@@ -1,0 +1,115 @@
+"""EXL3 trellis pack/unpack — port of exllamav3_ext/quant/pack.cu (CPU reference)."""
+
+from __future__ import annotations
+
+import numpy as np
+
+
+def _funnel_shift_r(b: np.uint32, a: np.uint32, shift: int) -> np.uint32:
+    merged = (np.uint64(a) << 32) | np.uint64(b)
+    return np.uint32(merged >> shift)
+
+
+def pack_trellis_tile(encoded: np.ndarray, k: int) -> np.ndarray:
+    """
+  Pack one 16x16 tile of K-bit codewords.
+
+  encoded: (256,) uint16 — values use only the low K bits.
+  returns: (256 * k // 16,) uint16 bitstream tile
+  """
+    if encoded.shape != (256,):
+        raise ValueError(f"expected encoded shape (256,), got {encoded.shape}")
+    if not 1 <= k <= 8:
+        raise ValueError(f"K must be in [1, 8], got {k}")
+
+    packed_size = 256 * k // 16
+    s_unpacked = encoded.astype(np.uint16, copy=False)
+    s_packed = np.zeros(packed_size, dtype=np.uint16)
+
+    spans = 16
+    length = 256 // spans
+    for t in range(spans):
+        i = length * t
+        j = k * t
+        buf = np.uint32(0)
+        bit_pos = 32
+        for _ in range(length):
+            v = np.uint32(s_unpacked[i]) & np.uint32((1 << k) - 1)
+            bit_pos -= k
+            buf |= v << bit_pos
+            if bit_pos <= 16:
+                s_packed[j] = np.uint16(buf >> 16)
+                buf = np.uint32(buf << 16)
+                bit_pos += 16
+                j += 1
+            i += 1
+
+    packed_u32 = s_packed.view(np.uint32)
+    packed_u32[:] = (packed_u32 << 16) | (packed_u32 >> 16)  # SWAP16 per uint32
+    return s_packed
+
+
+def unpack_trellis_tile(packed: np.ndarray, k: int) -> np.ndarray:
+    """
+  Unpack one trellis tile to 256 uint16 codewords.
+
+  Each codeword is the full 16-bit sliding window of the tile bitstream ending
+  at that weight's K fresh bits (bitshift trellis), matching ``dq``/``dq2`` in
+  ``exllamav3_ext/quant/exl3_dq.cuh``.
+
+  packed: (256 * k // 16,) uint16
+  returns: (256,) uint16
+  """
+    packed_size = 256 * k // 16
+    if packed.shape != (packed_size,):
+        raise ValueError(f"expected packed shape ({packed_size},), got {packed.shape}")
+
+    s_packed = packed.astype(np.uint16, copy=True)
+    words = s_packed.view(np.uint32)
+    mask_words = (k * 256) // 32
+
+    decoded = np.zeros(128, dtype=np.uint32)
+    for t in range(128):
+        b0 = t * 2 * k + k - 16 + 256 * k
+        b1 = b0 + k
+        b2 = b1 + 16
+        i0 = b0 // 32
+        i1 = (b2 - 1) // 32
+        s1 = (i1 + 1) * 32 - b2
+        a = words[i0 % mask_words]
+        b = words[i1 % mask_words]
+        w1 = _funnel_shift_r(b, a, s1)
+        w0 = (w1 >> k) & 0xFFFF
+        w1 &= 0xFFFF
+        decoded[t] = (np.uint32(w1) << 16) | np.uint32(w0)
+
+    # Codewords are full 16-bit sliding windows of the bitstream (exl3_dq.cuh:
+    # ``__funnelshift_r(b, a, s0) & 0xffff``), NOT the low K bits per weight.
+    return decoded.view(np.uint16).reshape(256).copy()
+
+
+def pack_trellis(encoded: np.ndarray, k: int) -> np.ndarray:
+    """Pack a trellis tensor of shape (tiles_k, tiles_n, 256)."""
+    if encoded.ndim != 3 or encoded.shape[-1] != 256:
+        raise ValueError(f"expected shape (tiles_k, tiles_n, 256), got {encoded.shape}")
+    tiles_k, tiles_n, _ = encoded.shape
+    out = np.empty((tiles_k, tiles_n, 256 * k // 16), dtype=np.uint16)
+    for tk in range(tiles_k):
+        for tn in range(tiles_n):
+            out[tk, tn] = pack_trellis_tile(encoded[tk, tn], k)
+    return out
+
+
+def unpack_trellis(packed: np.ndarray, k: int) -> np.ndarray:
+    """Unpack trellis tensor of shape (tiles_k, tiles_n, 256 * k // 16)."""
+    if packed.ndim != 3:
+        raise ValueError(f"expected 3D packed trellis, got {packed.shape}")
+    packed_size = 256 * k // 16
+    if packed.shape[-1] != packed_size:
+        raise ValueError(f"expected last dim {packed_size}, got {packed.shape[-1]}")
+    tiles_k, tiles_n, _ = packed.shape
+    out = np.empty((tiles_k, tiles_n, 256), dtype=np.uint16)
+    for tk in range(tiles_k):
+        for tn in range(tiles_n):
+            out[tk, tn] = unpack_trellis_tile(packed[tk, tn], k)
+    return out

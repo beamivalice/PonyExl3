@@ -1,0 +1,24 @@
+{
+  "include": ["ponyexl3", "tests"],
+  "exclude": ["**/__pycache__", ".venv"],
+  "stubPath": "typings",
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.10",
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingTypeStubs": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownVariableType": false,
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "extraPaths": ["."],
+      "reportUnusedFunction": false,
+      "reportPrivateUsage": false,
+      "reportOptionalMemberAccess": false,
+      "reportUnknownParameterType": false,
+      "reportMissingParameterType": false
+    }
+  ]
+}

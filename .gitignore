@@ -1,0 +1,52 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+*.so
+*.dylib
+*.metallib
+.DS_Store
+.vscode/
+.venv/
+venv/
+
+# WikiText-2 (HuggingFace ``datasets`` cache; not shipped)
+data/wikitext/
+data/wikitext-*/
+
+# Capability eval corpora (not shipped; run scripts/testset_download.sh)
+eval/data/mmlu/
+eval/data/gsm8k/
+eval/data/ifeval/
+eval/data/bfcl/
+eval/data/humaneval/
+
+# hybrid-search-cache build output
+cache/
+
+# hybrid-search-cache build output
+cache/
+
+# Models / Artifacts
+scripts/orchestration/logs/
+orchestration/logs/
+profiler/results/*.log
+profiler/results/*.jsonl
+profile/results/*.log
+profile/results/*.jsonl
+bench/results/*.json
+*.safetensors
+*.bin
+*.gguf
+*.npz
+
+# Reference scripts ship; the CUDA-host reference bundle does not
+# (model-derived activations + embedded host paths). *.npz already covers
+# the bundle; this covers the generated verify sidecar.
+ponyexl3/reference/*.verify.txt
+
+# Internal working ledger only; the parity audit + conversion design ship.
+docs/current_stage.md

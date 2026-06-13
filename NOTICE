@@ -1,0 +1,60 @@
+PonyExl3
+Copyright 2026 Theinruj Toranavikrai
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+Third-party components
+================================================================================
+
+This project ports and is derived from the following open-source works. Their
+original copyright notices and license terms are reproduced below as required.
+
+--------------------------------------------------------------------------------
+ExLlamaV3 (the EXL3 format and codec)
+    https://github.com/turboderp-org/exllamav3
+    License: MIT
+
+PonyExl3 reimplements the EXL3 quantization codec for Apple Silicon / Metal.
+The following are direct ports of, or derived from, exllamav3 source:
+
+  - ponyexl3/ref/{trellis,codebook,hadamard,perm,signs,reconstruct}.py
+      CPU reference of the EXL3 trellis pack/unpack, 3INST procedural
+      codebooks, blockwise Walsh–Hadamard transform, and permutation —
+      ported from exllamav3_ext/quant/*.cu and the exllamav3 quant modules.
+  - ponyexl3/mlx/* trellis-decode, sign/Hadamard, and MoE routing logic
+      reimplemented in Metal kernels following the exllamav3 algorithms.
+  - ponyexl3/reference/* export/compare tooling that calls the exllamav3
+      Python API to produce cross-platform reference tensors.
+
+    MIT License
+
+    Copyright (c) 2025 Turboderp
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+--------------------------------------------------------------------------------
+MLX and mlx-lm
+    https://github.com/ml-explore/mlx
+    https://github.com/ml-explore/mlx-lm
+    License: MIT, Copyright (c) Apple Inc.
+
+PonyExl3 builds on MLX (arrays, Metal kernels) and loads models into mlx-lm
+model skeletons (Qwen3.5 / Qwen3.6 architectures). These are used as
+dependencies; no MLX or mlx-lm source is vendored into this repository.

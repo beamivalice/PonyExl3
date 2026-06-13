@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ponyexl3"
+version = "0.1.0"
+description = "EXL3 quantized LLM inference on Apple Silicon via MLX"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{name = "Theinruj Toranavikrai", email = "my.beam@gmail.com"}]
+keywords = ["mlx", "quantization", "llm", "apple-silicon", "exl3"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "mlx>=0.20.0",
+    "mlx-lm>=0.31.3",
+    "numpy",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyright"]
+
+[tool.pyright]
+include = ["ponyexl3", "tests"]
+exclude = ["**/__pycache__", ".venv"]
+stubPath = "typings"
+typeCheckingMode = "strict"
+pythonVersion = "3.10"
+venvPath = "."
+venv = ".venv"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["."]
+reportUnusedFunction = false
+reportPrivateUsage = false
+reportOptionalMemberAccess = false
+reportUnknownParameterType = false
+reportMissingParameterType = false
+
+[project.scripts]
+ponyexl3-generate = "ponyexl3.cli.generate_model:main"
+ponyexl3-compare-layer = "ponyexl3.cli.compare_layer:main"
+ponyexl3-compare-engines = "ponyexl3.cli.compare_engines:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ponyexl3*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "ponyexl3: EXL3 MLX port tests",
+]
