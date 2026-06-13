@@ -400,6 +400,30 @@ def convert_engine(
     return errors
 
 
+def _apply_device_memory_limit() -> None:
+    """Cap MLX memory to the GPU's recommended working set so the process
+    never wires more than the OS allows. A 32 GB Mac kills the process at
+    ~26.5 GB *wired*, and MLX's buffer cache will otherwise grow well past
+    that during a heavy load. Override with ``PONYEXL3_MEM_LIMIT_GB=<n>``;
+    disable the cap with ``PONYEXL3_MEM_LIMIT_GB=0``."""
+    env = os.environ.get("PONYEXL3_MEM_LIMIT_GB", "").strip()
+    try:
+        if env:
+            gb = float(env)
+            if gb <= 0:
+                return
+            lim = int(gb * 1024**3)
+        else:
+            info = mx.metal.device_info()
+            ws = int(info.get("max_recommended_working_set_size", 0))
+            if ws <= 0:
+                return
+            lim = int(ws * 0.92)  # leave headroom below the wired ceiling
+        mx.set_memory_limit(lim)
+    except Exception:
+        pass
+
+
 def load_model(
     model_dir: str,
     *,
@@ -416,6 +440,7 @@ def load_model(
     preserves EXL3 accuracy. ``warm=True`` pre-decodes the cached fp16 ``W``
     for the exact engine (no-op for converted engines).
     """
+    _apply_device_memory_limit()
     config = _read_json(model_dir, "config.json")
     qcfg = _read_json(model_dir, "quantization_config.json")
     if qcfg.get("quant_method", config.get("quantization_config", {}).get("quant_method")) != "exl3":
@@ -537,6 +562,13 @@ def load_model(
         for _, m in exl3_linears(model):
             m.warm()
     mx.eval(model.parameters())
+    # Best-effort release of the build-transient buffer cache. The hard guard
+    # against the OS wired-memory kill is the working-set cap applied at entry
+    # (_apply_device_memory_limit): MLX reclaims its cache to stay under that
+    # cap, so even though the freed build buffers (~16 GB on the MoE) settle
+    # into the pool asynchronously, total wired never exceeds the GPU's
+    # recommended working set (a 32 GB Mac kills at ~26.5 GB wired).
+    mx.clear_cache()
     model.eval()
     return model, config
 

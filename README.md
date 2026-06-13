@@ -133,9 +133,17 @@ Engine fidelity via `ponyexl3/reference/compare_trace.py`.
   fused members per group, and drops the host-side trellis once the device
   runtime owns it. So the load transient stays near the resident footprint
   (a 15 GB model loads in ~27 GB, not ~42 GB), and ~4.6 GB stays free for the
-  KV cache (~225k tokens of 27B context) instead of a dead host copy. On very
-  tight memory, `EXL3_FUSE_MIN_MB=999999` skips sibling fusion to shave the
-  load peak further (slightly slower decode). `EXL3_WCACHE=1` keeps the host
+  KV cache (~225k tokens of 27B context) instead of a dead host copy.
+
+  **Wired-memory cap.** Apple Silicon kills a process that wires more than the
+  GPU's working-set limit (~26.5 GB on a 32 GB Mac), and MLX's buffer cache
+  would otherwise grow past it during a heavy load. The loader caps MLX at 92%
+  of the device's recommended working set so it evicts cache and stays under
+  that ceiling instead of being killed. Override with `PONYEXL3_MEM_LIMIT_GB`
+  (e.g. `=26` if you know your exact limit; `=0` to disable the cap).
+
+  Other knobs for tight memory: `EXL3_FUSE_MIN_MB=999999` skips sibling fusion
+  (lower load peak, slightly slower decode); `EXL3_WCACHE=1` keeps the host
   trellis (needed only for the fp16-fold reconstruct path).
 
 ---
