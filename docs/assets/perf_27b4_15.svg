@@ -1,21 +1,31 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 384" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
-<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#7c3aed"/><stop offset="1" stop-color="#a855f7"/></linearGradient><linearGradient id="b" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#818cf8"/></linearGradient></defs>
-<rect x="0" y="0" width="760" height="384" rx="16" fill="#0f172a"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#a855f7"/><stop offset="1" stop-color="#c084fc"/></linearGradient></defs>
+<rect x="0" y="0" width="760" height="400" rx="16" fill="#0f172a"/>
 <text x="26" y="40" fill="#e2e8f0" font-size="23" font-weight="700">Qwen3.6-27B · 4.15 bpw</text>
-<text x="26" y="64" fill="#94a3b8" font-size="14">dense</text>
-<text x="26" y="84" fill="#94a3b8" font-size="12.5">Apple M5 Max · decode tok/s · greedy, verify-gated (token-identical)</text>
-<text x="188" y="121.0" fill="#e2e8f0" font-size="14.5" text-anchor="end">Plain decode</text>
-<rect x="200" y="96" width="175.7" height="40" rx="7" fill="#94a3b8"/>
-<text x="385.7" y="121.0" fill="#e2e8f0" font-size="15" font-weight="600">17<tspan fill="#94a3b8" font-weight="500" font-size="13"></tspan></text>
-<text x="188" y="177.0" fill="#e2e8f0" font-size="14.5" text-anchor="end">+ EAGLE-3</text>
-<rect x="200" y="152" width="256.1" height="40" rx="7" fill="url(#b)"/>
-<text x="466.1" y="177.0" fill="#e2e8f0" font-size="15" font-weight="600">24<tspan fill="#94a3b8" font-weight="500" font-size="13">  1.46×</tspan></text>
-<text x="188" y="233.0" fill="#e2e8f0" font-size="14.5" text-anchor="end">+ MTP spec</text>
-<rect x="200" y="208" width="299.5" height="40" rx="7" fill="url(#b)"/>
-<text x="509.5" y="233.0" fill="#e2e8f0" font-size="15" font-weight="600">28<tspan fill="#94a3b8" font-weight="500" font-size="13">  1.70×</tspan></text>
-<text x="188" y="289.0" fill="#e2e8f0" font-size="14.5" text-anchor="end">+ DFlash (k=7)</text>
-<rect x="200" y="264" width="400.0" height="40" rx="7" fill="url(#g)"/>
-<text x="610.0" y="289.0" fill="#e2e8f0" font-size="15" font-weight="700">38<tspan fill="#94a3b8" font-weight="500" font-size="13">  2.28×</tspan></text>
-<text x="610.0" y="261.0" fill="#7c3aed" font-size="10.5" font-weight="700">FASTEST</text>
-<text x="26" y="362" fill="#94a3b8" font-size="13">prefill 662 tok/s  ·  15.1 GB resident  ·  4-bit weights stay resident — decoded in-kernel</text>
+<text x="26" y="62" fill="#94a3b8" font-size="14">dense</text>
+<text x="26" y="82" fill="#94a3b8" font-size="12.5">decode tok/s · greedy, verify-gated (token-identical to plain)</text>
+<rect x="26" y="96" width="12" height="12" rx="3" fill="#a855f7"/>
+<text x="44" y="106" fill="#e2e8f0" font-size="12.5">M5 Max</text>
+<rect x="115" y="96" width="12" height="12" rx="3" fill="#3b82f6"/>
+<text x="133" y="106" fill="#e2e8f0" font-size="12.5">M1 Max</text>
+<text x="188" y="154" fill="#e2e8f0" font-size="14" text-anchor="end">Plain decode</text>
+<rect x="200" y="126" width="165.8" height="26" rx="6" fill="#a855f7"/>
+<text x="374.8" y="144" fill="#e2e8f0" font-size="14.5" font-weight="600">17<tspan fill="#94a3b8" font-weight="400" font-size="12"></tspan></text>
+<rect x="200" y="154" width="40.0" height="18" rx="5" fill="#3b82f6"/>
+<text x="249.0" y="167" fill="#cbd5e1" font-size="13">4.0<tspan fill="#94a3b8" font-size="11"></tspan></text>
+<text x="188" y="212" fill="#e2e8f0" font-size="14" text-anchor="end">+ EAGLE-3</text>
+<rect x="200" y="194" width="241.7" height="26" rx="6" fill="#a855f7"/>
+<text x="450.7" y="212" fill="#e2e8f0" font-size="14.5" font-weight="600">24<tspan fill="#94a3b8" font-weight="400" font-size="12">  1.46×</tspan></text>
+<text x="188" y="270" fill="#e2e8f0" font-size="14" text-anchor="end">+ MTP</text>
+<rect x="200" y="242" width="282.7" height="26" rx="6" fill="#a855f7"/>
+<text x="491.7" y="260" fill="#e2e8f0" font-size="14.5" font-weight="600">28<tspan fill="#94a3b8" font-weight="400" font-size="12">  1.70×</tspan></text>
+<rect x="200" y="270" width="86.9" height="18" rx="5" fill="#3b82f6"/>
+<text x="295.9" y="283" fill="#cbd5e1" font-size="13">8.7<tspan fill="#94a3b8" font-size="11">  2.17×</tspan></text>
+<text x="188" y="338" fill="#e2e8f0" font-size="14" text-anchor="end">+ DFlash</text>
+<rect x="200" y="310" width="377.6" height="26" rx="6" fill="url(#g)"/>
+<text x="586.6" y="328" fill="#e2e8f0" font-size="14.5" font-weight="700">38<tspan fill="#94a3b8" font-weight="400" font-size="12">  2.28×</tspan></text>
+<text x="586.6" y="307" fill="#a855f7" font-size="10" font-weight="700">FASTEST</text>
+<rect x="200" y="338" width="149.8" height="18" rx="5" fill="#3b82f6"/>
+<text x="358.8" y="351" fill="#cbd5e1" font-size="13">15.0<tspan fill="#94a3b8" font-size="11">  3.75×</tspan></text>
+<text x="26" y="385" fill="#94a3b8" font-size="12.5">prefill M5 662 / M1 126 tok/s  ·  15.1 GB resident</text>
 </svg>

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/ponyexl3-dark.png">
+    <img src="docs/assets/ponyexl3.png" alt="PonyExl3" width="200">
+  </picture>
+</p>
+
 # PonyExl3
 
 EXL3 quantized LLM inference on Apple Silicon, built on [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm).
@@ -35,6 +42,20 @@ Prefill at 8k context: **662 / 2775 / 642 tok/s** (27B-4.15 / 35B-A3B / 27B-8.00
 weights stay resident and are decoded in-kernel — the 27B runs inference in **~15 GB**.
 Reproduce with `tools/bench/perf_chart_bench.py`; accuracy is [below](#accuracy).
 
+Also runs on a 32 GB **M1 Max** (older, slower GPU), same checkpoints:
+
+| Model | prefill (4k / 8k) | decode | best drafter | resident |
+|-------|------------------:|-------:|-------------:|---------:|
+| Qwen3.6-27B 4.15bpw | 149 / 126 t/s | 4.0 t/s | **15.0** (DFlash) | 15.1 GB |
+| Qwen3.6-35B-A3B 4.00bpw | 673 / 497 t/s | 23.5 t/s | ~flat | 17.2 GB |
+
+Dense decode is ALU-bound, so speculation helps *more* on the slower GPU: DFlash
+takes the 27B from 4.0 → **15.0 tok/s** (3.75×, 6.0 accepted/cycle), MTP → 8.7. The
+MoE's few active params/token keep it usable (23.5) but leave little for spec to win
+— its verify overhead eats the gain (n-gram lookup likewise isn't worth it). Prefill
+drops with context as attention grows. Both fit a 32 GB Mac at short context (long
+context is memory-bound — see below).
+
 ### vs RTX 4090 (same EXL3 weights)
 
 The identical EXL3 checkpoints run through exllamav3 on an RTX 4090. The platforms
@@ -57,6 +78,36 @@ the MoE.
 RTX 4090 figures are exllamav3 plain TG (no drafter); the M5 Max drafters are
 verify-gated (token-identical). The M5 Max is a 128 GB laptop SoC — it holds the
 4090 on decode while fitting far larger models than the 4090's 24 GB.
+
+---
+
+## Speculative decoding
+
+Four drafters, all **verify-gated**: the target model checks every proposed token,
+so output stays **identical to plain greedy** — these buy speed, never trade quality.
+Numbers below are **Qwen3.6-27B 4.15bpw decode on an Apple M5 Max** (greedy; the
+model-based drafters add `--draft-w4`, which is free since draft tokens never reach
+the output stream).
+
+| Method | flag | tok/s | vs plain | tok/cycle | what it is |
+|--------|------|------:|---------:|----------:|------------|
+| Plain greedy | — | 16.6 | 1.00× | — | one forward per token |
+| N-gram lookup | `--lookup` | ~17 (**+16% on edits**) | up to ~1.4× | — | draft-free; suffix-index over prompt+output |
+| EAGLE-3 | `--eagle3 <path>` | 24.2 | 1.46× | 2.29 | autoregressive draft head over target features |
+| MTP | `--mtp auto` | 28.3 | 1.70× | 2.74 | multi-token-prediction head |
+| **DFlash** | `--dflash <path>` | **37.8** | **2.28×** | 4.80 | block drafter — one masked-block forward per cycle |
+
+- **DFlash** is the strongest here (≈4.8 accepted tokens per verify cycle). **MTP**
+  needs only the head bundled with the checkpoint (`--mtp auto`). **EAGLE-3** and
+  DFlash take a separate drafter checkpoint (see [Speculative drafters](#speculative-drafters)).
+- **N-gram lookup** needs no weights and no setup — it proposes continuations seen
+  earlier in the prompt/output, so it shines on code edits and repetition and is
+  ~neutral on novel prose (an adaptive floor keeps it from ever hurting).
+- All compose with the 8 bpw target, and speculation pays off **more** on slower
+  silicon for the dense model: on a 32 GB M1 Max, DFlash takes the 27B from
+  4.0 → **15.0 tok/s** (3.75×, vs 2.28× on the M5 Max) because plain decode is so
+  ALU-bound there. The MoE is the opposite — already fast per token, so speculation
+  barely moves it.
 
 ---
 
