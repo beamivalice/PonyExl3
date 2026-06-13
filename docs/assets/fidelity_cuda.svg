@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<defs><linearGradient id="f" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7c3aed" stop-opacity="0.45"/><stop offset="1" stop-color="#7c3aed" stop-opacity="0.03"/></linearGradient></defs>
+<rect x="0" y="0" width="760" height="300" rx="16" fill="#0f172a"/>
+<text x="26" y="38" fill="#e2e8f0" font-size="22" font-weight="700">Real EXL3: MLX Metal vs reference CUDA</text>
+<text x="26" y="60" fill="#94a3b8" font-size="13.5">Qwen3.6-35B-A3B · identical EXL3 weights · cosine similarity of each module's output</text>
+<text x="26" y="80" fill="#94a3b8" font-size="12.5">top-1 argmax matches · logit cosine 0.9991 · drift is the fp16 cross-platform floor, not a bug</text>
+<line x1="56" y1="248.0" x2="734" y2="248.0" stroke="#1e293b" stroke-width="1"/>
+<text x="48" y="252.0" fill="#94a3b8" font-size="11" text-anchor="end">0.995</text>
+<line x1="56" y1="217.6" x2="734" y2="217.6" stroke="#1e293b" stroke-width="1"/>
+<text x="48" y="221.6" fill="#94a3b8" font-size="11" text-anchor="end">0.996</text>
+<line x1="56" y1="187.2" x2="734" y2="187.2" stroke="#1e293b" stroke-width="1"/>
+<text x="48" y="191.2" fill="#94a3b8" font-size="11" text-anchor="end">0.997</text>
+<line x1="56" y1="156.8" x2="734" y2="156.8" stroke="#1e293b" stroke-width="1"/>
+<text x="48" y="160.8" fill="#94a3b8" font-size="11" text-anchor="end">0.998</text>
+<line x1="56" y1="126.4" x2="734" y2="126.4" stroke="#1e293b" stroke-width="1"/>
+<text x="48" y="130.4" fill="#94a3b8" font-size="11" text-anchor="end">0.999</text>
+<line x1="56" y1="96.0" x2="734" y2="96.0" stroke="#1e293b" stroke-width="1"/>
+<text x="48" y="100.0" fill="#94a3b8" font-size="11" text-anchor="end">1.000</text>
+<polygon points="56,248.0 56.0,96.0 72.1,96.1 88.3,98.1 104.4,97.6 120.6,98.0 136.7,98.1 152.9,98.8 169.0,98.5 185.1,99.1 201.3,99.2 217.4,99.8 233.6,100.0 249.7,100.6 265.9,101.6 282.0,139.0 298.1,144.3 314.3,151.6 330.4,143.8 346.6,138.7 362.7,134.8 378.9,133.6 395.0,127.4 411.1,134.9 427.3,148.3 443.4,152.2 459.6,156.6 475.7,149.9 491.9,145.1 508.0,146.0 524.1,136.5 540.3,136.6 556.4,130.3 572.6,154.6 588.7,164.8 604.9,143.3 621.0,125.0 637.1,119.0 653.3,128.4 669.4,150.0 685.6,126.3 701.7,130.5 717.9,189.3 734.0,124.3 734,248.0" fill="url(#f)"/>
+<polyline points="56.0,96.0 72.1,96.1 88.3,98.1 104.4,97.6 120.6,98.0 136.7,98.1 152.9,98.8 169.0,98.5 185.1,99.1 201.3,99.2 217.4,99.8 233.6,100.0 249.7,100.6 265.9,101.6 282.0,139.0 298.1,144.3 314.3,151.6 330.4,143.8 346.6,138.7 362.7,134.8 378.9,133.6 395.0,127.4 411.1,134.9 427.3,148.3 443.4,152.2 459.6,156.6 475.7,149.9 491.9,145.1 508.0,146.0 524.1,136.5 540.3,136.6 556.4,130.3 572.6,154.6 588.7,164.8 604.9,143.3 621.0,125.0 637.1,119.0 653.3,128.4 669.4,150.0 685.6,126.3 701.7,130.5 717.9,189.3 734.0,124.3" fill="none" stroke="#a855f7" stroke-width="2.5" stroke-linejoin="round"/>
+<circle cx="56.0" cy="96.0" r="4" fill="#e2e8f0"/>
+<text x="64.0" y="100.0" fill="#e2e8f0" font-size="11">embeddings bit-exact (1.000)</text>
+<text x="56.0" y="274" fill="#94a3b8" font-size="11" text-anchor="middle">embed</text>
+<text x="72.1" y="274" fill="#94a3b8" font-size="11" text-anchor="middle">L0</text>
+<text x="233.6" y="274" fill="#94a3b8" font-size="11" text-anchor="middle">L10</text>
+<text x="395.0" y="274" fill="#94a3b8" font-size="11" text-anchor="middle">L20</text>
+<text x="556.4" y="274" fill="#94a3b8" font-size="11" text-anchor="middle">L30</text>
+<text x="701.7" y="274" fill="#94a3b8" font-size="11" text-anchor="middle">L39</text>
+<text x="717.9" y="274" fill="#94a3b8" font-size="11" text-anchor="middle">norm</text>
+<text x="734.0" y="274" fill="#94a3b8" font-size="11" text-anchor="middle">logits</text>
+<text x="395" y="292" fill="#94a3b8" font-size="12" text-anchor="middle">forward module (embed → 40 layers → norm → lm_head)</text>
+</svg>

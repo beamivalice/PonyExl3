@@ -258,6 +258,14 @@ def fuse_exl3_siblings(model: MlxLmModel) -> int:
     only = os.environ.get("EXL3_FUSE_ONLY", "")
     skip = os.environ.get("EXL3_FUSE_SKIP", "")
 
+    # The fused group owns an independent concatenated trellis, so each
+    # member's per-layer runtime becomes dead once it is replaced. Release
+    # those buffers as we go (every few groups) so they don't pile up
+    # alongside the accumulating fused buffers — that coexistence is the
+    # dominant load-time memory spike on this path (measured ~21 GB device
+    # peak collapsing to ~15 GB resident once the members are freed).
+    from ponyexl3.mlx.layer_state import clear_layer_caches
+
     n = 0
     for layer in model.layers:
         for owner_name, names in _FUSE_SIBLINGS:
@@ -280,6 +288,10 @@ def fuse_exl3_siblings(model: MlxLmModel) -> int:
             for i, nm in enumerate(names):
                 setattr(owner, nm, group.sibling(i))
             n += 1
+            # drop the just-replaced members' cached runtimes immediately so
+            # they never accumulate alongside the growing fused buffers
+            clear_layer_caches()
+            mx.clear_cache()
     return n
 
 
@@ -431,17 +443,33 @@ def load_model(
 
     # 1) Swap each quantized linear for EXL3Linear (MoE experts are stacked
     #    into EXL3SwitchGLU modules instead).
+    #
+    #    Free each layer's source tensors from ``weights`` as it is converted,
+    #    and release the buffer cache periodically. Without this, the whole
+    #    mmap'd source stays resident through the build loop *alongside* the
+    #    accumulating device runtime, so the load transient peaks at ~2.7x the
+    #    resident footprint (measured 42 GB RSS for a 15 GB model) — enough to
+    #    OOM-kill a 32 GB Mac during load even though the model runs in ~15 GB
+    #    once loaded.
     moe_consumed = _build_moe_experts(model, storage, weights, verbose)
-    for key, info in sorted(storage.items()):
+    if moe_consumed:
+        mx.clear_cache()
+    for n, (key, info) in enumerate(sorted(storage.items())):
         if _expert_match(key) or key in moe_consumed:
             continue
         layer = _build_exl3_layer(key, info, weights)
         _set_module(model, _module_path(key), EXL3Linear(layer))
+        for sfx in _EXL3_SUFFIXES:
+            weights.pop(f"{key}.{sfx}", None)
+        # release the just-consumed source buffer every layer so it never
+        # accumulates alongside the growing runtime
+        mx.clear_cache()
         if verbose:
             print(f"  exl3  {key}  {layer.in_features}x{layer.out_features} k={layer.k}")
-
+    mx.clear_cache()
 
     # 2) Everything that is not an EXL3 tensor loads as a plain weight.
+    #    (EXL3 source tensors were popped above; this filter is a backstop.)
     exl3_tensor_keys = {
         f"{key}.{sfx}" for key in storage for sfx in _EXL3_SUFFIXES
     }
@@ -491,6 +519,19 @@ def load_model(
         mono = install_mlp_monoliths(model)
         if mono and verbose:
             print(f"  mlp monolith {mono} layers")
+
+        if engine == "exl3":
+            # Release the host-side numpy trellis now that the device runtime,
+            # fused groups, and monoliths own the weights. On unified memory it
+            # was dead weight competing with the KV cache (~4.6 GB / ~225k
+            # tokens of context on a 27B). No-op under EXL3_WCACHE.
+            released = 0
+            for _, m in exl3_linears(model):
+                released += 1 if getattr(m._exl3, "trellis", None) is not None else 0
+                m.release_source()
+            mx.clear_cache()
+            if verbose:
+                print(f"  released host trellis for {released} layers")
 
     if warm and engine == "exl3":
         for _, m in exl3_linears(model):

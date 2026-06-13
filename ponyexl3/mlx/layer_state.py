@@ -22,16 +22,18 @@ from ponyexl3.ref.signs import unpack_signs_or_pass
 
 
 def _layer_key(layer: EXL3Layer) -> tuple[Any, ...]:
-    t = layer.trellis
+    # ``id(layer)`` disambiguates per object without reading the trellis, so
+    # the host-side numpy can be released post-load (EXL3Linear.release_source)
+    # while the runtime cache still keys correctly. Each EXL3Layer lives for
+    # the model's lifetime (held by its EXL3Linear), so the id is stable.
     return (
+        id(layer),
         layer.key,
         layer.in_features,
         layer.out_features,
         layer.k,
         layer.mcg,
         layer.mul1,
-        t.ctypes.data,
-        t.shape,
     )
 
 
@@ -154,7 +156,7 @@ def layer_runtime_mlx(layer: EXL3Layer) -> EXL3LayerRuntime:
     svh_np = unpack_signs_or_pass(layer.svh)
     rt = EXL3LayerRuntime(
         key=key,
-        trellis=mx.array(layer.trellis.astype(np.uint16)),
+        trellis=mx.array(layer.trellis),  # already uint16 — no redundant host copy
         suh=None if suh_np is None else unpack_signs_or_pass_mlx(mx.array(suh_np)),
         svh=None if svh_np is None else unpack_signs_or_pass_mlx(mx.array(svh_np)),
         bias=None if layer.bias is None else mx.array(layer.bias.astype(np.float16)),
@@ -163,6 +165,14 @@ def layer_runtime_mlx(layer: EXL3Layer) -> EXL3LayerRuntime:
     )
     _runtime_cache[key] = rt
     return rt
+
+
+def pin_runtime(layer: EXL3Layer, rt: EXL3LayerRuntime) -> None:
+    """Seed the runtime cache for ``layer`` with an already-built ``rt`` so a
+    later ``layer_runtime_mlx(layer)`` (e.g. the lm_head stripe path) hits the
+    cache instead of re-deriving from ``layer.trellis`` — which lets
+    EXL3Linear.release_source drop that host-side numpy."""
+    _runtime_cache[_layer_key(layer)] = rt
 
 
 def inner_weight_mlx(layer: EXL3Layer, *, use_cache: bool = True) -> mx.array:

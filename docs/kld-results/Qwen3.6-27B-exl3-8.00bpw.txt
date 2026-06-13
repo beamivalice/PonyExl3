@@ -1,0 +1,162 @@
+# PonyExl3 — KLD accuracy, raw per-window output
+# model:     Qwen3.6-27B-exl3-8.00bpw  (EXL3, MLX/Metal, this repo)
+# reference: bf16 Qwen3.6-27B
+# windows:   16 x 8192 tokens   metric: KLD(bf16 || EXL3), PPL, top-1 Acc
+# harness:   mlx-eval by deepsweet (https://github.com/deepsweet/mlx-eval), mlx_eval.compare
+# hardware:  Apple M5 Max (128 GB), 2026-06-13
+
+[2026-06-13 09:18:33 UTC] KLD compare: 16 window(s), model=Qwen3.6-27B-exl3-8.00bpw
+[2026-06-13 09:18:33 UTC] window 1/16 start
+KLD: 0.052810
+KLD p95: 0.063658
+KLD p99: 0.462131
+PPL: 15.220699
+Δ PPL: +0.059340
+Acc@1: 0.552558
+Δ Acc@1: -0.000610
+[2026-06-13 09:18:56 UTC] window 1/16 done kld=0.052810 elapsed=22.7s
+[2026-06-13 09:18:56 UTC] window 2/16 start
+KLD: 0.017809
+KLD p95: 0.057729
+KLD p99: 0.070466
+PPL: 6.444849
+Δ PPL: +0.025126
+Acc@1: 0.628128
+Δ Acc@1: +0.000855
+[2026-06-13 09:19:10 UTC] window 2/16 done kld=0.017809 elapsed=14.0s
+[2026-06-13 09:19:10 UTC] window 3/16 start
+KLD: 0.028189
+KLD p95: 0.060091
+KLD p99: 0.075761
+PPL: 9.159978
+Δ PPL: -0.035851
+Acc@1: 0.556953
+Δ Acc@1: +0.000977
+[2026-06-13 09:19:25 UTC] window 3/16 done kld=0.028189 elapsed=15.1s
+[2026-06-13 09:19:25 UTC] window 4/16 start
+KLD: 0.140877
+KLD p95: 0.065976
+KLD p99: 3.268891
+PPL: 9.304226
+Δ PPL: +0.108398
+Acc@1: 0.639482
+Δ Acc@1: -0.001099
+[2026-06-13 09:19:40 UTC] window 4/16 done kld=0.140877 elapsed=15.4s
+[2026-06-13 09:19:40 UTC] window 5/16 start
+KLD: 0.024689
+KLD p95: 0.060631
+KLD p99: 0.115410
+PPL: 14.382549
+Δ PPL: +0.139771
+Acc@1: 0.523501
+Δ Acc@1: -0.000733
+[2026-06-13 09:19:56 UTC] window 5/16 done kld=0.024689 elapsed=15.5s
+[2026-06-13 09:19:56 UTC] window 6/16 start
+KLD: 0.083788
+KLD p95: 0.065213
+KLD p99: 1.317434
+PPL: 7.417976
+Δ PPL: -0.087441
+Acc@1: 0.663167
+Δ Acc@1: +0.000855
+[2026-06-13 09:20:11 UTC] window 6/16 done kld=0.083788 elapsed=15.4s
+[2026-06-13 09:20:11 UTC] window 7/16 start
+KLD: 0.018149
+KLD p95: 0.058230
+KLD p99: 0.072734
+PPL: 5.908353
+Δ PPL: -0.028920
+Acc@1: 0.624832
+Δ Acc@1: +0.001099
+[2026-06-13 09:20:26 UTC] window 7/16 done kld=0.018149 elapsed=14.9s
+[2026-06-13 09:20:26 UTC] window 8/16 start
+KLD: 0.047511
+KLD p95: 0.062888
+KLD p99: 0.414919
+PPL: 11.049042
+Δ PPL: +0.128726
+Acc@1: 0.586986
+Δ Acc@1: -0.001099
+[2026-06-13 09:20:41 UTC] window 8/16 done kld=0.047511 elapsed=15.0s
+[2026-06-13 09:20:41 UTC] window 9/16 start
+KLD: 0.088924
+KLD p95: 0.061632
+KLD p99: 0.814054
+PPL: 8.488157
+Δ PPL: -0.016594
+Acc@1: 0.601636
+Δ Acc@1: +0.001221
+[2026-06-13 09:20:56 UTC] window 9/16 done kld=0.088924 elapsed=15.1s
+[2026-06-13 09:20:56 UTC] window 10/16 start
+KLD: 0.039883
+KLD p95: 0.061040
+KLD p99: 0.283371
+PPL: 8.194930
+Δ PPL: -0.048158
+Acc@1: 0.606886
+Δ Acc@1: +0.000244
+[2026-06-13 09:21:12 UTC] window 10/16 done kld=0.039883 elapsed=15.1s
+[2026-06-13 09:21:12 UTC] window 11/16 start
+KLD: 0.017570
+KLD p95: 0.060708
+KLD p99: 0.140703
+PPL: 8.605003
+Δ PPL: -0.033679
+Acc@1: 0.576608
+Δ Acc@1: +0.000733
+[2026-06-13 09:21:27 UTC] window 11/16 done kld=0.017570 elapsed=15.1s
+[2026-06-13 09:21:27 UTC] window 12/16 start
+KLD: 0.019383
+KLD p95: 0.060251
+KLD p99: 0.117193
+PPL: 6.948158
+Δ PPL: -0.047660
+Acc@1: 0.611403
+Δ Acc@1: +0.001953
+[2026-06-13 09:21:42 UTC] window 12/16 done kld=0.019383 elapsed=15.1s
+[2026-06-13 09:21:42 UTC] window 13/16 start
+KLD: 0.019638
+KLD p95: 0.058149
+KLD p99: 0.069198
+PPL: 5.943074
+Δ PPL: +0.005801
+Acc@1: 0.628739
+Δ Acc@1: -0.001709
+[2026-06-13 09:21:57 UTC] window 13/16 done kld=0.019638 elapsed=15.0s
+[2026-06-13 09:21:57 UTC] window 14/16 start
+KLD: 0.031562
+KLD p95: 0.060838
+KLD p99: 0.115914
+PPL: 10.877743
+Δ PPL: -0.042574
+Acc@1: 0.580881
+Δ Acc@1: -0.000122
+[2026-06-13 09:22:12 UTC] window 14/16 done kld=0.031562 elapsed=14.9s
+[2026-06-13 09:22:12 UTC] window 15/16 start
+KLD: 0.026084
+KLD p95: 0.060823
+KLD p99: 0.186161
+PPL: 9.788909
+Δ PPL: -0.000000
+Acc@1: 0.584178
+Δ Acc@1: -0.000977
+[2026-06-13 09:22:27 UTC] window 15/16 done kld=0.026084 elapsed=14.9s
+[2026-06-13 09:22:27 UTC] window 16/16 start
+KLD: 0.019940
+KLD p95: 0.059573
+KLD p99: 0.076074
+PPL: 9.750746
+Δ PPL: +0.113600
+Acc@1: 0.559272
+Δ Acc@1: -0.002320
+[2026-06-13 09:22:42 UTC] window 16/16 done kld=0.019940 elapsed=14.9s
+[2026-06-13 09:22:42 UTC] overall (token-weighted)
+
+KLD: 0.042300
+KLD p95: 0.061046
+KLD p99: 0.221805
+PPL: 8.879781
+Δ PPL: +0.005959
+Acc@1: 0.595326
+Δ Acc@1: -0.000046
+RAM: 26.27

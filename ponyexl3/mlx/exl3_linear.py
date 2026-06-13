@@ -80,6 +80,21 @@ class EXL3Linear(nn.Module):
             mx.eval(inner_weight_mlx(self._exl3))
         return self
 
+    def release_source(self) -> "EXL3Linear":
+        """Drop the host-side numpy trellis once the device runtime owns the
+        weights. On unified memory that numpy is dead weight competing with the
+        KV cache (~30% of a 27B's footprint → ~225k tokens of context). The
+        device runtime is pinned in the cache first so the stripe / lm_head
+        path still resolves without re-deriving from it. No-op under
+        ``EXL3_WCACHE`` (which reconstructs the fp16 ``W`` from the numpy)."""
+        if _WCACHE or getattr(self._exl3, "trellis", None) is None:
+            return self
+        from ponyexl3.mlx.layer_state import pin_runtime
+
+        pin_runtime(self._exl3, self._rt)
+        self._exl3.trellis = None
+        return self
+
     def __call__(self, x: mx.array) -> mx.array:
         rt = self._rt
         in_shape = x.shape
