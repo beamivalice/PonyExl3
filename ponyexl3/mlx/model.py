@@ -414,7 +414,7 @@ def _apply_device_memory_limit() -> None:
                 return
             lim = int(gb * 1024**3)
         else:
-            info = mx.metal.device_info()
+            info = mx.device_info()
             ws = int(info.get("max_recommended_working_set_size", 0))
             if ws <= 0:
                 return

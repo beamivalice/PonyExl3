@@ -273,13 +273,20 @@ def speculative_stream_generate(
     prefill_chunk: int = 2048,
     eos_ids: set[int] | frozenset[int] = frozenset(),
     stats: GenStats | None = None,
+    temp: float = 0.0,
+    top_p: float = 1.0,
 ):
-    """Greedy speculative decoding with the MTP draft head (exllamav3 port).
+    """Speculative decoding with the MTP draft head (exllamav3 port).
 
     Per cycle: chain ``num_draft`` MTP drafts, verify them in ONE batched
     target forward (which reads each weight once for all rows — that is the
     speedup), accept the longest matching prefix plus the bonus token.
-    Verified greedy output is identical to plain greedy decoding.
+
+    At ``temp == 0`` the accept is greedy (draft == target argmax) and output
+    is identical to plain greedy. At ``temp > 0`` it switches to Leviathan-Chen
+    rejection sampling (``spec_sampling.accept_drafts``): drafts are sampled
+    from their own distribution and accepted so the emitted stream matches plain
+    sampling from the target **exactly** — same distribution, just faster.
 
     Hybrid-cache rollback: hiddens at accepted positions from the verify
     forward are already true (causality); only the cache needs repair. KV
@@ -289,6 +296,10 @@ def speculative_stream_generate(
     import numpy as np
 
     from mlx_lm.models.cache import KVCache
+
+    from ponyexl3.mlx.spec_sampling import accept_drafts, sample_token
+
+    rng = np.random.default_rng()
 
     lm = model.language_model
     embed = lm.model.embed_tokens
@@ -306,7 +317,11 @@ def speculative_stream_generate(
         hs.append(h)
     h_all = mx.concatenate(hs, axis=1) if len(hs) > 1 else hs[0]
     logits = lm.lm_head(h_all[:, -1:, :])
-    pending = mx.argmax(logits[0, -1]).reshape(1).astype(mx.int32)  # not yet fed
+    if temp > 0.0:
+        mx.eval(logits)
+        pending = mx.array([sample_token(np.asarray(logits[0, -1]), temp, top_p, rng)], dtype=mx.int32)
+    else:
+        pending = mx.argmax(logits[0, -1]).reshape(1).astype(mx.int32)  # not yet fed
     mx.eval(pending)
     stats.prefill_s = time.perf_counter() - tic
 
@@ -320,7 +335,7 @@ def speculative_stream_generate(
     # quantized lm_head copy (mtp.quantize_draft) — output bits unchanged.
     draft_head = getattr(mtp, "_draft_head", None) or lm.lm_head
 
-    def draft_phase(catch_t: mx.array, catch_h: mx.array) -> list[mx.array]:
+    def draft_phase(catch_t: mx.array, catch_h: mx.array):
         # First MTP call also extends the cache with the true catch-up pairs;
         # its last output starts the chain.
         C = catch_t.shape[1]
@@ -337,18 +352,25 @@ def speculative_stream_generate(
                 mtp_cache,
             )
         h_chain = h_mtp[:, -1:, :]
-        drafts = []
+        drafts: list[mx.array] = []
+        dlogits: list[np.ndarray] = []  # draft q-logits, only when temp > 0
         for j in range(num_draft):
             d_logits = draft_head(mtp.head_input(h_chain))
-            dj = mx.argmax(d_logits[0, -1]).reshape(1).astype(mx.int32)
+            dl = d_logits[0, -1]
+            if temp > 0.0:
+                mx.eval(dl)
+                dlogits.append(np.asarray(dl))
+                dj = mx.array([sample_token(dlogits[-1], temp, top_p, rng)], dtype=mx.int32)
+            else:
+                dj = mx.argmax(dl).reshape(1).astype(mx.int32)
             drafts.append(dj)
             if j < num_draft - 1:
                 h_chain = mtp(embed(dj[None]), h_chain, mtp_cache)  # speculative
-        return drafts
+        return drafts, dlogits
 
     tic = time.perf_counter()
     emitted = 0
-    drafts = draft_phase(catch_t, catch_h)
+    drafts, dlogits = draft_phase(catch_t, catch_h)
     n_spec_mtp = num_draft - 1
     while emitted < max_tokens:
         # ---- verify in one batched target forward (tracing DeltaNet inputs)
@@ -360,15 +382,20 @@ def speculative_stream_generate(
                 return trace, lm.model(verify_tokens[None], cache=cache)
 
         trace, h_ver = cast(tuple[_DeltaNetTrace, mx.array], _verify_mtp())
-        preds = mx.argmax(lm.lm_head(h_ver)[0], axis=-1)  # (k+1,)
-
-        # one host sync per cycle
-        preds_np = np.array(preds)
+        target_logits = lm.lm_head(h_ver)[0]  # (k+1, V)
         verify_np = np.array(verify_tokens)
-        m = 0
-        while m < num_draft and preds_np[m] == verify_np[m + 1]:
-            m += 1
-        bonus = int(preds_np[m])
+        if temp > 0.0:
+            # Leviathan-Chen: draft q-dists vs target p-dists -> exact accept
+            m, bonus = accept_drafts(
+                np.array(target_logits), np.stack(dlogits), verify_np[1:],
+                temp=temp, top_p=top_p, rng=rng,
+            )
+        else:
+            preds_np = np.array(mx.argmax(target_logits, axis=-1))  # one host sync
+            m = 0
+            while m < num_draft and preds_np[m] == verify_np[m + 1]:
+                m += 1
+            bonus = int(preds_np[m])
         accepted = [int(v) for v in verify_np[: m + 1]]
 
         stats.spec_cycles += 1
@@ -398,7 +425,7 @@ def speculative_stream_generate(
         catch_t = mx.concatenate(
             [mx.array(accepted[1:], dtype=mx.int32), pending]
         )[None]
-        next_drafts = draft_phase(catch_t, catch_h)
+        next_drafts, next_dlogits = draft_phase(catch_t, catch_h)
         mx.async_eval(next_drafts[-1])
 
         # ---- emit (host work overlaps the drafting on the GPU)
@@ -414,7 +441,7 @@ def speculative_stream_generate(
             if emitted >= max_tokens:
                 stop = True
                 break
-        drafts = next_drafts
+        drafts, dlogits = next_drafts, next_dlogits
         if stop:
             break
     stats.decode_s = time.perf_counter() - tic
@@ -430,20 +457,26 @@ def eagle3_stream_generate(
     prefill_chunk: int = 2048,
     eos_ids: set[int] | frozenset[int] = frozenset(),
     stats: GenStats | None = None,
+    temp: float = 0.0,
+    top_p: float = 1.0,
 ):
-    """Greedy speculative decoding with an EAGLE-3 draft head.
+    """Speculative decoding with an EAGLE-3 draft head.
 
     Clone of ``speculative_stream_generate`` (MTP) with two structural
     swaps: drafter features come from the target's aux residual streams
     (``AuxTrace`` + ``drafter.fuse``) instead of the final hidden, and the
-    draft chain's argmax runs the drafter's own 32k head with d2t mapping.
-    The verify forward keeps the exact target weights and lm_head, so the
-    output is token-identical to plain greedy regardless of the drafter."""
+    draft chain runs the drafter's own 32k head with d2t mapping. The verify
+    forward keeps the exact target weights and lm_head, so output matches plain
+    decoding — greedy at ``temp == 0``, and temp-correct at ``temp > 0`` (the
+    draft ``q`` is scattered from the 32k head into the target vocab via d2t)."""
     import numpy as np
 
     from mlx_lm.models.cache import KVCache
 
     from ponyexl3.mlx.eagle3 import AuxTrace
+    from ponyexl3.mlx.spec_sampling import accept_drafts, sample_token, temp_topp_probs
+
+    rng = np.random.default_rng()
 
     lm = model.language_model
     embed = lm.model.embed_tokens
@@ -463,14 +496,34 @@ def eagle3_stream_generate(
         g_all = drafter.fuse(aux.take())
     h_all = mx.concatenate(hs, axis=1) if len(hs) > 1 else hs[0]
     logits = lm.lm_head(h_all[:, -1:, :])
-    pending = mx.argmax(logits[0, -1]).reshape(1).astype(mx.int32)
+    if temp > 0.0:
+        mx.eval(logits)
+        pending = mx.array([sample_token(np.asarray(logits[0, -1]), temp, top_p, rng)], dtype=mx.int32)
+    else:
+        pending = mx.argmax(logits[0, -1]).reshape(1).astype(mx.int32)
     mx.eval(pending)
     stats.prefill_s = time.perf_counter() - tic
 
     catch_g = g_all  # pyright: ignore[reportPossiblyUnboundVariable]
     catch_t = mx.concatenate([toks[0, 1:].astype(mx.int32), pending])[None]
 
-    def draft_phase(catch_t: mx.array, catch_g: mx.array) -> list[mx.array]:
+    # temp-correct draft side: sample the drafter's 32k head, map to a target id
+    # via d2t, and scatter the 32k logits into the target vocab so the accept
+    # sees ``q`` over the same vocab as the target ``p``.
+    _Vtgt = int(lm.lm_head.out_features)
+    _d2t_np = np.asarray(drafter.d2t)
+
+    def _draft_token(h_chain: mx.array):
+        if temp <= 0.0:
+            return drafter.draft_token(h_chain).astype(mx.int32), None
+        d32 = np.asarray(drafter.draft_logits(h_chain))  # (V_draft,)
+        q32 = temp_topp_probs(d32, temp, top_p)
+        did = int(rng.choice(q32.shape[0], p=q32))
+        qlog = np.full(_Vtgt, -1e30, np.float32)
+        qlog[_d2t_np] = d32
+        return mx.array([int(_d2t_np[did])], dtype=mx.int32), qlog
+
+    def draft_phase(catch_t: mx.array, catch_g: mx.array):
         C = catch_t.shape[1]
         end = min(prefill_chunk, C)
         h_d = drafter(
@@ -485,17 +538,20 @@ def eagle3_stream_generate(
                 draft_cache,
             )
         h_chain = h_d[:, -1:, :]
-        drafts = []
+        drafts: list[mx.array] = []
+        dlogits: list[np.ndarray] = []
         for j in range(num_draft):
-            dj = drafter.draft_token(h_chain).astype(mx.int32)
+            dj, qlog = _draft_token(h_chain)
             drafts.append(dj)
+            if qlog is not None:
+                dlogits.append(qlog)
             if j < num_draft - 1:
                 h_chain = drafter(embed(dj[None]), h_chain, draft_cache)
-        return drafts
+        return drafts, dlogits
 
     tic = time.perf_counter()
     emitted = 0
-    drafts = draft_phase(catch_t, catch_g)
+    drafts, dlogits = draft_phase(catch_t, catch_g)
     n_spec = num_draft - 1
     while emitted < max_tokens:
         verify_tokens = mx.concatenate([pending] + drafts)
@@ -509,14 +565,18 @@ def eagle3_stream_generate(
         trace, h_ver, g_ver = cast(
             tuple[_DeltaNetTrace, mx.array, mx.array], _verify_eagle()
         )
-        preds = mx.argmax(lm.lm_head(h_ver)[0], axis=-1)
-
-        preds_np = np.array(preds)
         verify_np = np.array(verify_tokens)
-        m = 0
-        while m < num_draft and preds_np[m] == verify_np[m + 1]:
-            m += 1
-        bonus = int(preds_np[m])
+        if temp > 0.0:
+            m, bonus = accept_drafts(
+                np.array(lm.lm_head(h_ver)[0]), np.stack(dlogits), verify_np[1:],
+                temp=temp, top_p=top_p, rng=rng,
+            )
+        else:
+            preds_np = np.array(mx.argmax(lm.lm_head(h_ver)[0], axis=-1))
+            m = 0
+            while m < num_draft and preds_np[m] == verify_np[m + 1]:
+                m += 1
+            bonus = int(preds_np[m])
         accepted = [int(v) for v in verify_np[: m + 1]]
 
         stats.spec_cycles += 1
@@ -538,7 +598,7 @@ def eagle3_stream_generate(
         catch_t = mx.concatenate(
             [mx.array(accepted[1:], dtype=mx.int32), pending]
         )[None]
-        next_drafts = draft_phase(catch_t, catch_g)
+        next_drafts, next_dlogits = draft_phase(catch_t, catch_g)
         mx.async_eval(next_drafts[-1])
 
         stop = False
@@ -553,7 +613,7 @@ def eagle3_stream_generate(
             if emitted >= max_tokens:
                 stop = True
                 break
-        drafts = next_drafts
+        drafts, dlogits = next_drafts, next_dlogits
         if stop:
             break
     stats.decode_s = time.perf_counter() - tic
@@ -569,18 +629,23 @@ def dflash_stream_generate(
     prefill_chunk: int = 2048,
     eos_ids: set[int] | frozenset[int] = frozenset(),
     stats: GenStats | None = None,
+    temp: float = 0.0,
+    top_p: float = 1.0,
 ):
-    """Greedy speculative decoding with the DFlash block drafter.
+    """Speculative decoding with the DFlash block drafter.
 
     Like the MTP/EAGLE loops, but the drafter holds no autoregressive
     state: its KV is built from fc-fused target features at fed positions
     (appended only for ACCEPTED tokens — no trim, no rollback), and each
-    cycle drafts via one 16-token masked block forward. The verify forward
-    keeps exact target weights + lm_head, so output is token-identical to
-    plain greedy."""
+    cycle drafts via one 16-token masked block forward. Greedy at ``temp == 0``
+    (output identical to plain greedy); Leviathan-Chen temp-correct sampling at
+    ``temp > 0`` (the block logits are over the target vocab, so ``q`` is exact)."""
     import numpy as np
 
     from ponyexl3.mlx.eagle3 import AuxTrace
+    from ponyexl3.mlx.spec_sampling import accept_drafts, sample_token
+
+    rng = np.random.default_rng()
 
     lm = model.language_model
     embed = lm.model.embed_tokens
@@ -598,13 +663,28 @@ def dflash_stream_generate(
         mx.eval(h)
         drafter.update_kv(drafter.fuse(aux.take()))
     logits = lm.lm_head(h[:, -1:, :])  # pyright: ignore[reportPossiblyUnboundVariable]
-    pending = mx.argmax(logits[0, -1]).reshape(1).astype(mx.int32)
+    if temp > 0.0:
+        mx.eval(logits)
+        pending = mx.array([sample_token(np.asarray(logits[0, -1]), temp, top_p, rng)], dtype=mx.int32)
+    else:
+        pending = mx.argmax(logits[0, -1]).reshape(1).astype(mx.int32)
     mx.eval(pending)
     stats.prefill_s = time.perf_counter() - tic
 
+    def _draft(pend: mx.array):
+        # greedy: lazy token array; temp-correct: sample each block position
+        # from its target-vocab logits and keep them for the accept.
+        if temp > 0.0:
+            bl = drafter.draft_block(pend, embed, lm.lm_head, num_draft, return_logits=True)
+            mx.eval(bl)
+            dl = np.asarray(bl)  # (num_draft, V)
+            d = mx.array([sample_token(dl[j], temp, top_p, rng) for j in range(num_draft)], dtype=mx.int32)
+            return d, dl
+        return drafter.draft_block(pend, embed, lm.lm_head, num_draft), None
+
     tic = time.perf_counter()
     emitted = 0
-    drafts = drafter.draft_block(pending, embed, lm.lm_head, num_draft)
+    drafts, dlogits = _draft(pending)
     while emitted < max_tokens:
         verify_tokens = mx.concatenate([pending, drafts])
         snap = _snapshot_recurrent(cache)
@@ -617,14 +697,18 @@ def dflash_stream_generate(
         trace, h_ver, g_ver = cast(
             tuple[_DeltaNetTrace, mx.array, mx.array], _verify_dflash()
         )
-        preds = mx.argmax(lm.lm_head(h_ver)[0], axis=-1)
-
-        preds_np = np.array(preds)
         verify_np = np.array(verify_tokens)
-        m = 0
-        while m < num_draft and preds_np[m] == verify_np[m + 1]:
-            m += 1
-        bonus = int(preds_np[m])
+        if temp > 0.0:
+            m, bonus = accept_drafts(
+                np.array(lm.lm_head(h_ver)[0]), dlogits, verify_np[1:],
+                temp=temp, top_p=top_p, rng=rng,
+            )
+        else:
+            preds_np = np.array(mx.argmax(lm.lm_head(h_ver)[0], axis=-1))
+            m = 0
+            while m < num_draft and preds_np[m] == verify_np[m + 1]:
+                m += 1
+            bonus = int(preds_np[m])
         accepted = [int(v) for v in verify_np[: m + 1]]
 
         stats.spec_cycles += 1
@@ -645,7 +729,7 @@ def dflash_stream_generate(
         drafter.update_kv(g_ver[:, : m + 1, :])
 
         pending = mx.array([bonus], dtype=mx.int32)
-        drafts = drafter.draft_block(pending, embed, lm.lm_head, num_draft)
+        drafts, dlogits = _draft(pending)
         mx.async_eval(drafts)
 
         stop = False
@@ -896,7 +980,7 @@ def generate_text(
         eos_ids.add(tokenizer.eos_token_id)
 
     stats = GenStats()
-    if dflash is not None and temp <= 0.0:
+    if dflash is not None:
         gen = dflash_stream_generate(
             model,
             dflash,
@@ -906,8 +990,9 @@ def generate_text(
             prefill_chunk=prefill_chunk,
             eos_ids=eos_ids,
             stats=stats,
+            temp=temp,
         )
-    elif eagle3 is not None and temp <= 0.0:
+    elif eagle3 is not None:
         gen = eagle3_stream_generate(
             model,
             eagle3,
@@ -917,8 +1002,9 @@ def generate_text(
             prefill_chunk=prefill_chunk,
             eos_ids=eos_ids,
             stats=stats,
+            temp=temp,
         )
-    elif mtp is not None and temp <= 0.0:
+    elif mtp is not None:
         gen = speculative_stream_generate(
             model,
             mtp,
@@ -928,6 +1014,7 @@ def generate_text(
             prefill_chunk=prefill_chunk,
             eos_ids=eos_ids,
             stats=stats,
+            temp=temp,
         )
     elif lookup and temp <= 0.0:
         gen = lookup_stream_generate(

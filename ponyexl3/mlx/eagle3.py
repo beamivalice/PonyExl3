@@ -117,6 +117,17 @@ class Eagle3Draft(nn.Module):
         logits = self.lm_head(self.head_input(h_last))
         return self._d2t[mx.argmax(logits[0, -1])].reshape(1)
 
+    @property
+    def d2t(self) -> mx.array:
+        """Draft-vocab index -> target token id (offsets pre-applied)."""
+        return self._d2t
+
+    def draft_logits(self, h_last: mx.array) -> mx.array:
+        """(B, 1, H) -> (V_draft,) raw draft-vocab (32k) logits. ``d2t`` maps the
+        index to a target id; used for temperature-correct sampling, where the
+        draft ``q`` is scattered into the target vocab via ``d2t``."""
+        return self.lm_head(self.head_input(h_last))[0, -1]
+
     def quantize_draft(self, *, bits: int = 4, group_size: int = 64) -> None:
         """Lossy-quantize the whole drafter (verify-gated, output-exact)."""
         for name in (

@@ -151,8 +151,12 @@ class DFlashDraft(nn.Module):
         embed: Any,
         head: Any,
         num_draft: int,
+        *,
+        return_logits: bool = False,
     ) -> mx.array:
-        """One 16-token block forward -> (num_draft,) target-vocab drafts."""
+        """One 16-token block forward -> (num_draft,) target-vocab drafts, or
+        the (num_draft, V) target-vocab logits if ``return_logits`` (for
+        temperature-correct sampling)."""
         ids = mx.concatenate(
             [
                 pending.reshape(1).astype(mx.int32),
@@ -200,6 +204,8 @@ class DFlashDraft(nn.Module):
         else:
             h = h[:, 1 : 1 + num_draft]
         logits = (self._draft_head or head)(h.astype(mx.float16))
+        if return_logits:
+            return logits[0]  # (num_draft, V)
         return mx.argmax(logits[0], axis=-1).astype(mx.int32)
 
     def quantize_draft(

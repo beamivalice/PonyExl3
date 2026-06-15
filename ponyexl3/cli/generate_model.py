@@ -97,7 +97,7 @@ def main() -> int:
         )
 
     dflash = None
-    if args.dflash and args.engine in ("exl3", "w4gptq") and args.temp <= 0.0:
+    if args.dflash and args.engine in ("exl3", "w4gptq"):
         from ponyexl3.mlx.dflash import DFlashDraft
 
         dflash = DFlashDraft(args.dflash)
@@ -125,7 +125,7 @@ def main() -> int:
             )
 
     eagle3 = None
-    if dflash is None and args.eagle3 and args.engine == "exl3" and args.temp <= 0.0:
+    if dflash is None and args.eagle3 and args.engine == "exl3":
         from ponyexl3.mlx.eagle3 import Eagle3Draft
 
         eagle3 = Eagle3Draft(args.eagle3)
@@ -139,7 +139,7 @@ def main() -> int:
             )
 
     mtp = None
-    if dflash is None and eagle3 is None and args.mtp != "off" and args.engine == "exl3" and args.temp <= 0.0:
+    if dflash is None and eagle3 is None and args.mtp != "off" and args.engine == "exl3":
         from ponyexl3.mlx.mtp import load_mtp
 
         mtp = load_mtp(

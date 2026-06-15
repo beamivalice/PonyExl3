@@ -16,78 +16,71 @@ PonyExl3 ports the [ExLlamaV3 EXL3](https://github.com/turboderp-org/exllamav3) 
 
 ---
 
-## Performance — Apple M5 Max (128 GB)
+## Performance
 
-Decode throughput measured on this machine — greedy, and **verify-gated**, so every
-speculative mode emits output token-identical to plain greedy. Bars show the trained
-drafters; draft-free n-gram lookup is workload-dependent (+16–43% on copy/edit, ~neutral
-on novel text) and is omitted here.
+Decode throughput in tok/s — greedy, and **verify-gated** so every speculative mode
+emits output token-identical to plain greedy. Measured on an Apple M5 Max (128 GB) and
+a 32 GB M1 Max, same EXL3 checkpoints ([UnstableLlama](https://huggingface.co/UnstableLlama)).
+**Bold** = fastest in that row.
 
-<p align="center">
-<img src="docs/assets/perf_27b4_15.svg" width="730" alt="Qwen3.6-27B 4.15bpw decode tok/s on M5 Max"><br>
-<sub><a href="https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw">Qwen3.6-27B · 4.15 bpw — EXL3 quant by UnstableLlama ↗</a></sub>
-</p>
+| Model | Hardware | plain | EAGLE-3 | MTP | DFlash | prefill (8k) | resident |
+|-------|----------|------:|--------:|----:|-------:|-------------:|---------:|
+| **Qwen3.6-27B · 4.15bpw** | M5 Max | 16.6 | 24.2 | 28.3 | **37.8** | 662 | 15.1 GB |
+|  | M1 Max | 4.0 | — | 8.7 | **15.0** | 126 | 15.1 GB |
+| **Qwen3.6-35B-A3B · 4.00bpw** | M5 Max | 68.5 | **79.8** | — | — | 2775 | 17.2 GB |
+|  | M1 Max | 23.5 | ~flat | — | — | 497 | 17.2 GB |
+| **Qwen3.6-27B · 8.00bpw** | M5 Max | 15.6 | — | — | **31.6** | 642 | 26.3 GB |
 
-<p align="center">
-<img src="docs/assets/perf_moe.svg" width="730" alt="Qwen3.6-35B-A3B decode tok/s on M5 Max"><br>
-<sub><a href="https://huggingface.co/UnstableLlama/Qwen3.6-35B-A3B-exl3-4.00bpw">Qwen3.6-35B-A3B · 4.00 bpw — EXL3 quant by UnstableLlama ↗</a></sub>
-</p>
+4-bit weights stay resident and decode in-kernel (the 27B runs in ~15 GB). Speculation
+pays off *more* on the slower GPU for the dense model — DFlash is **3.75×** on the M1 Max
+(4.0 → 15.0) vs 2.28× on the M5 Max — but barely moves the MoE (already fast per token).
+Draft-free n-gram lookup is workload-dependent (+16% on code edits, ~neutral on novel
+text), so it's not tabled. Reproduce with `tools/bench/perf_chart_bench.py`; accuracy
+is [below](#accuracy).
 
-<p align="center">
-<img src="docs/assets/perf_27b8.svg" width="730" alt="Qwen3.6-27B 8.00bpw decode tok/s on M5 Max"><br>
-<sub><a href="https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-8.00bpw">Qwen3.6-27B · 8.00 bpw — EXL3 quant by UnstableLlama ↗</a></sub>
-</p>
+**At temperature 0.6** the same drafters stay **distribution-exact** (Leviathan-Chen
+rejection sampling, not greedy — see [Speculative decoding](#speculative-decoding)).
+Decode tok/s on the M5 Max (sampling is stochastic, so these wobble run-to-run; the
+output *distribution* is exact vs plain sampling):
 
-Prefill at 8k context: **662 / 2775 / 642 tok/s** (27B-4.15 / 35B-A3B / 27B-8.00). 4-bit
-weights stay resident and are decoded in-kernel — the 27B runs inference in **~15 GB**.
-Reproduce with `tools/bench/perf_chart_bench.py`; accuracy is [below](#accuracy).
+| Model | plain | EAGLE-3 | MTP | DFlash |
+|-------|------:|--------:|----:|-------:|
+| Qwen3.6-27B · 4.15bpw | 17.5 | 19.7 | 20.5 | **25.1** |
+| Qwen3.6-35B-A3B · 4.00bpw | **67.8** | 57.9 | — | 31.1 |
 
-Also runs on a 32 GB **M1 Max** (older, slower GPU), same checkpoints:
-
-| Model | prefill (4k / 8k) | decode | best drafter | resident |
-|-------|------------------:|-------:|-------------:|---------:|
-| Qwen3.6-27B 4.15bpw | 149 / 126 t/s | 4.0 t/s | **15.0** (DFlash) | 15.1 GB |
-| Qwen3.6-35B-A3B 4.00bpw | 673 / 497 t/s | 23.5 t/s | ~flat | 17.2 GB |
-
-Dense decode is ALU-bound, so speculation helps *more* on the slower GPU: DFlash
-takes the 27B from 4.0 → **15.0 tok/s** (3.75×, 6.0 accepted/cycle), MTP → 8.7. The
-MoE's few active params/token keep it usable (23.5) but leave little for spec to win
-— its verify overhead eats the gain (n-gram lookup likewise isn't worth it). Prefill
-drops with context as attention grows. Both fit a 32 GB Mac at short context (long
-context is memory-bound — see below).
+DFlash leads the 27B (**1.4×** over plain). On the MoE, plain decode is already fast
+enough that the host-coupled accept overhead makes speculation net-negative — run it
+greedy there, or skip the drafter at temperature.
 
 ### vs RTX 4090 (same EXL3 weights)
 
-The identical EXL3 checkpoints run through exllamav3 on an RTX 4090. The platforms
-split by axis: the 4090 wins **prefill** on raw compute (2–3×); the M5 Max wins or
-ties **decode** — the latency-bound regime that gates interactive use — outright on
-the MoE.
-
-<p align="center">
-<img src="docs/assets/vs_rtx4090_decode.svg" width="720" alt="EXL3 decode tok/s: Apple M5 Max vs RTX 4090"><br>
-<sub>EXL3 quants by UnstableLlama: <a href="https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw">Qwen3.6-27B · 4.15 bpw</a> · <a href="https://huggingface.co/UnstableLlama/Qwen3.6-35B-A3B-exl3-4.00bpw">Qwen3.6-35B-A3B · 4.00 bpw</a> ↗</sub>
-</p>
+The identical EXL3 checkpoints through exllamav3 on an RTX 4090. The platforms split by
+axis: the 4090 wins **prefill** on raw compute (2–3×); the M5 Max wins or ties **decode**
+— the latency-bound regime that gates interactive use — outright on the MoE.
 
 | metric (8k context) | 27B · M5 Max | 27B · RTX 4090 | 35B-A3B · M5 Max | 35B-A3B · RTX 4090 |
 |---------------------|------------:|---------------:|-----------------:|-------------------:|
 | prefill tok/s       | 662 | 2306 | 2775 | 6140 |
 | decode, plain       | 16.6 | 33 | **68.5** | 52 |
-| decode, + drafter   | 38 | — | 80 | — |
+| decode, + drafter   | 38 (DFlash) | — | 80 (EAGLE-3) | — |
 | memory              | 15.1 GB | 15.9 GB | 17.2 GB | 17.6 GB |
 
 RTX 4090 figures are exllamav3 plain TG (no drafter); the M5 Max drafters are
-verify-gated (token-identical). The M5 Max is a 128 GB laptop SoC — it holds the
-4090 on decode while fitting far larger models than the 4090's 24 GB.
+verify-gated. The M5 Max is a 128 GB laptop SoC — it holds the 4090 on decode while
+fitting far larger models than the 4090's 24 GB.
 
 ---
 
 ## Speculative decoding
 
-Four drafters, all **verify-gated**: the target model checks every proposed token,
-so output stays **identical to plain greedy** — these buy speed, never trade quality.
-Numbers below are **Qwen3.6-27B 4.15bpw decode on an Apple M5 Max** (greedy; the
-model-based drafters add `--draft-w4`, which is free since draft tokens never reach
-the output stream).
+Four drafters, all **verify-gated**: the target model checks every proposed token, so
+they buy speed, never trade quality. At `--temp 0` the output is **identical to plain
+greedy**; at `--temp > 0` the verify switches to Leviathan-Chen rejection sampling, so
+the stream is **distribution-exact vs plain sampling** at that temperature (`q` drafted,
+accepted with `min(1, p/q)`, bonus resampled from `(p−q)₊`). Numbers below are
+**Qwen3.6-27B 4.15bpw, M5 Max, greedy** (model-based drafters add `--draft-w4`, free
+since draft tokens never reach the output stream; at temp 0.6 the same drafters run
+~21–29 tok/s, distribution-exact).
 
 | Method | flag | tok/s | vs plain | tok/cycle | what it is |
 |--------|------|------:|---------:|----------:|------------|
