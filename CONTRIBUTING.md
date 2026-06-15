@@ -20,8 +20,8 @@ older Python releases are unsupported.
 pytest tests/ -q
 ```
 
-**171 tests** run without any checkpoint on disk (synthetic layers + CPU/MLX
-parity). Nine more are skipped unless you set model env vars — see README
+**194 tests** run without any checkpoint on disk (synthetic layers + CPU/MLX
+parity). Thirteen integration tests are skipped unless you set model env vars — see README
 [Testing](README.md#testing).
 
 CI runs the same suite on **GitHub-hosted `macos-latest`** (Apple Silicon).
@@ -33,6 +33,7 @@ Optional integration tests (skipped by default):
 ```bash
 export PONYEXL3_MODEL_DIR=/path/to/checkpoint
 export PONYEXL3_MODEL_27B=/path/to/27b-exl3
+export PONYEXL3_MODEL_GEMMA4=/path/to/gemma4-exl3
 export PONYEXL3_REFERENCE_NPZ=/path/to/reference.npz
 pytest tests/ -q
 ```

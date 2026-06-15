@@ -71,6 +71,7 @@ def main() -> int:
     import mlx.core as mx
     from mlx_lm.utils import load_tokenizer
 
+    from ponyexl3.cli._generate_common import collect_eos_token_ids
     from ponyexl3.mlx.generate import generate_text
     from ponyexl3.mlx.model import load_model
 
@@ -83,9 +84,7 @@ def main() -> int:
     load_s = time.perf_counter() - t0
     tokenizer = load_tokenizer(Path(args.model))
 
-    text_cfg = config.get("text_config", config)
-    eos = text_cfg.get("eos_token_id")
-    extra_eos = tuple(eos) if isinstance(eos, list) else ((eos,) if eos is not None else ())
+    extra_eos = collect_eos_token_ids(config)
 
     # Drafters (decode only) — mirrors the generate CLI wiring.
     mtp = dflash = eagle3 = None

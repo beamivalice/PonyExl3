@@ -80,17 +80,32 @@ class _RouterTap:
         self.records: dict[int, tuple[Any, Any]] = {}
 
     def install(self, model: MlxLmModel) -> int:
-        from ponyexl3.mlx.exl3_moe import EXL3MoEBlock
+        from ponyexl3.mlx.exl3_moe import EXL3Gemma4MoEBlock, EXL3MoEBlock
 
         n = 0
         for li, layer in enumerate(model.language_model.model.layers):
             block = getattr(layer, "mlp", None)
-            if not isinstance(block, EXL3MoEBlock):
+            if isinstance(block, EXL3MoEBlock):
+                orig = block._router()  # pyright: ignore[reportPrivateUsage]
+                block._router_fn = self._wrap(li, orig)  # pyright: ignore[reportPrivateUsage]
+                n += 1
                 continue
-            orig = block._router()  # pyright: ignore[reportPrivateUsage]
-            block._router_fn = self._wrap(li, orig)  # pyright: ignore[reportPrivateUsage]
-            n += 1
+            block = getattr(layer, "router", None)
+            if isinstance(block, EXL3Gemma4MoEBlock):
+                orig = block._route
+                block._route = self._wrap_route(li, orig)  # type: ignore[method-assign]
+                n += 1
         return n
+
+    def _wrap_route(
+        self, li: int, orig: Callable[[Any], tuple[Any, Any]]
+    ) -> Callable[[Any], tuple[Any, Any]]:
+        def _fn(h: Any) -> tuple[Any, Any]:
+            inds, scores = orig(h)
+            self.records[li] = (inds, scores)
+            return inds, scores
+
+        return _fn
 
     def _wrap(self, li: int, orig: Callable[..., tuple[Any, Any]]) -> Callable[..., tuple[Any, Any]]:
         def _fn(*args: Any) -> tuple[Any, Any]:

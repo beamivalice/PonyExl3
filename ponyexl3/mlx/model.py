@@ -5,7 +5,8 @@ EXL3-quantized linear for :class:`EXL3Linear`. Non-quantized tensors (norms,
 embeddings, DeltaNet params) load through the architecture's ``sanitize`` so
 HF-side conventions (conv1d layout, zero-centered norms) are handled by mlx_lm.
 
-Currently mapped architectures: ``qwen3_5`` (Qwen3.5 hybrid linear/full attention).
+Mapped architectures: ``qwen3_5`` / ``qwen3_5_moe`` (Qwen3.5/3.6) and
+``gemma4`` / ``gemma4_text`` (Gemma4 26B-A4B MoE with hybrid SWA/full attn).
 """
 
 from __future__ import annotations
@@ -36,19 +37,149 @@ _ARCHITECTURES = {
     "qwen3_5_text": "qwen3_5",
     "qwen3_5_moe": "qwen3_5_moe",
     "qwen3_5_moe_text": "qwen3_5_moe",
+    "gemma4": "gemma4",
+    "gemma4_text": "gemma4_text",
 }
 
-_expert_re: re.Pattern[str] | None = None
+_QWEN_ARCHES = frozenset({"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"})
+_GEMMA4_ARCHES = frozenset({"gemma4", "gemma4_text"})
+
+_qwen_expert_re: re.Pattern[str] | None = None
+_gemma4_expert_re: re.Pattern[str] | None = None
 
 
-def _expert_match(key: str) -> re.Match[str] | None:
-    global _expert_re
-    if _expert_re is None:
-        _expert_re = re.compile(
+def _qwen_expert_match(key: str) -> re.Match[str] | None:
+    global _qwen_expert_re
+    if _qwen_expert_re is None:
+        _qwen_expert_re = re.compile(
             r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
             r"(gate_proj|up_proj|down_proj)$"
         )
-    return _expert_re.match(key)
+    return _qwen_expert_re.match(key)
+
+
+def _gemma4_expert_match(key: str) -> re.Match[str] | None:
+    global _gemma4_expert_re
+    if _gemma4_expert_re is None:
+        _gemma4_expert_re = re.compile(
+            r"model\.language_model\.layers\.(\d+)\.experts\.(\d+)\."
+            r"(gate_proj|up_proj|down_proj)$"
+        )
+    return _gemma4_expert_re.match(key)
+
+
+def _is_routed_expert_key(key: str) -> bool:
+    return _qwen_expert_match(key) is not None or _gemma4_expert_match(key) is not None
+
+
+def _stack_expert_switch_glu(
+    expert_pres: list[str],
+    storage: dict[str, JsonDict],
+    weights: dict[str, mx.array],
+    *,
+    activation: str = "silu",
+) -> tuple[Any, set[str], int]:
+    """Stack per-expert gate/up/down EXL3 tensors into one EXL3SwitchGLU."""
+    from ponyexl3.mlx.exl3_moe import EXL3SwitchGLU
+    from ponyexl3.ref.codebook import codebook_mode_from_flags
+
+    sample = f"{expert_pres[0]}.gate_proj"
+    info = storage[sample]
+    sh = info["stored_tensors"][f"{sample}.trellis"]["shape"]
+    k = sh[2] * 16 // 256
+    cb = codebook_mode_from_flags(
+        mcg=bool(info.get("mcg_multiplier")),
+        mul1=bool(info.get("mul1_multiplier")),
+    )
+    gu_parts, gu_suh, gu_svh = [], [], []
+    dn_parts, dn_suh, dn_svh = [], [], []
+    up_parts = []
+    consumed: set[str] = set()
+    for ep in expert_pres:
+        g, u, d = f"{ep}.gate_proj", f"{ep}.up_proj", f"{ep}.down_proj"
+        gu_parts.append(weights[f"{g}.trellis"])
+        up_parts.append(weights[f"{u}.trellis"])
+        gu_suh.append(mx.stack([weights[f"{g}.suh"], weights[f"{u}.suh"]]))
+        gu_svh.append(mx.concatenate([weights[f"{g}.svh"], weights[f"{u}.svh"]]))
+        dn_parts.append(weights[f"{d}.trellis"])
+        dn_suh.append(weights[f"{d}.suh"])
+        dn_svh.append(weights[f"{d}.svh"])
+        for proj in (g, u, d):
+            if proj in storage:
+                consumed.add(proj)
+    mod = EXL3SwitchGLU(
+        gu_trellis=mx.concatenate(gu_parts + up_parts, axis=1).view(mx.uint16),
+        gu_suh=mx.stack(gu_suh).astype(mx.float16),
+        gu_svh=mx.stack(gu_svh).astype(mx.float16),
+        dn_trellis=mx.concatenate(dn_parts, axis=1).view(mx.uint16),
+        dn_suh=mx.stack(dn_suh).astype(mx.float16),
+        dn_svh=mx.stack(dn_svh).astype(mx.float16),
+        k=k,
+        cb=cb,
+        activation=activation,
+    )
+    mx.eval(
+        mod._gu_trellis, mod._gu_suh, mod._gu_svh,  # pyright: ignore[reportPrivateUsage]
+        mod._dn_trellis, mod._dn_suh, mod._dn_svh,  # pyright: ignore[reportPrivateUsage]
+    )
+    return mod, consumed, k
+
+
+def _build_gemma4_moe_experts(
+    model: MlxLmModel,
+    storage: dict[str, JsonDict],
+    weights: dict[str, mx.array],
+    verbose: bool,
+) -> set[str]:
+    """Stack Gemma4 routed experts into EXL3Gemma4MoEBlock (shared MLP stays)."""
+    from ponyexl3.mlx.exl3_moe import EXL3Gemma4MoEBlock, _Gemma4ExpertsShim
+
+    legacy = os.environ.get("PONYEXL3_GEMMA4_LEGACY_MOE", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+    layers: dict[int, int] = {}
+    for key in storage:
+        m = _gemma4_expert_match(key)
+        if m:
+            li, e = int(m.group(1)), int(m.group(2))
+            layers[li] = max(layers.get(li, 0), e + 1)
+    if not layers:
+        return set()
+
+    consumed: set[str] = set()
+    for li, E in sorted(layers.items()):
+        pre = f"model.language_model.layers.{li}.experts"
+        expert_pres = [f"{pre}.{e}" for e in range(E)]
+        mod, used, k = _stack_expert_switch_glu(
+            expert_pres, storage, weights, activation="gelu"
+        )
+        consumed |= used
+        layer = model.layers[li]
+        if legacy:
+            _set_module(
+                model, f"language_model.model.layers.{li}.experts.switch_glu", mod
+            )
+            if verbose:
+                print(f"  gemma4 moe layer {li}: {E} routed experts, k={k}")
+            continue
+        router = layer.router
+        block = EXL3Gemma4MoEBlock(
+            router.proj,
+            router.scale,
+            router.per_expert_scale,
+            mod,
+            router.config.top_k_experts,
+            router.eps,
+            router.config.hidden_size,
+        )
+        path = f"language_model.model.layers.{li}"
+        _set_module(model, f"{path}.router", block)
+        _set_module(model, f"{path}.experts", _Gemma4ExpertsShim(block))
+        if verbose:
+            print(f"  gemma4 moe layer {li}: {E} routed experts, k={k} (EXL3Gemma4MoEBlock)")
+    return consumed
 
 
 def _build_moe_experts(
@@ -57,62 +188,37 @@ def _build_moe_experts(
     weights: dict[str, mx.array],
     verbose: bool,
 ) -> set[str]:
-    """Stack each layer's experts (plus the shared expert as the LAST expert)
-    into EXL3SwitchGLU modules wrapped in EXL3MoEBlock. Returns the set of
-    storage keys consumed here (skipped by the generic EXL3Linear swap)."""
-    from ponyexl3.mlx.exl3_moe import EXL3MoEBlock, EXL3SwitchGLU
-    from ponyexl3.ref.codebook import codebook_mode_from_flags
+    """Stack routed experts for Qwen3.5 or Gemma4 MoE checkpoints."""
+    if any(_gemma4_expert_match(k) for k in storage):
+        return _build_gemma4_moe_experts(model, storage, weights, verbose)
+    return _build_qwen_moe_experts(model, storage, weights, verbose)
+
+
+def _build_qwen_moe_experts(
+    model: MlxLmModel,
+    storage: dict[str, JsonDict],
+    weights: dict[str, mx.array],
+    verbose: bool,
+) -> set[str]:
+    """Stack Qwen3.5 MoE experts (plus shared expert) into EXL3MoEBlock."""
+    from ponyexl3.mlx.exl3_moe import EXL3MoEBlock
 
     layers: dict[int, int] = {}
-    consumed: set[str] = set()
-    for key, info in storage.items():
-        m = _expert_match(key)
+    for key in storage:
+        m = _qwen_expert_match(key)
         if m:
             li, e = int(m.group(1)), int(m.group(2))
             layers[li] = max(layers.get(li, 0), e + 1)
     if not layers:
-        return consumed
+        return set()
 
+    consumed: set[str] = set()
     for li, E in sorted(layers.items()):
         pre = f"model.language_model.layers.{li}.mlp.experts"
-        info = storage[f"{pre}.0.gate_proj"]
-        sh = info["stored_tensors"][f"{pre}.0.gate_proj.trellis"]["shape"]
-        k = sh[2] * 16 // 256
-        cb = codebook_mode_from_flags(
-            mcg=bool(info.get("mcg_multiplier")),
-            mul1=bool(info.get("mul1_multiplier")),
-        )
-        gu_parts, gu_suh, gu_svh = [], [], []
-        dn_parts, dn_suh, dn_svh = [], [], []
         shared_pre = f"model.language_model.layers.{li}.mlp.shared_expert"
         expert_pres = [f"{pre}.{e}" for e in range(E)] + [shared_pre]
-        up_parts = []
-        for ep in expert_pres:
-            g, u, d = f"{ep}.gate_proj", f"{ep}.up_proj", f"{ep}.down_proj"
-            gu_parts.append(weights[f"{g}.trellis"])
-            up_parts.append(weights[f"{u}.trellis"])
-            gu_suh.append(mx.stack([weights[f"{g}.suh"], weights[f"{u}.suh"]]))
-            gu_svh.append(mx.concatenate([weights[f"{g}.svh"], weights[f"{u}.svh"]]))
-            dn_parts.append(weights[f"{d}.trellis"])
-            dn_suh.append(weights[f"{d}.suh"])
-            dn_svh.append(weights[f"{d}.svh"])
-            for proj in (g, u, d):
-                if proj in storage:
-                    consumed.add(proj)
-        mod = EXL3SwitchGLU(
-            gu_trellis=mx.concatenate(gu_parts + up_parts, axis=1).view(mx.uint16),
-            gu_suh=mx.stack(gu_suh).astype(mx.float16),
-            gu_svh=mx.stack(gu_svh).astype(mx.float16),
-            dn_trellis=mx.concatenate(dn_parts, axis=1).view(mx.uint16),
-            dn_suh=mx.stack(dn_suh).astype(mx.float16),
-            dn_svh=mx.stack(dn_svh).astype(mx.float16),
-            k=k,
-            cb=cb,
-        )
-        mx.eval(
-            mod._gu_trellis, mod._gu_suh, mod._gu_svh,  # pyright: ignore[reportPrivateUsage]
-            mod._dn_trellis, mod._dn_suh, mod._dn_svh,  # pyright: ignore[reportPrivateUsage]
-        )
+        mod, used, k = _stack_expert_switch_glu(expert_pres, storage, weights)
+        consumed |= used
         old = model.layers[li].mlp
         block = EXL3MoEBlock(
             old.gate, old.shared_expert_gate, mod, old.top_k, bool(old.norm_topk_prob)
@@ -226,14 +332,30 @@ ENGINES = ("exl3", "fold16", "w8a16", "w4a16", "w4gptq")
 
 # Sibling projections called on the same input within one mlx_lm module —
 # candidates for one-launch fused groups (must share in_features and K).
+# Longer groups first; ``q_proj``+``k_proj`` covers Gemma4 full-attn (no ``v_proj``).
 _FUSE_SIBLINGS = (
     ("mlp", ("gate_proj", "up_proj")),
     ("self_attn", ("q_proj", "k_proj", "v_proj")),
+    ("self_attn", ("q_proj", "k_proj")),
     ("linear_attn", ("in_proj_qkv", "in_proj_z")),
 )
 
 
-def fuse_exl3_siblings(model: MlxLmModel) -> int:
+def _fuse_min_bytes(model_type: str) -> int:
+    """Minimum fp16-equivalent weight bytes to fuse a sibling group."""
+    from ponyexl3.mlx.exl3_linear import HUGE_WEIGHT_BYTES
+
+    env = os.environ.get("EXL3_FUSE_MIN_MB", "").strip()
+    if env:
+        return int(float(env) * 1048576)
+    # Gemma4 sliding qkv (~44 MB) benefits from fusion; shared MLP gate+up (~24 MB)
+    # regresses decode when fused (same small-layer effect as Qwen 2B).
+    if model_type in _GEMMA4_ARCHES:
+        return 40 * 1024 * 1024
+    return HUGE_WEIGHT_BYTES
+
+
+def fuse_exl3_siblings(model: MlxLmModel, *, model_type: str = "") -> int:
     """Replace same-K EXL3Linear sibling groups with FusedEXL3Group views.
 
     Only groups above ~64 MB (fp16-equivalent) are fused: the fused chain
@@ -241,16 +363,10 @@ def fuse_exl3_siblings(model: MlxLmModel) -> int:
     independent sibling GEMVs for throughput, which only pays off when the
     kernels are big (measured: 27B +prefill +decode, 2B decode regressed 2x).
     """
-    from ponyexl3.mlx.exl3_linear import HUGE_WEIGHT_BYTES
-    from ponyexl3.mlx.exl3_fused import FusedEXL3Group, fusable
+    from ponyexl3.mlx.exl3_linear import EXL3Linear
+    from ponyexl3.mlx.exl3_fused import FusedEXL3Group, FusedEXL3Sibling, fusable
 
-    # EXL3_FUSE_MIN_MB overrides the 64 MB gate: 35B-A3B's dense projections
-    # (qkv+z 50 MB, attn qkv 38 MB) sit just under it, leaving 131 unfused
-    # GEMV chains per decode token (Phase 23 census).
-    min_bytes = int(
-        float(os.environ.get("EXL3_FUSE_MIN_MB", HUGE_WEIGHT_BYTES / 1048576))
-        * 1048576
-    )
+    min_bytes = _fuse_min_bytes(model_type)
     # EXL3_FUSE_ONLY / EXL3_FUSE_SKIP restrict fusion by group type
     # (consumer-topology experiments, Phase 23c: fusing members whose
     # outputs are NOT consumed together — DeltaNet's z with qkv — extends
@@ -278,6 +394,8 @@ def fuse_exl3_siblings(model: MlxLmModel) -> int:
             if owner is None:
                 continue
             mods = [getattr(owner, nm, None) for nm in names]
+            if any(isinstance(m, FusedEXL3Sibling) for m in mods if m is not None):
+                continue
             exl3_mods = [m for m in mods if isinstance(m, EXL3Linear)]
             if len(exl3_mods) != len(names):
                 continue
@@ -485,7 +603,7 @@ def load_model(
     if moe_consumed:
         mx.clear_cache()
     for n, (key, info) in enumerate(sorted(storage.items())):
-        if _expert_match(key) or key in moe_consumed:
+        if _is_routed_expert_key(key) or key in moe_consumed:
             continue
         layer = _build_exl3_layer(key, info, weights)
         _set_module(model, _module_path(key), EXL3Linear(layer))
@@ -530,12 +648,13 @@ def load_model(
         )
 
     if engine in ("exl3", "w4gptq"):
-        from ponyexl3.mlx.deltanet_patch import install_deltanet_glue
+        if model_type in _QWEN_ARCHES:
+            from ponyexl3.mlx.deltanet_patch import install_deltanet_glue
 
-        install_deltanet_glue()
-        fused = fuse_exl3_siblings(model)
+            install_deltanet_glue()
+
+        fused = fuse_exl3_siblings(model, model_type=model_type)
         if fused:
-            # Per-member runtime uploads are now served by the fused groups.
             from ponyexl3.mlx.layer_state import clear_layer_caches
 
             clear_layer_caches()
@@ -544,11 +663,12 @@ def load_model(
             if verbose:
                 print(f"  fused {fused} sibling groups")
 
-        from ponyexl3.mlx.exl3_mlp_monolith import install_mlp_monoliths
+        if model_type in _QWEN_ARCHES:
+            from ponyexl3.mlx.exl3_mlp_monolith import install_mlp_monoliths
 
-        mono = install_mlp_monoliths(model)
-        if mono and verbose:
-            print(f"  mlp monolith {mono} layers")
+            mono = install_mlp_monoliths(model)
+            if mono and verbose:
+                print(f"  mlp monolith {mono} layers")
 
         if engine == "exl3":
             # Release the host-side numpy trellis now that the device runtime,

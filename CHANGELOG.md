@@ -2,6 +2,15 @@
 
 All notable changes to PonyExl3 are documented here.
 
+## [0.1.7] — 2026-06-13
+
+- Gemma4-26B-A4B EXL3 support (`model_type` `gemma4` / `gemma4_text`)
+- Gemma4 MoE: ``EXL3Gemma4MoEBlock`` (compiled router + stacked experts; shared MLP separate)
+- Gemma4 routed experts use GeGLU (``gelu_approx``) in MoE kernels, matching exllamav3
+- Gemma4 sibling fusion: attn qkv + full-layer qk (40 MB threshold; MLP gate+up unfused)
+- Fusion parity test vs unfused logits (`tests/test_gemma4_model.py`)
+- Fix Gemma4 generation stop: merge top-level + `text_config` `eos_token_id` (honors `<turn|>`)
+
 ## [0.1.6] — 2026-06-13
 
 - CLI validation: model dir, Metal, context limits, empty prompts, spec-flag warnings

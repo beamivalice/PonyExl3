@@ -54,6 +54,26 @@ _SEG_BM = 64
 # from ~S=2048 once the rhs is contiguous; measured Phase 19).
 _MM_MAX_ROWS = int(os.environ.get("EXL3_MM_MAX_ROWS", str(9 * 1024)))
 
+# Gate activation for stacked experts: Qwen MoE uses SwiGLU (silu*up);
+# Gemma4 routed experts use GeGLU (gelu_approx(gate)*up), matching exllamav3.
+_MOE_ACTIVATIONS = frozenset({"silu", "gelu"})
+
+
+def _moe_glu_metal_expr(act: str) -> str:
+    """Metal expression: gate ``g``, value ``u`` -> activated hidden."""
+    if act == "gelu":
+        return (
+            "float tanh_arg = 0.797884560803f * (g + 0.044715f * g * g * g);\n"
+            "        float h = 0.5f * g * (1.0f + tanh(tanh_arg)) * u;"
+        )
+    return "float h = (g / (1.0f + exp(-g))) * u;"
+
+
+def _moe_gate_activation(g: mx.array, u: mx.array, act: str) -> mx.array:
+    if act == "gelu":
+        return nn.gelu_approx(g) * u
+    return nn.silu(g) * u
+
 
 @lru_cache(maxsize=None)
 def _seg_table_fn(E: int, nb_max: int, bm: int) -> Callable[[mx.array], tuple[mx.array, mx.array]]:
@@ -243,10 +263,11 @@ def _lane_setup() -> str:
 """
 
 
-def _moe_gateup_source(k: int, cb: CodebookMode) -> str:
-    """Kernel A: gate+up GEMV pair + dual-block post-Hadamard + svh + SwiGLU,
+def _moe_gateup_source(k: int, cb: CodebookMode, act: str = "silu") -> str:
+    """Kernel A: gate+up GEMV pair + dual-block post-Hadamard + svh + GLU,
     one dispatch for ALL selected experts. Threadgroup owns a (gate-block,
     up-block) pair: 128 hidden cols of one expert."""
+    glu = _moe_glu_metal_expr(act)
     decode = __import__("ponyexl3.mlx.gemv_metal", fromlist=["_decode_expr"])._decode_expr(cb, cw_in="cw")
     return f"""
 #define PACKED_U32 {k * 256 // 32}
@@ -277,7 +298,7 @@ def _moe_gateup_source(k: int, cb: CodebookMode) -> str:
         uint col = block * 128u + tid;
         float g = tg_g[tid] * {_HS} * float(gu_svh[e * 2u * hidden + col]);
         float u = tg_u[tid] * {_HS} * float(gu_svh[e * 2u * hidden + hidden + col]);
-        float h = (g / (1.0f + exp(-g))) * u;
+        {glu}
         out[slot * hidden + col] = half(h);
     }}
 """
@@ -350,11 +371,12 @@ def _moe_gateup2_source(k: int, cb: CodebookMode) -> str:
 """
 
 
-def _moe_down2_source(k: int, cb: CodebookMode) -> str:
+def _moe_down2_source(k: int, cb: CodebookMode, act: str = "silu") -> str:
     """Kernel B2: down projection whose prologue FINISHES gate+up (dual
-    butterfly + svh + SwiGLU) from kernel A2's raw output, then pre-rotates
+    butterfly + svh + GLU) from kernel A2's raw output, then pre-rotates
     and runs the down tile loop. Each of the slot's threadgroups redoes the
     ~2 KB prologue — trivial ALU for the occupancy freedom it buys."""
+    glu = _moe_glu_metal_expr(act)
     decode = __import__("ponyexl3.mlx.gemv_metal", fromlist=["_decode_expr"])._decode_expr(cb, cw_in="cw")
     return f"""
 #define PACKED_U32 {k * 256 // 32}
@@ -384,7 +406,7 @@ def _moe_down2_source(k: int, cb: CodebookMode) -> str:
     for (uint idx = tid; idx < hidden; idx += 128u) {{
         float g = tg_g[idx] * float(gu_svh[e * 2u * hidden + idx]);
         float u = tg_g[hidden + idx] * float(gu_svh[e * 2u * hidden + hidden + idx]);
-        float h = (g / (1.0f + exp(-g))) * u;
+        {glu}
         h = float(half(h));   // match the unfused pipeline's fp16 handoff
         tg_xh[idx] = h * float(dn_suh[e * in_features + idx]) * {_HS};
     }}
@@ -414,8 +436,11 @@ class EXL3SwitchGLU(nn.Module):
         dn_svh: mx.array,  # (E, in)
         k: int,
         cb: CodebookMode,
+        activation: str = "silu",
     ):
         super().__init__()
+        if activation not in _MOE_ACTIVATIONS:
+            raise ValueError(f"unsupported MoE activation {activation!r}")
         self._gu_trellis = gu_trellis
         self._gu_suh = gu_suh
         self._gu_svh = gu_svh
@@ -424,6 +449,7 @@ class EXL3SwitchGLU(nn.Module):
         self._dn_svh = dn_svh
         self._k = k
         self._cb = cb
+        self._activation = activation
         self.num_experts = int(gu_suh.shape[0])
         self.input_dims = int(gu_suh.shape[2])
         self.hidden_dims = int(dn_suh.shape[1])
@@ -431,17 +457,18 @@ class EXL3SwitchGLU(nn.Module):
         self._dn_tiles = self.input_dims // 16
 
     def _kernels(self) -> tuple[Callable[..., Any], Callable[..., Any]]:
-        key = (self._k, int(self._cb))
+        key = (self._k, int(self._cb), self._activation, "v1")
         pair = _MOE_KERNELS.get(key)
         if pair is None:
+            act = self._activation
             kA = mx.fast.metal_kernel(
-                name=f"exl3_moe_gateup_k{self._k}_cb{int(self._cb)}_v1",
+                name=f"exl3_moe_gateup_k{self._k}_cb{int(self._cb)}_{act}_v1",
                 input_names=["xh", "trellis", "perm", "sel", "gu_svh", "dims"],
                 output_names=["out"],
-                source=_moe_gateup_source(self._k, self._cb),
+                source=_moe_gateup_source(self._k, self._cb, act),
             )
             kB = mx.fast.metal_kernel(
-                name=f"exl3_moe_down_k{self._k}_cb{int(self._cb)}_v1",
+                name=f"exl3_moe_down_k{self._k}_cb{int(self._cb)}_{act}_v1",
                 input_names=["hbuf", "trellis", "perm", "sel", "dn_suh", "dn_svh", "dims"],
                 output_names=["out"],
                 source=_moe_down_source(self._k, self._cb),
@@ -522,23 +549,24 @@ class EXL3SwitchGLU(nn.Module):
         return y.reshape(E_sel, D)
 
     def _kernels2(self):
-        key = (self._k, int(self._cb), "v2")
+        key = (self._k, int(self._cb), self._activation, "v2")
         pair = _MOE_KERNELS.get(key)
         if pair is None:
+            act = self._activation
             kA = mx.fast.metal_kernel(
-                name=f"exl3_moe_gateup2_k{self._k}_cb{int(self._cb)}_v2",
+                name=f"exl3_moe_gateup2_k{self._k}_cb{int(self._cb)}_{act}_v2",
                 input_names=["xh", "trellis", "perm", "sel", "dims"],
                 output_names=["out"],
                 source=_moe_gateup2_source(self._k, self._cb),
             )
             kB = mx.fast.metal_kernel(
-                name=f"exl3_moe_down2_k{self._k}_cb{int(self._cb)}_v2",
+                name=f"exl3_moe_down2_k{self._k}_cb{int(self._cb)}_{act}_v2",
                 input_names=[
                     "ygu", "trellis", "perm", "sel",
                     "gu_svh", "dn_suh", "dn_svh", "dims",
                 ],
                 output_names=["out"],
-                source=_moe_down2_source(self._k, self._cb),
+                source=_moe_down2_source(self._k, self._cb, act),
             )
             pair = _MOE_KERNELS[key] = (kA, kB)
         return pair
@@ -640,7 +668,7 @@ class EXL3SwitchGLU(nn.Module):
         ).reshape(E_sel, 2 * self.hidden_dims)
         y = _rows_finish()(y.astype(mx.float16), self._gu_svh[sel])
         g, u = mx.split(y, 2, axis=-1)
-        h = nn.silu(g) * u  # (E_sel, hidden)
+        h = _moe_gate_activation(g, u, self._activation)
 
         ar_dn = mx.arange(self._dn_tiles, dtype=mx.uint32)
         tile_map = (
@@ -718,7 +746,7 @@ class EXL3SwitchGLU(nn.Module):
             )
         g = _rows_finish()(g.reshape(N, H).astype(mx.float16), self._gu_svh[sidx, :H])
         u = _rows_finish()(u.reshape(N, H).astype(mx.float16), self._gu_svh[sidx, H:])
-        h = nn.silu(g) * u
+        h = _moe_gate_activation(g, u, self._activation)
 
         if use_mm:
             h_pad = mx.concatenate([h, mx.zeros((_SEG_BM, H), dtype=h.dtype)])
@@ -809,3 +837,101 @@ class EXL3MoEBlock(nn.Module):
         )
         y = self.switch_mlp(x, inds)
         return (y * scores[..., None]).sum(axis=-2)
+
+
+class EXL3Gemma4MoEBlock(nn.Module):
+    """Replaces Gemma4 ``Router`` + ``Experts`` with one compiled routed path.
+
+  Mounted on ``layer.router``; ``_Gemma4ExpertsShim`` forwards the expert
+  call so ``DecoderLayer`` is unchanged and router weights are not duplicated
+  in the parameter tree.
+    """
+
+    def __init__(
+        self,
+        proj: nn.Linear,
+        scale: mx.array,
+        per_expert_scale: mx.array,
+        switch: EXL3SwitchGLU,
+        top_k: int,
+        eps: float,
+        hidden_size: int,
+    ):
+        super().__init__()
+        self.proj = proj
+        self.scale = scale
+        self.per_expert_scale = per_expert_scale
+        self.switch_mlp = switch
+        self.top_k = top_k
+        self.eps = eps
+        self._root_scale = hidden_size**-0.5
+
+    def _route(self, h: mx.array) -> tuple[mx.array, mx.array]:
+        normed = mx.fast.rms_norm(h, self.scale * self._root_scale, self.eps)
+        expert_scores = self.proj(normed)
+        inds = mx.argpartition(expert_scores, kth=-self.top_k, axis=-1)[
+            ..., -self.top_k :
+        ]
+        weights = mx.take_along_axis(expert_scores, inds, axis=-1)
+        weights = mx.softmax(weights, axis=-1)
+        weights = weights * self.per_expert_scale[inds]
+        return inds, weights
+
+    def _router(self):
+        if not hasattr(self, "_router_fn"):
+
+            @mx.compile
+            def _fn(
+                h: mx.array,
+                scale: mx.array,
+                root_scale: float,
+                eps: float,
+                proj_w: mx.array,
+                per_expert_scale: mx.array,
+                k: int,
+            ) -> tuple[mx.array, mx.array]:
+                normed = mx.fast.rms_norm(h, scale * root_scale, eps)
+                expert_scores = normed @ proj_w.T
+                inds = mx.argpartition(expert_scores, kth=-k, axis=-1)[..., -k:]
+                weights = mx.take_along_axis(expert_scores, inds, axis=-1)
+                weights = mx.softmax(weights, axis=-1)
+                weights = weights * per_expert_scale[inds]
+                return inds, weights
+
+            self._router_fn = _fn
+        return self._router_fn
+
+    def __call__(
+        self,
+        x: mx.array,
+        top_k_indices: mx.array | None = None,
+        top_k_weights: mx.array | None = None,
+    ) -> mx.array | tuple[mx.array, mx.array]:
+        if top_k_indices is None:
+            use_compile = os.environ.get("EXL3_GEMMA4_ROUTER_COMPILE", "0") == "1"
+            if use_compile:
+                return self._router()(
+                    x,
+                    self.scale,
+                    self._root_scale,
+                    self.eps,
+                    self.proj.weight,
+                    self.per_expert_scale,
+                    self.top_k,
+                )
+            return self._route(x)
+        y = self.switch_mlp(x, top_k_indices)
+        return (top_k_weights[..., None] * y).sum(axis=-2)
+
+
+class _Gemma4ExpertsShim(nn.Module):
+    """DecoderLayer ``experts`` slot without duplicating router params in the tree."""
+
+    def __init__(self, block: EXL3Gemma4MoEBlock):
+        super().__init__()
+        self._block = block
+
+    def __call__(
+        self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
+    ) -> mx.array:
+        return self._block(x, top_k_indices, top_k_weights)

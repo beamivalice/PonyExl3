@@ -19,7 +19,22 @@ class _FakeTokenizer:
         return [100 + (i % 50) for i in range(max(1, len(text) // 4))]
 
 
-def test_resolve_prompt_file_missing():
+def test_collect_eos_gemma4():
+    from ponyexl3.cli._generate_common import collect_eos_token_ids
+
+    cfg = {
+        "eos_token_id": [1, 106],
+        "text_config": {"eos_token_id": 1},
+    }
+    assert collect_eos_token_ids(cfg) == (1, 106)
+
+
+def test_collect_eos_dense():
+    from ponyexl3.cli._generate_common import collect_eos_token_ids
+
+    assert collect_eos_token_ids({"eos_token_id": 151643}) == (151643,)
+
+
     with pytest.raises(FileNotFoundError, match="prompt file not found"):
         resolve_prompt_file("/no/such/prompt.txt")
 

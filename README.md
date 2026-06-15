@@ -30,13 +30,15 @@ a 32 GB M1 Max, same EXL3 checkpoints ([UnstableLlama](https://huggingface.co/Un
 | **Qwen3.6-35B-A3B · 4.00bpw** | M5 Max | 68.5 | **79.8** | — | — | 2775 | 17.2 GB |
 |  | M1 Max | 23.5 | ~flat | — | — | 497 | 17.2 GB |
 | **Qwen3.6-27B · 8.00bpw** | M5 Max | 15.6 | — | — | **31.6** | 642 | 26.3 GB |
+| **Gemma4-26B-A4B · 4.10bpw** | M5 Max | **44.0** | — | — | — | 2295 | 15.8 GB |
 
-4-bit weights stay resident and decode in-kernel (the 27B runs in ~15 GB). Speculation
+4-bit weights stay resident and decode in-kernel (the 27B runs in ~15 GB). Gemma4
+decode is plain-greedy only (no speculative drafters yet). Speculation
 pays off *more* on the slower GPU for the dense model — DFlash is **3.75×** on the M1 Max
 (4.0 → 15.0) vs 2.28× on the M5 Max — but barely moves the MoE (already fast per token).
 Draft-free n-gram lookup is workload-dependent (+16% on code edits, ~neutral on novel
-text), so it's not tabled. Reproduce with `tools/bench/perf_chart_bench.py`; accuracy
-is [below](#accuracy).
+text), so it's not tabled. Reproduce with `ponyexl3-generate-bench` or
+`tools/bench/perf_chart_bench.py`; accuracy is [below](#accuracy).
 
 **At temperature 0.6** the same drafters stay **distribution-exact** (Leviathan-Chen
 rejection sampling, not greedy — see [Speculative decoding](#speculative-decoding)).
@@ -154,7 +156,7 @@ Engine fidelity via `ponyexl3/reference/compare_trace.py`.
 ## Features
 
 - **Exact EXL3 decode path** — fused Metal GEMV at batch size 1; lowest memory footprint
-- **Full model loader** — Qwen3.5 / Qwen3.6 dense and MoE architectures via mlx-lm skeleton + `EXL3Linear` swap
+- **Full model loader** — Qwen3.5 / Qwen3.6 dense and MoE, plus Gemma4-26B-A4B MoE via mlx-lm skeleton + `EXL3Linear` swap
 - **Speculative decoding** — MTP, DFlash, EAGLE-3, and draft-free n-gram lookup (all verify-gated for token-identical greedy output)
 - **Dual implementation + pytest parity** — every MLX primitive has a CPU `ref/` twin
 - **Cross-platform reference** — CUDA-exported `.npz` fixtures for logits and per-layer bisection (`ponyexl3/reference/`)
@@ -171,6 +173,7 @@ Engine fidelity via `ponyexl3/reference/compare_trace.py`.
   |-------|---------:|----------:|---------|
   | Qwen3.6-27B 4.15bpw | ~17 GB | ~27 GB | 32 GB |
   | Qwen3.6-35B-A3B 4.00bpw | ~17 GB | ~19 GB | 32 GB |
+  | Gemma4-26B-A4B 4.10bpw | ~16 GB | ~30 GB | 32 GB |
   | Qwen3.6-27B 8.00bpw | ~27 GB | ~30 GB | 48 GB+ |
 
   The loader frees each layer's source tensors as it converts them, releases
@@ -204,6 +207,34 @@ pip install -e ".[dev]"
 ```
 
 No Pony monorepo or `PYTHONPATH` setup is needed. Everything imports as `ponyexl3`.
+
+### Releases
+
+v0.1.x ships the **Python runtime only** — not model weights. EXL3 checkpoints
+live on Hugging Face (or your disk) separately.
+
+| Artifact | Format | How to get it |
+|----------|--------|---------------|
+| Git tag | `v0.1.7` | `git checkout v0.1.7` |
+| GitHub Release | `.tar.gz` / `.zip` source archives | Auto-attached when you publish a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) from the tag |
+| Python packages | `ponyexl3-0.1.7.tar.gz` (sdist) + `ponyexl3-0.1.7-py3-none-any.whl` | `uv build` locally; optionally upload to PyPI or attach to the GitHub Release |
+
+**Install options:**
+
+```bash
+# editable dev install (recommended while hacking)
+pip install -e ".[dev]"
+
+# pinned release from git
+pip install "ponyexl3 @ git+https://github.com/beamster/ponyexl3.git@v0.1.7"
+
+# from a built wheel
+pip install ponyexl3-0.1.7-py3-none-any.whl
+```
+
+A release GitHub Action is **optional** — tag + publish a GitHub Release manually is
+enough for v0.1.7. Add automation later if you want PyPI publish or changelog →
+release notes on every tag.
 
 ---
 
@@ -286,20 +317,35 @@ python -m ponyexl3.cli.generate_synthetic_layer
 
 ## Supported models
 
-Any EXL3-quantized checkpoint whose `model_type` is `qwen3_5` or `qwen3_5_moe`
-loads — i.e. the **Qwen3.5 / Qwen3.6 dense and MoE families, at any size**
-(other architectures raise `no architecture mapping`). The checkpoints below
-are the ones validated end-to-end:
+### Architecture compatibility
+
+Any EXL3-quantized checkpoint whose `model_type` maps to mlx-lm loads. Others
+raise `no architecture mapping`.
+
+| `model_type` | Family | MoE path | Notes |
+|--------------|--------|----------|-------|
+| `qwen3_5` | Qwen3.5 / Qwen3.6 dense | — | Primary ship target |
+| `qwen3_5_moe` | Qwen3.6 MoE | `EXL3MoEBlock` (SwiGLU) | Fused expert kernels |
+| `gemma4`, `gemma4_text` | Gemma4-26B-A4B | `EXL3Gemma4MoEBlock` (GeGLU) | Hybrid SWA/full attention; shared dense MLP + routed experts |
+
+Checkpoints must be EXL3-quantized (ExLlamaV3 or compatible converter output)
+with a sidecar `quantization_config.json` (`quant_method: exl3`).
+
+### Validated checkpoints
+
+End-to-end tested on Apple Silicon (load, generate, parity tests):
 
 | Model | `model_type` | Notes |
 |-------|--------------|-------|
 | [Qwen3.6-27B dense (4.15bpw)](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw) | `qwen3_5` | Primary ship target (~15 GB RAM) |
 | [Qwen3.6-27B dense (8.00bpw)](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-8.00bpw) | `qwen3_5` | Near-lossless; decodes at 4.15bpw speed (~27 GB RAM) |
-| [Qwen3.6-35B-A3B MoE](https://huggingface.co/UnstableLlama/Qwen3.6-35B-A3B-exl3-4.00bpw) | `qwen3_5_moe` | `EXL3MoEBlock` / fused expert kernels (~19.5 GB RAM) |
+| [Qwen3.6-35B-A3B MoE](https://huggingface.co/UnstableLlama/Qwen3.6-35B-A3B-exl3-4.00bpw) | `qwen3_5_moe` | `EXL3MoEBlock` / fused expert kernels (~17 GB RAM) |
 | [Qwen3.5-2B](https://huggingface.co/UnstableLlama/Qwen3.5-2B-exl3-4.00bpw) | `qwen3_5` | Dev / fast iteration (dense) |
+| Gemma4-26B-A4B (4.10bpw EXL3) | `gemma4` | ~16 GB resident; chat template emits a thought channel — use `--raw` for plain completion; no speculative drafters yet |
 
-Checkpoints must be EXL3-quantized (ExLlamaV3 or compatible converter output)
-with a sidecar `quantization_config.json`.
+**Gemma4 generation tips:** default mode uses the model's chat template (thought
+channel + `<turn|>` stop). Plain completion: `--raw`. EOS ids are merged from
+top-level and `text_config` so generation stops at `<turn|>`.
 
 ### Speculative drafters
 
@@ -324,12 +370,13 @@ any drafter's head/body in w4 — draft-side only, so output bits are unchanged.
 pytest tests/ -q
 ```
 
-**171 tests** run without any model on disk (synthetic layers + CPU/MLX parity). Optional integration tests are skipped unless env vars are set:
+**194 tests** run without any model on disk (synthetic layers + CPU/MLX parity). Optional integration tests are skipped unless env vars are set:
 
 ```bash
 export PONYEXL3_MODEL_DIR=/path/to/checkpoint
 export PONYEXL3_MODEL_27B=/path/to/27b-exl3
 export PONYEXL3_MODEL_2B=/path/to/2b-exl3
+export PONYEXL3_MODEL_GEMMA4=/path/to/gemma4-exl3
 export PONYEXL3_REFERENCE_NPZ=/path/to/reference.npz   # see below
 
 pytest tests/ -q
@@ -394,6 +441,7 @@ A custom generation loop (`ponyexl3.mlx.generate`) runs prefill through the text
 | `PONYEXL3_MODEL_DIR` | `compare_reference`, `test_reference_parity` |
 | `PONYEXL3_MODEL_27B` | 27B integration tests, `tools/bench/*` |
 | `PONYEXL3_MODEL_2B` | 2B GEMV layer tests |
+| `PONYEXL3_MODEL_GEMMA4` | Gemma4 integration tests, local bench |
 | `PONYEXL3_MTP_DIR` | MTP benchmarks |
 | `PONYEXL3_REFERENCE_NPZ` | Full-model reference parity test |
 | `MODEL` / `MTP` | Legacy aliases for bench scripts |

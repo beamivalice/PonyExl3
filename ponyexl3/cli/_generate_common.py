@@ -11,10 +11,29 @@ from typing import Any
 
 import mlx.core as mx
 
-from ponyexl3.mlx.generate import max_position_embeddings, validate_generation_params
+from ponyexl3.mlx.generate import max_position_embeddings
 from ponyexl3.types import DraftModule, MlxLmModel, Tokenizer
 
 PREFILL_BENCH_SIZES = (1024, 2048, 4096, 8192, 16384, 32768)
+
+
+def collect_eos_token_ids(config: dict[str, Any]) -> tuple[int, ...]:
+    """Union EOS/stop ids from top-level config and nested ``text_config``.
+
+    Gemma4 stores ``<eos>`` (1) in ``text_config`` but ``<turn|>`` (106) only at
+    the top level; without both, chat-template generation never stops."""
+    ids: set[int] = set()
+    for section in (config, config.get("text_config")):
+        if not isinstance(section, dict):
+            continue
+        eos = section.get("eos_token_id")
+        if eos is None:
+            continue
+        if isinstance(eos, list):
+            ids.update(int(x) for x in eos)
+        else:
+            ids.add(int(eos))
+    return tuple(sorted(ids))
 
 
 def add_generate_arguments(
@@ -284,11 +303,7 @@ def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
 
     tokenizer = load_tokenizer(Path(args.model))
 
-    text_cfg = config.get("text_config", config)
-    eos = text_cfg.get("eos_token_id")
-    extra_eos: tuple[int, ...] = ()
-    if eos is not None:
-        extra_eos = tuple(eos) if isinstance(eos, list) else (eos,)
+    extra_eos = collect_eos_token_ids(config)
 
     return GenerateStack(
         model=model,
