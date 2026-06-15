@@ -2,6 +2,12 @@
 
 All notable changes to PonyExl3 are documented here.
 
+## [0.1.5] — 2026-06-13
+
+- `ponyexl3-generate-bench`: prefill sweep (1k–32k) with 128-token decode per row
+- Shared generate CLI setup (`--mtp`, `--dflash`, `--eagle3`, `--lookup`, engines, etc.)
+- Default prompt file: `README.md` (`--prompt-file` to override)
+
 ## [0.1.3] — 2026-06-13
 
 - MTP speculative decoding: temperature-aware verify (Leviathan–Chen rejection sampling)

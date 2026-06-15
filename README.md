@@ -231,6 +231,14 @@ ponyexl3-generate /path/to/model --engine fold16 -p "Hello" -n 128
 ponyexl3-compare-engines /path/to/model --engines exl3 fold16 w8a16 -n 64
 ```
 
+Throughput sweep (prefill 1k–32k, 128-token decode per row; default prompt `README.md`):
+
+```bash
+ponyexl3-generate-bench /path/to/model --raw
+ponyexl3-generate-bench /path/to/model --dflash /path/to/dflash --mtp off --json
+ponyexl3-generate-bench /path/to/model --prompt-file my_prompt.txt --warmup
+```
+
 ### Speculative decoding
 
 All speculative modes verify drafts against the main model — greedy output stays token-identical.
@@ -256,6 +264,7 @@ Installed by `pip install -e .`:
 | Command | Purpose |
 |---------|---------|
 | `ponyexl3-generate` | End-to-end text generation |
+| `ponyexl3-generate-bench` | Prefill/decode throughput sweep (1k–32k context, 128 gen) |
 | `ponyexl3-compare-layer` | Per-layer correctness ladder (probe → tile → slice → forward) |
 | `ponyexl3-compare-engines` | End-to-end engine agreement + logit drift report |
 

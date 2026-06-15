@@ -37,7 +37,12 @@ def test_console_scripts_registered():
         for ep in entry_points(group="console_scripts")
         if ep.value.startswith("ponyexl3.")
     }
-    expected = {"ponyexl3-generate", "ponyexl3-compare-layer", "ponyexl3-compare-engines"}
+    expected = {
+        "ponyexl3-generate",
+        "ponyexl3-generate-bench",
+        "ponyexl3-compare-layer",
+        "ponyexl3-compare-engines",
+    }
     assert expected <= names, f"missing entry points: {expected - names}"
 
 

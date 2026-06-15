@@ -948,6 +948,7 @@ def generate_text(
     tokenizer: Tokenizer,
     prompt: str,
     *,
+    prompt_ids: list[int] | None = None,
     max_tokens: int = 256,
     temp: float = 0.0,
     prefill_chunk: int = 2048,
@@ -963,14 +964,20 @@ def generate_text(
     """Encode, generate, and detokenize. ``on_segment`` streams text chunks.
     With an ``mtp`` draft module and greedy sampling, uses speculative
     decoding; with ``lookup`` (and no mtp), draft-free n-gram lookup
-    speculation (both verified — output identical to plain greedy)."""
-    if use_chat_template and getattr(tokenizer, "chat_template", None):
-        prompt_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-        )
+    speculation (both verified — output identical to plain greedy).
+
+    Pass ``prompt_ids`` to skip string encoding (used by throughput benches
+    that need an exact prefill length)."""
+    if prompt_ids is None:
+        if use_chat_template and getattr(tokenizer, "chat_template", None):
+            prompt_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+            )
+        else:
+            prompt_ids = tokenizer.encode(prompt)
     else:
-        prompt_ids = tokenizer.encode(prompt)
+        prompt_ids = list(prompt_ids)
 
     eos_ids = set(extra_eos)
     tok_eos = getattr(tokenizer, "eos_token_ids", None)
