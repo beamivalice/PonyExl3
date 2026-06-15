@@ -2,6 +2,13 @@
 
 All notable changes to PonyExl3 are documented here.
 
+## [0.1.6] — 2026-06-13
+
+- CLI validation: model dir, Metal, context limits, empty prompts, spec-flag warnings
+- `ponyexl3-generate-bench`: text-repeat prefill padding, cache clear between rows
+- Generation guards for `prefill_chunk`, `num_draft`, and `max_position_embeddings`
+- CLI edge-case tests (`tests/test_cli.py`, `tests/test_generate_validation.py`)
+
 ## [0.1.5] — 2026-06-13
 
 - `ponyexl3-generate-bench`: prefill sweep (1k–32k) with 128-token decode per row

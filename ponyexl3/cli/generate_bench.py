@@ -22,34 +22,57 @@ from ponyexl3.cli._generate_common import (
     PREFILL_BENCH_SIZES,
     add_generate_arguments,
     build_prefill_prompt_ids,
+    check_context_limit,
     load_generate_stack,
+    max_position_embeddings,
     resolve_prompt_file,
+    validate_generate_cli_args,
 )
 
 
-def _run_row(stack, prompt_ids: list[int], args: argparse.Namespace) -> dict[str, object]:
+def _run_row(
+    stack,
+    prompt_ids: list[int],
+    args: argparse.Namespace,
+    *,
+    expected_prefill: int,
+) -> dict[str, object]:
     import mlx.core as mx
 
     from ponyexl3.mlx.generate import generate_text
 
-    _, stats = generate_text(
-        stack.model,
-        stack.tokenizer,
-        prompt="",
-        prompt_ids=prompt_ids,
-        max_tokens=args.gen_tokens,
-        temp=args.temp,
-        prefill_chunk=args.prefill_chunk,
-        use_chat_template=False,
-        extra_eos=stack.extra_eos,
-        mtp=stack.mtp,
-        num_draft=stack.draft,
-        lookup=args.lookup,
-        eagle3=stack.eagle3,
-        dflash=stack.dflash,
-    )
+    try:
+        _, stats = generate_text(
+            stack.model,
+            stack.tokenizer,
+            prompt="",
+            prompt_ids=prompt_ids,
+            max_tokens=args.gen_tokens,
+            temp=args.temp,
+            prefill_chunk=args.prefill_chunk,
+            use_chat_template=False,
+            extra_eos=stack.extra_eos,
+            mtp=stack.mtp,
+            num_draft=stack.draft,
+            lookup=args.lookup,
+            eagle3=stack.eagle3,
+            dflash=stack.dflash,
+            max_context=max_position_embeddings(stack.config),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if stats.prompt_tokens != expected_prefill:
+        raise SystemExit(
+            f"internal error: expected prefill {expected_prefill} tokens, "
+            f"got {stats.prompt_tokens}"
+        )
+
     if hasattr(mx, "synchronize"):
         mx.synchronize()
+    if hasattr(mx, "clear_cache"):
+        mx.clear_cache()
+
     prefill_tps = stats.prompt_tokens / stats.prefill_s if stats.prefill_s else 0.0
     decode_tps = stats.gen_tokens / stats.decode_s if stats.decode_s else 0.0
     row: dict[str, object] = {
@@ -127,10 +150,16 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    prompt_path = resolve_prompt_file(args.prompt_file)
-    prompt_text = prompt_path.read_text(encoding="utf-8")
-    if not args.quiet:
-        print(f"[bench] prompt file: {prompt_path}", file=sys.stderr)
+    try:
+        prompt_path = resolve_prompt_file(args.prompt_file)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    try:
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"cannot read prompt file {prompt_path}: {exc}") from exc
+    if not prompt_text.strip():
+        raise SystemExit(f"prompt file is empty: {prompt_path}")
 
     try:
         sizes = [int(x.strip()) for x in args.prefill_sizes.split(",") if x.strip()]
@@ -139,24 +168,42 @@ def main() -> int:
     if not sizes or any(n <= 0 for n in sizes):
         raise SystemExit("--prefill-sizes must be positive integers")
 
+    validate_generate_cli_args(args, bench=True)
+
+    if not args.quiet:
+        print(f"[bench] prompt file: {prompt_path}", file=sys.stderr)
+
     stack = load_generate_stack(args)
+    for n in sizes:
+        check_context_limit(
+            n,
+            args.gen_tokens,
+            stack.config,
+            label=f"prefill={n}",
+        )
 
     if args.warmup:
-        warm_ids = build_prefill_prompt_ids(
-            prompt_text, 1024, stack.tokenizer, raw=args.raw
-        )
-        _run_row(stack, warm_ids, args)
+        try:
+            warm_ids = build_prefill_prompt_ids(
+                prompt_text, 1024, stack.tokenizer, raw=args.raw
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        _run_row(stack, warm_ids, args, expected_prefill=1024)
         if not args.quiet:
             print("[bench] warmup done", file=sys.stderr)
 
     rows: list[dict[str, object]] = []
     for n in sizes:
-        prompt_ids = build_prefill_prompt_ids(
-            prompt_text, n, stack.tokenizer, raw=args.raw
-        )
+        try:
+            prompt_ids = build_prefill_prompt_ids(
+                prompt_text, n, stack.tokenizer, raw=args.raw
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         if not args.quiet:
             print(f"[bench] prefill={n} gen={args.gen_tokens} ...", file=sys.stderr)
-        row = _run_row(stack, prompt_ids, args)
+        row = _run_row(stack, prompt_ids, args, expected_prefill=n)
         rows.append(row)
 
     if args.json:

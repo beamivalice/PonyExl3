@@ -14,6 +14,7 @@ import importlib
 import json
 import os
 import re
+import sys
 from glob import glob
 from typing import Any
 
@@ -420,8 +421,12 @@ def _apply_device_memory_limit() -> None:
                 return
             lim = int(ws * 0.92)  # leave headroom below the wired ceiling
         mx.set_memory_limit(lim)
-    except Exception:
-        pass
+    except Exception as exc:
+        if env:
+            print(
+                f"[warn] PONYEXL3_MEM_LIMIT_GB ignored: {exc}",
+                file=sys.stderr,
+            )
 
 
 def load_model(

@@ -38,6 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ponyexl3.cli._generate_common import require_metal, validate_exl3_model_dir
 from ponyexl3.ref.layer import EXL3Layer
 from ponyexl3.types import LayerMeta
 
@@ -312,7 +313,7 @@ def _list_layers(model_dir: Path, limit: int) -> None:
         print(f"  ... and {len(layers) - limit} more (use --list-limit)")
 
 
-def main() -> None:
+def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("model_dir", type=Path)
     p.add_argument("module_key", nargs="?")
@@ -344,33 +345,45 @@ def main() -> None:
     args = p.parse_args()
 
     if args.list:
-        _list_layers(args.model_dir, args.list_limit)
-        return
+        try:
+            _list_layers(args.model_dir, args.list_limit)
+        except FileNotFoundError as exc:
+            raise SystemExit(str(exc)) from exc
+        return 0
 
     if not args.module_key:
         raise SystemExit("module_key required unless --list")
 
-    if args.probe:
-        report = _probe(
-            args.model_dir,
-            args.module_key,
-            rows=args.rows,
-            seed=args.seed,
-            benchmark=args.benchmark,
-        )
-        print(json.dumps(report, indent=2))
-        return
+    validate_exl3_model_dir(args.model_dir)
 
     try:
         import mlx.core as mx
     except ImportError:
         mx = None
 
+    if args.probe:
+        try:
+            report = _probe(
+                args.model_dir,
+                args.module_key,
+                rows=args.rows,
+                seed=args.seed,
+                benchmark=args.benchmark,
+            )
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(report, indent=2))
+        return 0
+
+    try:
+        layer = _load_layer(args.model_dir, args.module_key)
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
     if args.mode == "tile":
         t0 = time.perf_counter()
-        layer = _load_layer(args.model_dir, args.module_key)
-        t_load = time.perf_counter() - t0
         report = _compare_tile(layer, args.tile_index, args.seed)
+        t_load = time.perf_counter() - t0
         print(f"module: {args.module_key}  K={layer.k}  load={t_load:.2f}s")
         print(
             f"  tile {report['tile_index']} {report['tile_coords']}: "
@@ -378,51 +391,56 @@ def main() -> None:
             f"ref={report['ref_seconds']*1e3:.2f}ms  mlx={report['mlx_seconds']*1e3:.2f}ms"
         )
         print(json.dumps(report, indent=2))
-        return
+        return 0
 
-    layer = _load_layer(args.model_dir, args.module_key)
     layer.validate()
 
-    rng = np.random.default_rng(args.seed)
-    out_cols = args.out_cols if args.mode == "slice" else None
-    out_dim = out_cols if out_cols is not None else layer.out_features
-    _ = out_dim
-    x = rng.standard_normal((args.rows, layer.in_features)).astype(np.float16)
+    try:
+        rng = np.random.default_rng(args.seed)
+        out_cols = args.out_cols if args.mode == "slice" else None
+        out_dim = out_cols if out_cols is not None else layer.out_features
+        _ = out_dim
+        x = rng.standard_normal((args.rows, layer.in_features)).astype(np.float16)
 
-    backends = list(args.backends or ["ref", "mlx"])
-    if "cuda" not in backends:
-        try:
-            import torch
+        backends = list(args.backends or ["ref", "mlx"])
+        if "cuda" not in backends:
+            try:
+                import torch
 
-            if torch.cuda.is_available():
-                backends.append("cuda")
-        except ImportError:
-            pass
+                if torch.cuda.is_available():
+                    backends.append("cuda")
+            except ImportError:
+                pass
 
-    results: dict[str, np.ndarray] = {}
-    timings: dict[str, float] = {}
+        results: dict[str, np.ndarray] = {}
+        timings: dict[str, float] = {}
 
-    if "ref" in backends:
-        t0 = time.perf_counter()
-        results["ref"] = _forward_ref(layer, x, out_cols=out_cols)
-        timings["ref"] = time.perf_counter() - t0
-    if "mlx" in backends:
-        if mx is None:
-            print("mlx not installed — skipping mlx backend", file=sys.stderr)
-        elif not mx.metal.is_available():
-            print("Metal not available — skipping mlx backend", file=sys.stderr)
-        else:
+        if "ref" in backends:
             t0 = time.perf_counter()
-            results["mlx"] = _forward_mlx(layer, x, out_cols=out_cols)
-            timings["mlx"] = time.perf_counter() - t0
-    if "cuda" in backends and args.mode == "forward":
-        t0 = time.perf_counter()
-        y_cuda = _forward_cuda(args.model_dir, args.module_key, x)
-        if y_cuda is not None:
-            results["cuda"] = y_cuda
-            timings["cuda"] = time.perf_counter() - t0
-        else:
-            print("CUDA / exllamav3 not available — skipping cuda backend", file=sys.stderr)
+            results["ref"] = _forward_ref(layer, x, out_cols=out_cols)
+            timings["ref"] = time.perf_counter() - t0
+        if "mlx" in backends:
+            if mx is None:
+                print("mlx not installed — skipping mlx backend", file=sys.stderr)
+            elif not mx.metal.is_available():
+                print("Metal not available — skipping mlx backend", file=sys.stderr)
+            else:
+                t0 = time.perf_counter()
+                results["mlx"] = _forward_mlx(layer, x, out_cols=out_cols)
+                timings["mlx"] = time.perf_counter() - t0
+        if "cuda" in backends and args.mode == "forward":
+            t0 = time.perf_counter()
+            y_cuda = _forward_cuda(args.model_dir, args.module_key, x)
+            if y_cuda is not None:
+                results["cuda"] = y_cuda
+                timings["cuda"] = time.perf_counter() - t0
+            else:
+                print(
+                    "CUDA / exllamav3 not available — skipping cuda backend",
+                    file=sys.stderr,
+                )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     if "ref" not in results:
         raise SystemExit("ref backend required as comparison baseline")
@@ -456,7 +474,8 @@ def main() -> None:
     if mx is not None and mx.metal.is_available():
         print("note: on Apple Silicon, mlx (Metal) is the GPU reference — not PyTorch MPS")
     print(json.dumps(report, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

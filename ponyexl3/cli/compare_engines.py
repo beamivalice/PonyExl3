@@ -18,6 +18,9 @@ from pathlib import Path
 
 import numpy as np
 
+from ponyexl3.cli._generate_common import require_metal, validate_exl3_model_dir
+
+
 def run_engine(
     model_dir: str,
     engine: str,
@@ -53,8 +56,6 @@ def run_engine(
         logits = lm.lm_head(h).astype(mx.float32)
         mx.eval(logits)
 
-    import numpy as np
-
     out = (tokens, np.array(first_logits))
     del model, lm, cache, h, logits, first_logits
     gc.collect()
@@ -69,14 +70,18 @@ def main() -> int:
     ap.add_argument("-p", "--prompt", default="Explain why the sky is blue.")
     ap.add_argument("-n", "--steps", type=int, default=128)
     ap.add_argument("--engines", nargs="+", default=["fold16"])
+    ap.add_argument("--raw", action="store_true", help="skip the chat template")
     args = ap.parse_args()
 
-    import numpy as np
+    validate_exl3_model_dir(args.model)
+    require_metal()
+    if args.steps < 0:
+        raise SystemExit("--steps must be >= 0")
 
     from mlx_lm.utils import load_tokenizer
 
     tokenizer = load_tokenizer(Path(args.model))
-    if getattr(tokenizer, "chat_template", None):
+    if not args.raw and getattr(tokenizer, "chat_template", None):
         prompt_ids = list(
             tokenizer.apply_chat_template(
                 [{"role": "user", "content": args.prompt}], add_generation_prompt=True
@@ -84,11 +89,16 @@ def main() -> int:
         )
     else:
         prompt_ids = list(tokenizer.encode(args.prompt))
+    if not prompt_ids:
+        raise SystemExit("prompt is empty after encoding")
 
     print(f"reference engine: exl3 ({args.steps} greedy steps, then teacher-forced)")
     ref_tokens, ref_logits = run_engine(args.model, "exl3", prompt_ids, args.steps)
 
     for engine in args.engines:
+        if engine == "exl3":
+            print("exl3: skipping (reference engine)")
+            continue
         toks, logits = run_engine(
             args.model, engine, prompt_ids, args.steps, forced=ref_tokens
         )

@@ -17,6 +17,42 @@ import mlx.core as mx
 from ponyexl3.types import DraftModule, KvCache, MlxLmModel, Tokenizer
 
 
+def max_position_embeddings(config: dict[str, Any]) -> int | None:
+    text_cfg = config.get("text_config", config)
+    limit = text_cfg.get("max_position_embeddings")
+    if limit is None:
+        return None
+    return int(limit)
+
+
+def validate_generation_params(
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    prefill_chunk: int,
+    num_draft: int = 1,
+    using_spec: bool = False,
+    max_context: int | None = None,
+) -> None:
+    if len(prompt_ids) == 0:
+        raise ValueError("prompt is empty after encoding")
+    if max_tokens < 0:
+        raise ValueError(f"max_tokens must be >= 0, got {max_tokens}")
+    if prefill_chunk <= 0:
+        raise ValueError(f"prefill_chunk must be positive, got {prefill_chunk}")
+    if using_spec and num_draft <= 0:
+        raise ValueError(
+            f"num_draft must be positive when using speculation, got {num_draft}"
+        )
+    if max_context is not None and max_context > 0:
+        total = len(prompt_ids) + max_tokens
+        if total > max_context:
+            raise ValueError(
+                f"context {total} tokens (prefill {len(prompt_ids)} + gen {max_tokens}) "
+                f"exceeds max_position_embeddings={max_context}"
+            )
+
+
 def _prefill_hidden(
     model: Any,
     toks: mx.array,
@@ -78,6 +114,11 @@ def stream_generate(
 ) -> Iterator[int]:
     """Yield generated token ids one at a time. ``model`` is the mlx_lm-style
     top-level Model (``model.language_model.{model,lm_head}``)."""
+    validate_generation_params(
+        prompt_ids,
+        max_tokens=max_tokens,
+        prefill_chunk=prefill_chunk,
+    )
     lm = model.language_model
     cache = lm.make_cache()
     stats = stats if stats is not None else GenStats()
@@ -293,6 +334,13 @@ def speculative_stream_generate(
     caches trim; DeltaNet recurrent states restore from a snapshot and the
     accepted tokens replay (only on partial acceptance).
     """
+    validate_generation_params(
+        prompt_ids,
+        max_tokens=max_tokens,
+        prefill_chunk=prefill_chunk,
+        num_draft=num_draft,
+        using_spec=True,
+    )
     import numpy as np
 
     from mlx_lm.models.cache import KVCache
@@ -469,6 +517,13 @@ def eagle3_stream_generate(
     forward keeps the exact target weights and lm_head, so output matches plain
     decoding — greedy at ``temp == 0``, and temp-correct at ``temp > 0`` (the
     draft ``q`` is scattered from the 32k head into the target vocab via d2t)."""
+    validate_generation_params(
+        prompt_ids,
+        max_tokens=max_tokens,
+        prefill_chunk=prefill_chunk,
+        num_draft=num_draft,
+        using_spec=True,
+    )
     import numpy as np
 
     from mlx_lm.models.cache import KVCache
@@ -640,6 +695,13 @@ def dflash_stream_generate(
     cycle drafts via one 16-token masked block forward. Greedy at ``temp == 0``
     (output identical to plain greedy); Leviathan-Chen temp-correct sampling at
     ``temp > 0`` (the block logits are over the target vocab, so ``q`` is exact)."""
+    validate_generation_params(
+        prompt_ids,
+        max_tokens=max_tokens,
+        prefill_chunk=prefill_chunk,
+        num_draft=num_draft,
+        using_spec=True,
+    )
     import numpy as np
 
     from ponyexl3.mlx.eagle3 import AuxTrace
@@ -817,6 +879,13 @@ def lookup_stream_generate(
     and lost ~35% end-to-end — the ~10 ms/cycle of host graph-build must
     stay hidden under GPU execution.
     """
+    validate_generation_params(
+        prompt_ids,
+        max_tokens=max_tokens,
+        prefill_chunk=prefill_chunk,
+        num_draft=num_draft,
+        using_spec=True,
+    )
     import numpy as np
 
     lm = model.language_model
@@ -960,6 +1029,7 @@ def generate_text(
     lookup: bool = False,
     eagle3: DraftModule | None = None,
     dflash: DraftModule | None = None,
+    max_context: int | None = None,
 ) -> tuple[str, GenStats]:
     """Encode, generate, and detokenize. ``on_segment`` streams text chunks.
     With an ``mtp`` draft module and greedy sampling, uses speculative
@@ -978,6 +1048,21 @@ def generate_text(
             prompt_ids = tokenizer.encode(prompt)
     else:
         prompt_ids = list(prompt_ids)
+
+    using_spec = bool(
+        dflash is not None
+        or eagle3 is not None
+        or mtp is not None
+        or (lookup and temp <= 0.0)
+    )
+    validate_generation_params(
+        list(prompt_ids),
+        max_tokens=max_tokens,
+        prefill_chunk=prefill_chunk,
+        num_draft=num_draft,
+        using_spec=using_spec,
+        max_context=max_context,
+    )
 
     eos_ids = set(extra_eos)
     tok_eos = getattr(tokenizer, "eos_token_ids", None)

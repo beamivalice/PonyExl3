@@ -14,7 +14,7 @@ from ponyexl3.ref.trellis import pack_trellis_tile
 _FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
 
-def main():
+def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", type=Path, default=_FIXTURES / "synthetic_layer.npz")
     p.add_argument("-k", type=int, default=4, help="bits per weight (1-8)")
@@ -22,6 +22,13 @@ def main():
     p.add_argument("--out-features", type=int, default=128)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
+
+    if not (1 <= args.k <= 8):
+        raise SystemExit("--k must be between 1 and 8")
+    if args.in_features <= 0 or args.out_features <= 0:
+        raise SystemExit("feature sizes must be positive")
+    if args.in_features % 16 != 0 or args.out_features % 16 != 0:
+        raise SystemExit("--in-features and --out-features must be multiples of 16")
 
     rng = np.random.default_rng(args.seed)
     k = args.k
@@ -61,7 +68,8 @@ def main():
         "path": str(args.out),
     }
     print(json.dumps(meta, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

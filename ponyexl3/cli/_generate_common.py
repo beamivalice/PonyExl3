@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
+
+from ponyexl3.mlx.generate import max_position_embeddings, validate_generation_params
 from ponyexl3.types import DraftModule, MlxLmModel, Tokenizer
 
 PREFILL_BENCH_SIZES = (1024, 2048, 4096, 8192, 16384, 32768)
@@ -62,6 +65,101 @@ def add_generate_arguments(
     ap.add_argument("-q", "--quiet", action="store_true", help="suppress load progress")
 
 
+def validate_exl3_model_dir(model_dir: str | Path) -> Path:
+    """Ensure ``model_dir`` looks like an EXL3 checkpoint before loading."""
+    p = Path(model_dir).expanduser()
+    if not p.is_dir():
+        raise SystemExit(f"model directory not found: {p}")
+    qcfg = p / "quantization_config.json"
+    if not qcfg.is_file():
+        raise SystemExit(f"not an EXL3 model directory (missing {qcfg})")
+    cfg = p / "config.json"
+    if not cfg.is_file():
+        raise SystemExit(f"model directory missing {cfg}")
+    return p
+
+
+def require_metal() -> None:
+    if not mx.metal.is_available():
+        raise SystemExit(
+            "Metal is required (Apple Silicon). MLX Metal backend is not available."
+        )
+
+
+def warn_speculative_flags(args: argparse.Namespace) -> None:
+    spec = []
+    if args.dflash:
+        spec.append("--dflash")
+    if args.eagle3:
+        spec.append("--eagle3")
+    if args.mtp != "off":
+        spec.append("--mtp")
+    if len(spec) > 1:
+        print(
+            f"[warn] multiple spec flags ({', '.join(spec)}); "
+            "precedence: dflash > eagle3 > mtp",
+            file=sys.stderr,
+        )
+    if args.lookup and spec:
+        print(
+            f"[warn] --lookup ignored while {spec[0]} is active",
+            file=sys.stderr,
+        )
+
+
+def validate_generate_cli_args(
+    args: argparse.Namespace,
+    *,
+    bench: bool = False,
+) -> None:
+    validate_exl3_model_dir(args.model)
+    require_metal()
+    if args.prefill_chunk <= 0:
+        raise SystemExit("--prefill-chunk must be positive")
+    if args.draft <= 0:
+        raise SystemExit("--draft must be positive")
+    if bench:
+        if args.gen_tokens < 0:
+            raise SystemExit("--gen-tokens must be >= 0")
+        if args.gen_tokens == 0:
+            print(
+                "[warn] --gen-tokens 0: prefill-only rows (no decode timing)",
+                file=sys.stderr,
+            )
+    else:
+        if args.max_tokens < 0:
+            raise SystemExit("--max-tokens must be >= 0")
+        if args.max_tokens == 0:
+            print(
+                "[warn] --max-tokens 0: prefill only, no tokens will be emitted",
+                file=sys.stderr,
+            )
+    warn_speculative_flags(args)
+    if args.lookup and args.temp > 0.0:
+        print(
+            "[warn] --lookup only applies at --temp 0; using plain sampling",
+            file=sys.stderr,
+        )
+
+
+def check_context_limit(
+    prefill_tokens: int,
+    gen_tokens: int,
+    config: dict[str, Any],
+    *,
+    label: str = "request",
+) -> None:
+    limit = max_position_embeddings(config)
+    if limit is None or limit <= 0:
+        return
+    total = prefill_tokens + gen_tokens
+    if total > limit:
+        raise SystemExit(
+            f"{label} needs {total} tokens (prefill {prefill_tokens} + "
+            f"gen {gen_tokens}) but max_position_embeddings={limit}"
+        )
+
+
 @dataclass
 class GenerateStack:
     model: MlxLmModel
@@ -95,6 +193,11 @@ def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
 
     dflash: DraftModule | None = None
     draft = args.draft
+    if args.dflash and args.engine not in ("exl3", "w4gptq") and not args.quiet:
+        print(
+            f"[warn] --dflash ignored for engine={args.engine!r} (needs exl3 or w4gptq)",
+            file=sys.stderr,
+        )
     if args.dflash and args.engine in ("exl3", "w4gptq"):
         from ponyexl3.mlx.dflash import DFlashDraft
 
@@ -122,6 +225,11 @@ def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
             )
 
     eagle3: DraftModule | None = None
+    if dflash is None and args.eagle3 and args.engine != "exl3" and not args.quiet:
+        print(
+            f"[warn] --eagle3 ignored for engine={args.engine!r} (needs exl3)",
+            file=sys.stderr,
+        )
     if dflash is None and args.eagle3 and args.engine == "exl3":
         from ponyexl3.mlx.eagle3 import Eagle3Draft
 
@@ -136,6 +244,17 @@ def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
             )
 
     mtp: DraftModule | None = None
+    if (
+        dflash is None
+        and eagle3 is None
+        and args.mtp != "off"
+        and args.engine != "exl3"
+        and not args.quiet
+    ):
+        print(
+            f"[warn] --mtp ignored for engine={args.engine!r} (needs exl3)",
+            file=sys.stderr,
+        )
     if dflash is None and eagle3 is None and args.mtp != "off" and args.engine == "exl3":
         from ponyexl3.mlx.mtp import load_mtp
 
@@ -148,6 +267,18 @@ def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
             print(
                 "[mtp] draft head loaded — speculative decoding on"
                 + (" (w4 draft side)" if args.draft_w4 else ""),
+                file=sys.stderr,
+            )
+        elif (
+            dflash is None
+            and eagle3 is None
+            and args.mtp != "off"
+            and args.engine == "exl3"
+            and mtp is None
+            and not args.quiet
+        ):
+            print(
+                "[warn] --mtp requested but no MTP weights found; using plain decode",
                 file=sys.stderr,
             )
 
@@ -204,11 +335,16 @@ def build_prefill_prompt_ids(
     *,
     raw: bool,
 ) -> list[int]:
-    base = encode_prompt_text(text, tokenizer, raw=raw)
-    if not base:
-        raise ValueError("prompt file encodes to zero tokens")
-    ids: list[int] = []
-    while len(ids) < target_tokens:
-        need = target_tokens - len(ids)
-        ids.extend(base if need >= len(base) else base[:need])
-    return ids[:target_tokens]
+    if target_tokens <= 0:
+        raise ValueError("target_tokens must be positive")
+    if not text.strip():
+        raise ValueError("prompt file is empty")
+    chunk = text
+    acc = chunk
+    while True:
+        ids = encode_prompt_text(acc, tokenizer, raw=raw)
+        if not ids:
+            raise ValueError("prompt file encodes to zero tokens")
+        if len(ids) >= target_tokens:
+            return ids[:target_tokens]
+        acc += chunk
