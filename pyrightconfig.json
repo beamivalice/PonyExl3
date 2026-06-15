@@ -3,7 +3,7 @@
   "exclude": ["**/__pycache__", ".venv"],
   "stubPath": "typings",
   "typeCheckingMode": "strict",
-  "pythonVersion": "3.10",
+  "pythonVersion": "3.14",
   "venvPath": ".",
   "venv": ".venv",
   "reportMissingTypeStubs": false,

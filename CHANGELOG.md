@@ -1,0 +1,27 @@
+# Changelog
+
+All notable changes to PonyExl3 are documented here.
+
+## [0.1.3] — 2026-06-13
+
+- MTP speculative decoding: temperature-aware verify (Leviathan–Chen rejection sampling)
+- README benchmark tables (M5 Max, M1 Max, RTX 4090 comparison)
+
+## [0.1.2] — 2026-06-13
+
+- Fix load transient memory / MLX buffer cache growth on 32 GB Macs
+- Wired-memory cap via `PONYEXL3_MEM_LIMIT_GB` (92% of device recommended working set)
+- M1 Max benchmark numbers in README
+
+## [0.1.1] — 2026-06-13
+
+- First 32 GB memory fix (load peak ~27.5 GB for 27B 4.15bpw)
+
+## [0.1.0] — 2026-06-13
+
+- Initial public release: EXL3 inference on Apple Silicon via MLX
+- CPU `ref/` golden codec + MLX Metal runtime
+- Model loader for Qwen3.5 / Qwen3.6 dense and MoE
+- Speculative decoding: MTP, DFlash, EAGLE-3, n-gram lookup (verify-gated)
+- CLIs: `ponyexl3-generate`, `ponyexl3-compare-layer`, `ponyexl3-compare-engines`
+- Cross-platform reference export/compare scripts (`ponyexl3/reference/`)

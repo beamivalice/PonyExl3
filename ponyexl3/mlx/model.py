@@ -326,7 +326,7 @@ def convert_engine(
         return []
 
     if engine == "w4gptq":
-        # GPTQ sidecar produced by tools/gptq_convert.py: activation-aware
+        # GPTQ sidecar produced by ponyexl3/cli/gptq_convert.py: activation-aware
         # affine w4 of every decoder linear; lm_head (and anything not in
         # the sidecar) keeps the exact trellis GEMV. Lossy vs EXL3 — the
         # opt-in speed/accuracy lever; drift measured in tools/drift_eval.py.
@@ -336,7 +336,7 @@ def convert_engine(
 
         if sidecar_dir is None or not os.path.isdir(sidecar_dir):
             raise ValueError(
-                f"w4gptq needs the sidecar from tools/gptq_convert.py ({sidecar_dir})"
+                f"w4gptq needs the sidecar from ponyexl3/cli/gptq_convert.py ({sidecar_dir})"
             )
         side = {}
         for f in sorted(_glob.glob(os.path.join(sidecar_dir, "chunk_*.safetensors"))):

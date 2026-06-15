@@ -164,7 +164,7 @@ Engine fidelity via `ponyexl3/reference/compare_trace.py`.
 ## Requirements
 
 - macOS on Apple Silicon (M-series)
-- Python ≥ 3.10
+- Python ≥ 3.14 (tested on 3.14.5)
 - **Memory** (unified RAM):
 
   | Model | resident | load peak | runs on |
@@ -195,7 +195,7 @@ Engine fidelity via `ponyexl3/reference/compare_trace.py`.
 ## Install
 
 ```bash
-git clone https://github.com/beamster/ponyexl3.git   # when published
+git clone https://github.com/beamster/ponyexl3.git
 cd ponyexl3
 
 python3 -m venv .venv
@@ -315,7 +315,7 @@ any drafter's head/body in w4 — draft-side only, so output bits are unchanged.
 pytest tests/ -q
 ```
 
-**169 tests** run without any model on disk (synthetic layers + CPU/MLX parity). Optional integration tests are skipped unless env vars are set:
+**171 tests** run without any model on disk (synthetic layers + CPU/MLX parity). Optional integration tests are skipped unless env vars are set:
 
 ```bash
 export PONYEXL3_MODEL_DIR=/path/to/checkpoint
@@ -389,7 +389,15 @@ A custom generation loop (`ponyexl3.mlx.generate`) runs prefill through the text
 | `PONYEXL3_REFERENCE_NPZ` | Full-model reference parity test |
 | `MODEL` / `MTP` | Legacy aliases for bench scripts |
 
-Runtime tuning knobs (`EXL3_FUSE_POST`, `EXL3_MLP_MONO`, etc.) are documented in [`docs/current_stage.md`](docs/current_stage.md).
+Common runtime tuning knobs (all optional; defaults are the shipped path):
+
+| Variable | Effect |
+|----------|--------|
+| `EXL3_FUSE_MIN_MB` | Skip fusing layers below this weight size (lower load peak) |
+| `EXL3_WCACHE` | Keep host-side trellis after device upload (fp16-fold path) |
+| `EXL3_FUSE_POST` | Fused post-Hadamard in GEMV kernel |
+| `EXL3_MLP_MONO` | Experimental monolithic MLP kernel |
+| `PONYEXL3_MEM_LIMIT_GB` | Cap MLX wired memory (see [Requirements](#requirements)) |
 
 ---
 
@@ -419,4 +427,4 @@ Internal bench/dev scripts are described in [`tools/README.md`](tools/README.md)
 
 ## License
 
-Apache-2.0 (see `LICENSE` when published).
+Apache-2.0 — see [`LICENSE`](LICENSE).

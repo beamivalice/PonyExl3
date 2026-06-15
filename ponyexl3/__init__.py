@@ -1,7 +1,7 @@
 """EXL3 → MLX inference for Apple Silicon (PonyExl3).
 
 Golden CPU reference in ``ponyexl3.ref``; MLX runtime in ``ponyexl3.mlx``.
-Ported from ``exllamav3/mlxport`` — see ``README.md`` and ``docs/ponyexl3-plan.md``.
+Ported from ``exllamav3/mlxport`` — see ``README.md``.
 """
 
 from ponyexl3.ref import (

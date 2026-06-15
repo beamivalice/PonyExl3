@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ponyexl3"
-version = "0.1.0"
+version = "0.1.3"
 description = "EXL3 quantized LLM inference on Apple Silicon via MLX"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 license = "Apache-2.0"
 authors = [{name = "Theinruj Toranavikrai", email = "my.beam@gmail.com"}]
 keywords = ["mlx", "quantization", "llm", "apple-silicon", "exl3"]
@@ -16,23 +16,29 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "mlx>=0.20.0",
+    "mlx>=0.31.2",
     "mlx-lm>=0.31.3",
-    "numpy",
-    "safetensors>=0.4.0",
+    "numpy>=2.0",
+    "safetensors>=0.8.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pyright"]
+dev = ["pytest>=9", "pyright"]
+
+[project.urls]
+Homepage = "https://github.com/beamster/ponyexl3"
+Repository = "https://github.com/beamster/ponyexl3"
+Issues = "https://github.com/beamster/ponyexl3/issues"
 
 [tool.pyright]
 include = ["ponyexl3", "tests"]
 exclude = ["**/__pycache__", ".venv"]
 stubPath = "typings"
 typeCheckingMode = "strict"
-pythonVersion = "3.10"
+pythonVersion = "3.14"
 venvPath = "."
 venv = ".venv"
 reportMissingTypeStubs = false
