@@ -3,7 +3,8 @@
 The default mode is the fast oracle-comparable tile pilot. `--direct-window`
 quantizes one 128x128 Hadamard block, `--direct-layer` quantizes a whole
 linear module without error feedback, and `--ldlq-layer` adds Hessian/LDLQ
-error feedback. Layer modes can emit a minimal loadable EXL3 bundle.
+error feedback. `--layer-modules` promotes layer modes to a bounded module-set
+driver and emits one multi-layer EXL3 bundle plus a manifest.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ DEFAULT_PILOT_MODULE = "model.language_model.layers.0.linear_attn.in_proj_qkv"
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in-dir", required=True, type=Path, help="source HF checkpoint")
-    parser.add_argument("--out-dir", type=Path, help="reserved for full conversion output")
+    parser.add_argument("--out-dir", type=Path, help="write converted EXL3 output bundle")
     parser.add_argument("--work-dir", type=Path, help="reserved for resumable conversion state")
     parser.add_argument("--oracle-dir", required=True, type=Path, help="EXL3 oracle checkpoint")
     parser.add_argument("--bits", type=float, default=4.0, help="target decoder bpw")
@@ -32,7 +33,7 @@ def main() -> int:
         default="mcg",
         help="target codebook; tile pilot uses the oracle layer's stored mode",
     )
-    parser.add_argument("--only-layer", type=int, help="reserved for layer-scoped conversion")
+    parser.add_argument("--only-layer", type=int, help="layer index for --layer-modules")
     parser.add_argument(
         "--only-module",
         default=DEFAULT_PILOT_MODULE,
@@ -56,6 +57,21 @@ def main() -> int:
         "--ldlq-layer",
         action="store_true",
         help="quantize the whole selected linear module with Hessian/LDLQ",
+    )
+    parser.add_argument(
+        "--layer-modules",
+        action="store_true",
+        help="convert supported EXL3 modules in --only-layer instead of --only-module",
+    )
+    parser.add_argument(
+        "--include-routed-experts",
+        action="store_true",
+        help="include routed MoE experts in --layer-modules",
+    )
+    parser.add_argument(
+        "--module-limit",
+        type=int,
+        help="limit selected modules for bounded layer-driver smoke runs",
     )
     parser.add_argument(
         "--scale-mode",
@@ -85,6 +101,71 @@ def main() -> int:
         if layer_modes > 1:
             raise ValueError("--direct-window, --direct-layer, and --ldlq-layer are mutually exclusive")
         if args.direct_layer or args.ldlq_layer:
+            if args.layer_modules:
+                if args.only_layer is None:
+                    raise ValueError("--layer-modules requires --only-layer")
+                from ponyexl3.convert.driver import (
+                    convert_module_set,
+                    module_set_summary,
+                    supported_module_keys,
+                )
+
+                module_keys, pre_skipped = supported_module_keys(
+                    args.in_dir,
+                    args.oracle_dir,
+                    args.only_layer,
+                    include_routed_experts=args.include_routed_experts,
+                    module_limit=args.module_limit,
+                )
+                result = convert_module_set(
+                    args.in_dir,
+                    args.oracle_dir,
+                    module_keys,
+                    quantizer="ldlq" if args.ldlq_layer else "direct",
+                    out_dir=args.out_dir,
+                    search_backend=args.search_backend,
+                    scale_mode=args.scale_mode,
+                    sigma_reg=args.sigma_reg,
+                    buf_size_rows=args.buf_size_rows,
+                    resume=bool(args.resume),
+                )
+                summary = module_set_summary(result)
+                summary["pre_skipped"] = pre_skipped
+                summary["requested"] = {
+                    "bits": args.bits,
+                    "head_bits": args.head_bits,
+                    "codebook": args.codebook,
+                    "out_dir": None if args.out_dir is None else str(args.out_dir),
+                    "work_dir": None if args.work_dir is None else str(args.work_dir),
+                    "only_layer": args.only_layer,
+                    "include_routed_experts": bool(args.include_routed_experts),
+                    "module_limit": args.module_limit,
+                    "search_backend": args.search_backend,
+                    "scale_mode": args.scale_mode,
+                    "sigma_reg": args.sigma_reg,
+                    "buf_size_rows": args.buf_size_rows,
+                    "resume": bool(args.resume),
+                }
+                if args.json:
+                    print(json.dumps(summary, indent=2, sort_keys=True))
+                    return 0
+                print(f"layer modules: layer={args.only_layer} quantizer={summary['quantizer']}")
+                print(
+                    f"completed={len(summary['completed'])} "
+                    f"skipped={len(summary['skipped']) + len(pre_skipped)} "
+                    f"out_dir={summary['out_dir']}"
+                )
+                for item in summary["completed"]:
+                    if item.get("resumed"):
+                        print(f"  {item['module']}: resumed")
+                        continue
+                    stats = item["stats"]
+                    print(
+                        f"  {item['module']}: output={stats['output_rel_rms']:.6f} "
+                        f"proxy={stats.get('hessian_proxy_rel_rms', float('nan')):.6f}"
+                    )
+                return 0
+
             from ponyexl3.convert.direct import (
                 direct_layer_summary,
                 direct_quantize_layer,

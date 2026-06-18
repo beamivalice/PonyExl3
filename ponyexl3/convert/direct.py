@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Literal
+import shutil
+from typing import Any, Literal, Sequence
 
 import numpy as np
 from safetensors.numpy import save_file
@@ -62,6 +63,19 @@ class DirectLayerResult:
 
 
 DirectResult = DirectWindowResult | DirectLayerResult
+
+_MODEL_ASSET_NAMES = (
+    "config.json",
+    "configuration.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+)
 
 
 def _mse(a: np.ndarray, b: np.ndarray) -> float:
@@ -441,21 +455,53 @@ def _stored_tensor_meta(arr: np.ndarray) -> dict[str, Any]:
     }
 
 
-def write_direct_bundle(result: DirectResult, out_dir: str | Path) -> EXL3Layer:
-    """Write a minimal safetensors bundle and load it back through `load_exl3_layer`."""
+def _layer_tensors(layer: EXL3Layer) -> dict[str, np.ndarray]:
+    tensors: dict[str, np.ndarray] = {
+        f"{layer.key}.trellis": layer.trellis.astype(np.uint16, copy=False),
+    }
+    if layer.suh is not None:
+        tensors[f"{layer.key}.suh"] = layer.suh.astype(np.float16, copy=False)
+    if layer.svh is not None:
+        tensors[f"{layer.key}.svh"] = layer.svh.astype(np.float16, copy=False)
+    if layer.bias is not None:
+        tensors[f"{layer.key}.bias"] = layer.bias
+    return tensors
 
+
+def _copy_model_assets(asset_dir: str | Path | None, out: Path) -> list[str]:
+    if asset_dir is None:
+        return []
+    src = Path(asset_dir)
+    copied: list[str] = []
+    for name in _MODEL_ASSET_NAMES:
+        path = src / name
+        if path.is_file():
+            shutil.copy2(path, out / name)
+            copied.append(name)
+    return copied
+
+
+def write_exl3_layers_bundle(
+    layers: Sequence[EXL3Layer],
+    out_dir: str | Path,
+    *,
+    asset_dir: str | Path | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> list[EXL3Layer]:
+    """Write one safetensors shard containing multiple converted EXL3 layers."""
+
+    if not layers:
+        raise ValueError("cannot write an empty EXL3 layer bundle")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    key = result.module_key
-    tensors: dict[str, np.ndarray] = {
-        f"{key}.trellis": result.layer.trellis.astype(np.uint16, copy=False),
-    }
-    if result.layer.suh is not None:
-        tensors[f"{key}.suh"] = result.layer.suh.astype(np.float16, copy=False)
-    if result.layer.svh is not None:
-        tensors[f"{key}.svh"] = result.layer.svh.astype(np.float16, copy=False)
-    if result.layer.bias is not None:
-        tensors[f"{key}.bias"] = result.layer.bias
+
+    tensors: dict[str, np.ndarray] = {}
+    for layer in layers:
+        layer.validate()
+        for name, arr in _layer_tensors(layer).items():
+            if name in tensors:
+                raise ValueError(f"duplicate tensor in bundle: {name}")
+            tensors[name] = arr
 
     shard = "model.safetensors"
     save_file(tensors, str(out / shard))
@@ -466,22 +512,45 @@ def write_direct_bundle(result: DirectResult, out_dir: str | Path) -> EXL3Layer:
         encoding="utf-8",
     )
 
+    tensor_storage: dict[str, Any] = {}
+    for layer in layers:
+        layer_tensor_names = [name for name in tensors if name.startswith(f"{layer.key}.")]
+        tensor_storage[layer.key] = {
+            "quant_format": "exl3",
+            "bits_per_weight": float(layer.k),
+            "mcg_multiplier": bool(layer.mcg),
+            "mul1_multiplier": bool(layer.mul1),
+            "stored_tensors": {name: _stored_tensor_meta(tensors[name]) for name in layer_tensor_names},
+        }
     qcfg = {
         "quant_method": "exl3",
-        "tensor_storage": {
-            key: {
-                "quant_format": "exl3",
-                "bits_per_weight": float(result.layer.k),
-                "mcg_multiplier": bool(result.layer.mcg),
-                "mul1_multiplier": bool(result.layer.mul1),
-                "stored_tensors": {name: _stored_tensor_meta(arr) for name, arr in tensors.items()},
-            }
-        },
+        "tensor_storage": tensor_storage,
     }
     (out / "quantization_config.json").write_text(json.dumps(qcfg, indent=2), encoding="utf-8")
-    loaded = load_exl3_layer(str(out), key)
-    loaded.validate()
+
+    copied_assets = _copy_model_assets(asset_dir, out)
+    if manifest is not None:
+        manifest_out = dict(manifest)
+        manifest_out["asset_files"] = copied_assets
+        manifest_out["tensor_count"] = len(tensors)
+        manifest_out["layer_count"] = len(layers)
+        (out / "ponyexl3_convert_manifest.json").write_text(
+            json.dumps(manifest_out, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    loaded: list[EXL3Layer] = []
+    for layer in layers:
+        item = load_exl3_layer(str(out), layer.key)
+        item.validate()
+        loaded.append(item)
     return loaded
+
+
+def write_direct_bundle(result: DirectResult, out_dir: str | Path) -> EXL3Layer:
+    """Write a minimal safetensors bundle and load it back through `load_exl3_layer`."""
+
+    return write_exl3_layers_bundle([result.layer], out_dir)[0]
 
 
 def write_direct_window_bundle(result: DirectWindowResult, out_dir: str | Path) -> EXL3Layer:
