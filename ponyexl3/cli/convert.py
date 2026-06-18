@@ -256,6 +256,20 @@ def main() -> int:
         default=128,
         help="LDLQ row buffer size; must be a 16-multiple",
     )
+    parser.add_argument(
+        "--ldlq-feedback-rows",
+        type=int,
+        default=16,
+        help=(
+            "LDLQ feedback granularity; 16 is exact, larger 16-multiples batch "
+            "more rows per Metal launch for faster approximate LDLQ"
+        ),
+    )
+    parser.add_argument(
+        "--skip-oracle-metrics",
+        action="store_true",
+        help="skip expensive oracle dequantization metrics in LDLQ conversion",
+    )
     parser.add_argument("--resume", action="store_true", help="reserved for full conversion")
     parser.add_argument(
         "--skip-g-scale",
@@ -384,6 +398,8 @@ def main() -> int:
                     scale_mode=args.scale_mode,
                     sigma_reg=args.sigma_reg,
                     buf_size_rows=args.buf_size_rows,
+                    feedback_rows=args.ldlq_feedback_rows,
+                    compare_oracle=not args.skip_oracle_metrics,
                     resume=bool(args.resume),
                     calibration_activations=calibration_activations,
                     skip_g_scale=bool(args.skip_g_scale),
@@ -411,6 +427,8 @@ def main() -> int:
                     "scale_mode": args.scale_mode,
                     "sigma_reg": args.sigma_reg,
                     "buf_size_rows": args.buf_size_rows,
+                    "ldlq_feedback_rows": args.ldlq_feedback_rows,
+                    "oracle_metrics": not args.skip_oracle_metrics,
                     "resume": bool(args.resume),
                     "calibration_activations": None
                     if args.calibration_activations is None
@@ -458,6 +476,8 @@ def main() -> int:
                     scale_mode=args.scale_mode,
                     sigma_reg=args.sigma_reg,
                     buf_size_rows=args.buf_size_rows,
+                    feedback_rows=args.ldlq_feedback_rows,
+                    compare_oracle=not args.skip_oracle_metrics,
                     calibration_activations=calibration_activations,
                     skip_g_scale=bool(args.skip_g_scale),
                     regularization_seed=args.regularization_seed,
@@ -486,6 +506,8 @@ def main() -> int:
                 "scale_mode": args.scale_mode,
                 "sigma_reg": args.sigma_reg,
                 "buf_size_rows": args.buf_size_rows,
+                "ldlq_feedback_rows": args.ldlq_feedback_rows,
+                "oracle_metrics": not args.skip_oracle_metrics,
                 "resume": bool(args.resume),
                 "calibration_activations": None
                 if args.calibration_activations is None

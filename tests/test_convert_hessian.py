@@ -133,6 +133,45 @@ def test_ldlq_identity_hessian_matches_direct_quantization():
     assert result.stats["pack_roundtrip"] is True
 
 
+def test_ldlq_grouped_feedback_identity_hessian_matches_direct_quantization():
+    rng = np.random.default_rng(106)
+    inner = (rng.standard_normal((64, 32)) * 0.05).astype(np.float32)
+    direct_packed, direct_states, direct_reconstructed = quantize_inner_matrix_direct(
+        inner,
+        k=2,
+        cb=CodebookMode.DEFAULT,
+        search_backend="cpu",
+    )
+    result = ldlq_inner_matrix(
+        inner,
+        np.eye(64, dtype=np.float32),
+        k=2,
+        cb=CodebookMode.DEFAULT,
+        search_backend="cpu",
+        buf_size_rows=64,
+        feedback_rows=64,
+    )
+
+    np.testing.assert_array_equal(result.packed, direct_packed)
+    np.testing.assert_array_equal(result.states, direct_states)
+    np.testing.assert_array_equal(result.reconstructed, direct_reconstructed)
+    assert result.stats["ldlq_feedback_rows"] == 64.0
+
+
+def test_ldlq_rejects_invalid_feedback_rows():
+    inner = np.zeros((32, 32), dtype=np.float32)
+    with pytest.raises(ValueError, match="feedback_rows"):
+        ldlq_inner_matrix(
+            inner,
+            np.eye(32, dtype=np.float32),
+            k=2,
+            cb=CodebookMode.DEFAULT,
+            search_backend="cpu",
+            buf_size_rows=32,
+            feedback_rows=24,
+        )
+
+
 def test_public_matrix_to_inner_identity_mode_is_noop():
     rng = np.random.default_rng(105)
     public = rng.standard_normal((128, 128)).astype(np.float32)
@@ -212,6 +251,19 @@ def test_ldlq_layer_identity_synthetic_emits_loadable_layer(tmp_path: Path):
     assert loaded.in_features == 128
     assert loaded.out_features == 128
     assert loaded.trellis.shape == result.layer.trellis.shape
+
+    no_oracle = ldlq_quantize_layer(
+        source_dir,
+        oracle_dir,
+        PILOT_MODULE,
+        search_backend="metal",
+        scale_mode="identity",
+        buf_size_rows=128,
+        feedback_rows=128,
+        compare_oracle=False,
+    )
+    assert no_oracle.stats["oracle_metrics"] is False
+    assert "oracle_output_rel_rms" not in no_oracle.stats
 
 
 @pytest.mark.skipif(not _metal_available(), reason="Metal is required for the 128x128 layer gate")

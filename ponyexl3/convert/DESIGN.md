@@ -79,6 +79,16 @@ Current checkpoint-backed pilot:
   under the fixture Hessian). This confirms the next quality phase should
   prioritize full-model LDLQ/calibration and measured proxy allocation over
   naive extra-bit spending.
+- MiniCPM5 speed hardening:
+  the `56.8 s` LDLQ smoke was dominated by diagnostic oracle reconstruction,
+  not conversion. Production LDLQ should use `--skip-oracle-metrics`, which
+  keeps converted/source metrics and skips CPU oracle dequantization. The same
+  `model.layers.0.mlp.down_proj` exact LDLQ run dropped to `2.8 s` with
+  identical output/proxy metrics. Full MiniCPM layer 0 exact LDLQ
+  (`7` modules) took `8.5 s` with `--skip-oracle-metrics`. A grouped feedback
+  approximation (`--ldlq-feedback-rows 128`) did not materially improve speed
+  and degraded the module output rel-RMS to `0.025153`, so exact
+  `--ldlq-feedback-rows 16` remains the recommended heavy-job setting.
 
 ---
 
@@ -423,6 +433,8 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 |---|---|---:|---|
 | MiniCPM5 `model.layers.0.self_attn.q_proj` | direct, Metal, oracle-safe scales | `~0.95 s` | Fast iteration gate after removing CPU trellis decode from metrics. |
 | MiniCPM5 `model.layers.0.mlp.down_proj` | direct, Metal, oracle-safe scales | `~1.8 s` | Representative small smoke module with live progress output. |
+| MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, Metal, `--skip-oracle-metrics` | `2.8 s` | Output rel-RMS `0.003690`; prior `56.8 s` included diagnostic oracle CPU dequantization. |
+| MiniCPM5 layer 0 (`7` modules) | exact LDLQ, Metal, `--skip-oracle-metrics` | `8.5 s` | Recommended heavy-job path; keep `--ldlq-feedback-rows 16`. |
 | MiniCPM5-1B full model | direct, Metal, oracle-safe scales | `428 s` (`7.1 min`) | `169` EXL3 linears + `50` plain tensors; strict-loadable output. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |

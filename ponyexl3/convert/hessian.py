@@ -257,6 +257,7 @@ def ldlq_inner_matrix(
     hessian: np.ndarray | None = None,
     search_backend: SearchBackend = "metal",
     buf_size_rows: int = 128,
+    feedback_rows: int = 16,
     max_pins: int = 4,
 ) -> LDLQResult:
     """Reverse 16-row LDLQ over an EXL3 inner-domain matrix."""
@@ -268,6 +269,10 @@ def ldlq_inner_matrix(
         raise ValueError(f"L factor shape {l_factor.shape} does not match rows {rows}")
     if buf_size_rows < 16 or buf_size_rows % 16 != 0:
         raise ValueError(f"buf_size_rows must be a positive 16-multiple, got {buf_size_rows}")
+    if feedback_rows < 16 or feedback_rows % 16 != 0:
+        raise ValueError(f"feedback_rows must be a positive 16-multiple, got {feedback_rows}")
+    if feedback_rows > buf_size_rows:
+        raise ValueError("feedback_rows must be <= buf_size_rows")
     if hessian is not None and hessian.shape != (rows, rows):
         raise ValueError(f"Hessian shape {hessian.shape} does not match rows {rows}")
 
@@ -294,11 +299,13 @@ def ldlq_inner_matrix(
         b_l = l[i:j]
         chunk_rows = j - i
 
-        for bj in range(chunk_rows, 0, -16):
-            bi = bj - 16
+        for bj in range(chunk_rows, 0, -feedback_rows):
+            bi = max(0, bj - feedback_rows)
+            if (bj - bi) % 16 != 0:
+                raise ValueError("LDLQ feedback groups must stay 16-aligned")
             bb_err = b_weight[bj:] - b_reconstructed[bj:]
             bb_l = b_l[bj:, i + bi : i + bj]
-            compensation = b_prod_cache[bi:bj]
+            compensation = b_prod_cache[bi:bj].copy()
             if bb_err.size:
                 compensation += bb_l.T @ bb_err
             rows_to_quantize = b_weight[bi:bj] + compensation
@@ -310,12 +317,14 @@ def ldlq_inner_matrix(
                 max_pins=max_pins,
             )
             tk = (i + bi) // 16
-            packed[tk : tk + 1] = block_packed
-            states[tk : tk + 1] = block_states
+            tk1 = tk + (bj - bi) // 16
+            packed[tk:tk1] = block_packed
+            states[tk:tk1] = block_states
             b_reconstructed[bi:bj] = block_reconstructed
 
         b_err = b_weight - b_reconstructed
-        prod_cache += b_l.T @ b_err
+        if i > 0:
+            prod_cache[:i] += b_l[:, :i].T @ b_err
         j = i
 
     delta = reconstructed - weight
@@ -325,6 +334,7 @@ def ldlq_inner_matrix(
         "inner_mse": mse,
         "inner_rel_rms": float(np.sqrt(mse) / ref_rms),
         "pack_roundtrip": True,
+        "ldlq_feedback_rows": float(feedback_rows),
     }
     if hessian is not None:
         proxy = hessian_proxy_stats(delta, hessian, reference=weight)
@@ -353,11 +363,13 @@ def ldlq_quantize_layer(
     scale_mode: ScaleMode = "oracle_safe",
     sigma_reg: float = 0.025,
     buf_size_rows: int = 128,
+    feedback_rows: int = 16,
     max_pins: int = 4,
     calibration_activations: np.ndarray | None = None,
     skip_g_scale: bool = False,
     regularization_seed: int = 0,
     quant_bits: int | None = None,
+    compare_oracle: bool = True,
 ) -> DirectLayerResult:
     """Quantize one full linear module with activation-aware LDLQ."""
 
@@ -395,7 +407,6 @@ def ldlq_quantize_layer(
 
     inner_acts = public_activations_to_inner(fixture.activations, suh)
     prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
-    oracle_inner, oracle_public = oracle_comparison_weights(ref_layer, suh=suh, svh=svh)
     ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
     quantized = ldlq_inner_matrix(
         target_inner,
@@ -405,6 +416,7 @@ def ldlq_quantize_layer(
         hessian=prepared.hessian,
         search_backend=search_backend,
         buf_size_rows=buf_size_rows,
+        feedback_rows=feedback_rows,
         max_pins=max_pins,
     )
 
@@ -430,24 +442,12 @@ def ldlq_quantize_layer(
     x = fixture.activations.astype(np.float32)
     source_y = x @ source_public
     converted_y = x @ reconstructed_public
-    oracle_y = x @ oracle_public
     public_delta = reconstructed_public - source_public
     output_delta = converted_y - source_y
-    oracle_public_delta = oracle_public - source_public
-    oracle_output_delta = oracle_y - source_y
     public_sse = float(np.sum(public_delta * public_delta))
     public_ref_ss = float(np.sum(source_public * source_public))
     output_sse = float(np.sum(output_delta * output_delta))
     output_ref_ss = float(np.sum(source_y * source_y))
-    oracle_public_sse = float(np.sum(oracle_public_delta * oracle_public_delta))
-    oracle_output_sse = float(np.sum(oracle_output_delta * oracle_output_delta))
-    oracle_proxy = hessian_proxy_stats(
-        oracle_inner - target_inner,
-        prepared.hessian,
-        reference=target_inner,
-    )
-    converted_proxy_rel = float(quantized.stats.get("hessian_proxy_rel_rms", float("nan")))
-    oracle_proxy_rel = oracle_proxy.proxy_rel_rms
 
     stats = dict(quantized.stats)
     stats.update(
@@ -460,32 +460,51 @@ def ldlq_quantize_layer(
             ),
             "output_mse": mse_from_sse(output_sse, int(source_y.size)),
             "output_rel_rms": rel_rms_from_sse(output_sse, output_ref_ss, int(source_y.size)),
-            "oracle_public_mse": mse_from_sse(oracle_public_sse, int(source_public.size)),
-            "oracle_public_rel_rms": rel_rms_from_sse(
-                oracle_public_sse,
-                public_ref_ss,
-                int(source_public.size),
-            ),
-            "oracle_output_mse": mse_from_sse(oracle_output_sse, int(source_y.size)),
-            "oracle_output_rel_rms": rel_rms_from_sse(
-                oracle_output_sse,
-                output_ref_ss,
-                int(source_y.size),
-            ),
-            "oracle_hessian_proxy_sse": oracle_proxy.proxy_sse,
-            "oracle_hessian_proxy_mse": oracle_proxy.proxy_mse,
-            "oracle_hessian_proxy_rel_rms": oracle_proxy_rel,
-            "hessian_proxy_rel_rms_over_oracle": float(
-                converted_proxy_rel / (oracle_proxy_rel + 1e-20)
-            ),
-            "output_rel_rms_over_oracle": float(
-                np.sqrt(mse_from_sse(output_sse, int(source_y.size)))
-                / (np.sqrt(mse_from_sse(oracle_output_sse, int(source_y.size))) + 1e-20)
-            ),
             "hessian_diag_mean": prepared.diag_mean,
             "ldl_retries": float(ldl.retries),
+            "oracle_metrics": bool(compare_oracle),
         }
     )
+    if compare_oracle:
+        oracle_inner, oracle_public = oracle_comparison_weights(ref_layer, suh=suh, svh=svh)
+        oracle_y = x @ oracle_public
+        oracle_public_delta = oracle_public - source_public
+        oracle_output_delta = oracle_y - source_y
+        oracle_public_sse = float(np.sum(oracle_public_delta * oracle_public_delta))
+        oracle_output_sse = float(np.sum(oracle_output_delta * oracle_output_delta))
+        oracle_proxy = hessian_proxy_stats(
+            oracle_inner - target_inner,
+            prepared.hessian,
+            reference=target_inner,
+        )
+        converted_proxy_rel = float(quantized.stats.get("hessian_proxy_rel_rms", float("nan")))
+        oracle_proxy_rel = oracle_proxy.proxy_rel_rms
+        stats.update(
+            {
+                "oracle_public_mse": mse_from_sse(oracle_public_sse, int(source_public.size)),
+                "oracle_public_rel_rms": rel_rms_from_sse(
+                    oracle_public_sse,
+                    public_ref_ss,
+                    int(source_public.size),
+                ),
+                "oracle_output_mse": mse_from_sse(oracle_output_sse, int(source_y.size)),
+                "oracle_output_rel_rms": rel_rms_from_sse(
+                    oracle_output_sse,
+                    output_ref_ss,
+                    int(source_y.size),
+                ),
+                "oracle_hessian_proxy_sse": oracle_proxy.proxy_sse,
+                "oracle_hessian_proxy_mse": oracle_proxy.proxy_mse,
+                "oracle_hessian_proxy_rel_rms": oracle_proxy_rel,
+                "hessian_proxy_rel_rms_over_oracle": float(
+                    converted_proxy_rel / (oracle_proxy_rel + 1e-20)
+                ),
+                "output_rel_rms_over_oracle": float(
+                    np.sqrt(mse_from_sse(output_sse, int(source_y.size)))
+                    / (np.sqrt(mse_from_sse(oracle_output_sse, int(source_y.size))) + 1e-20)
+                ),
+            }
+        )
     stats.update(basis.stats)
     return DirectLayerResult(
         module_key=module_key,

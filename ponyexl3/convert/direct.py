@@ -29,7 +29,7 @@ from ponyexl3.ref.codebook import CodebookMode
 from ponyexl3.ref.hadamard import HAD_DIM, preapply_had_left, preapply_had_right
 from ponyexl3.ref.layer import EXL3Layer
 from ponyexl3.ref.loader import load_exl3_layer
-from ponyexl3.ref.perm import kernel_order_to_row_major, tensor_core_perm
+from ponyexl3.ref.perm import tensor_core_perm, tensor_core_perm_inverse
 from ponyexl3.ref.signs import unpack_signs_or_pass
 from ponyexl3.ref.trellis import pack_trellis, unpack_trellis
 
@@ -94,6 +94,8 @@ _MODEL_ASSET_NAMES = (
     "preprocessor_config.json",
     "video_preprocessor_config.json",
 )
+_TENSOR_CORE_PERM = tensor_core_perm()
+_TENSOR_CORE_PERM_INV = tensor_core_perm_inverse()
 
 
 def _mse(a: np.ndarray, b: np.ndarray) -> float:
@@ -349,16 +351,12 @@ def _inner_to_kernel_tiles(inner: np.ndarray) -> np.ndarray:
         raise ValueError(f"expected 2D matrix with 16-multiple dims, got {inner.shape}")
     in_tiles = inner.shape[0] // 16
     out_tiles = inner.shape[1] // 16
-    perm = tensor_core_perm()
-    tiles = np.empty((in_tiles * out_tiles, 256), dtype=np.float32)
-    i = 0
-    for tk in range(in_tiles):
-        r0 = tk * 16
-        for tn in range(out_tiles):
-            c0 = tn * 16
-            tiles[i] = inner[r0 : r0 + 16, c0 : c0 + 16].reshape(256)[perm]
-            i += 1
-    return tiles
+    row_major = (
+        inner.reshape(in_tiles, 16, out_tiles, 16)
+        .transpose(0, 2, 1, 3)
+        .reshape(in_tiles * out_tiles, 256)
+    )
+    return row_major[:, _TENSOR_CORE_PERM].astype(np.float32, copy=False)
 
 
 def _kernel_tiles_to_inner(tiles: np.ndarray, rows: int, cols: int) -> np.ndarray:
@@ -366,15 +364,13 @@ def _kernel_tiles_to_inner(tiles: np.ndarray, rows: int, cols: int) -> np.ndarra
     out_tiles = cols // 16
     if tiles.shape != (in_tiles * out_tiles, 256):
         raise ValueError(f"decoded tile shape {tiles.shape} does not match {(rows, cols)}")
-    out = np.empty((rows, cols), dtype=np.float32)
-    i = 0
-    for tk in range(in_tiles):
-        r0 = tk * 16
-        for tn in range(out_tiles):
-            c0 = tn * 16
-            out[r0 : r0 + 16, c0 : c0 + 16] = kernel_order_to_row_major(tiles[i])
-            i += 1
-    return out
+    return (
+        tiles[:, _TENSOR_CORE_PERM_INV]
+        .reshape(in_tiles, out_tiles, 16, 16)
+        .transpose(0, 2, 1, 3)
+        .reshape(rows, cols)
+        .astype(np.float32, copy=False)
+    )
 
 
 def quantize_inner_matrix_direct(
@@ -384,6 +380,7 @@ def quantize_inner_matrix_direct(
     cb: CodebookMode,
     search_backend: SearchBackend = "metal",
     max_pins: int = 4,
+    verify_roundtrip: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Quantize an inner-domain matrix tilewise, without LDL error feedback."""
 
@@ -408,9 +405,10 @@ def quantize_inner_matrix_direct(
     out_tiles = inner.shape[1] // 16
     states = states_flat.reshape(in_tiles, out_tiles, 256)
     packed = pack_trellis((states & ((1 << k) - 1)).astype(np.uint16), k)
-    roundtrip = unpack_trellis(packed, k)
-    if not np.array_equal(roundtrip.astype(np.uint16), states):
-        raise AssertionError("direct quantization produced non-round-trippable trellis")
+    if verify_roundtrip:
+        roundtrip = unpack_trellis(packed, k)
+        if not np.array_equal(roundtrip.astype(np.uint16), states):
+            raise AssertionError("direct quantization produced non-round-trippable trellis")
     reconstructed_inner = _kernel_tiles_to_inner(decoded_tiles, inner.shape[0], inner.shape[1])
     return packed, states, reconstructed_inner
 

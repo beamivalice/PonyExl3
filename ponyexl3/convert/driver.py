@@ -247,10 +247,12 @@ def _convert_one(
     scale_mode: ScaleMode,
     sigma_reg: float,
     buf_size_rows: int,
+    feedback_rows: int,
     calibration_activations: np.ndarray | None,
     skip_g_scale: bool,
     regularization_seed: int,
     quant_bits: int | None,
+    compare_oracle: bool,
 ) -> DirectLayerResult:
     if quantizer == "direct":
         return direct_quantize_layer(
@@ -272,10 +274,12 @@ def _convert_one(
         scale_mode=scale_mode,
         sigma_reg=sigma_reg,
         buf_size_rows=buf_size_rows,
+        feedback_rows=feedback_rows,
         calibration_activations=calibration_activations,
         skip_g_scale=skip_g_scale,
         regularization_seed=regularization_seed,
         quant_bits=quant_bits,
+        compare_oracle=compare_oracle,
     )
 
 
@@ -296,6 +300,8 @@ def convert_module_set(
     scale_mode: ScaleMode = "oracle_safe",
     sigma_reg: float = 0.025,
     buf_size_rows: int = 128,
+    feedback_rows: int = 16,
+    compare_oracle: bool = True,
     skip_unsupported: bool = True,
     asset_dir: str | Path | None = None,
     resume: bool = False,
@@ -322,6 +328,8 @@ def convert_module_set(
                 "quantizer": quantizer,
                 "search_backend": search_backend,
                 "scale_mode": scale_mode,
+                "feedback_rows": feedback_rows,
+                "compare_oracle": compare_oracle,
                 "bit_plan_enabled": bool(planned_bits),
             },
         )
@@ -386,10 +394,12 @@ def convert_module_set(
                 scale_mode=scale_mode,
                 sigma_reg=sigma_reg,
                 buf_size_rows=buf_size_rows,
+                feedback_rows=feedback_rows,
                 calibration_activations=calibration_activations,
                 skip_g_scale=skip_g_scale,
                 regularization_seed=regularization_seed,
                 quant_bits=planned_bits.get(key),
+                compare_oracle=compare_oracle,
             )
         except (KeyError, ValueError, FileNotFoundError) as exc:
             if not skip_unsupported:
@@ -460,6 +470,8 @@ def convert_module_set(
             "scale_mode": scale_mode,
             "sigma_reg": sigma_reg,
             "buf_size_rows": buf_size_rows,
+            "feedback_rows": feedback_rows,
+            "compare_oracle": compare_oracle,
             "resume": resume,
             "calibration_rows": 0
             if calibration_activations is None
