@@ -13,6 +13,7 @@ All notable changes to PonyExl3 are documented here.
 
 - HF → EXL3 conversion on Metal: trellis search, Hessian/LDLQ, regularization, calibration, allocation
 - Full-model conversion validated on MiniCPM5-1B (~7 min direct path on M5 Max)
+- MiniCPM5 4.00bpw KLD vs bf16 matches [turboderp oracle](https://huggingface.co/turboderp/MiniCPM5-1B-exl3/tree/4.00bpw) (KLD 0.0422 vs 0.0428; p95 0.136 vs 0.145)
 - Module/layer/model scope; manifest output (`ponyexl3_convert_manifest.json`)
 - Metal search speedups: vectorized trellis packing, oracle-metrics fast path
 

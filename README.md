@@ -250,14 +250,14 @@ No Pony monorepo or `PYTHONPATH` setup is needed. Everything imports as `ponyexl
 
 ### Releases
 
-v0.1.x ships the **Python runtime only** — not model weights. EXL3 checkpoints
+v0.2.x ships the **Python runtime only** — not model weights. EXL3 checkpoints
 live on Hugging Face (or your disk) separately.
 
 | Artifact | Format | How to get it |
 |----------|--------|---------------|
-| Git tag | `v0.1.7` | `git checkout v0.1.7` |
+| Git tag | `v0.2.0` | `git checkout v0.2.0` |
 | GitHub Release | `.tar.gz` / `.zip` source archives | Auto-attached when you publish a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) from the tag |
-| Python packages | `ponyexl3-0.1.7.tar.gz` (sdist) + `ponyexl3-0.1.7-py3-none-any.whl` | `uv build` locally; optionally upload to PyPI or attach to the GitHub Release |
+| Python packages | `ponyexl3-0.2.0.tar.gz` (sdist) + `ponyexl3-0.2.0-py3-none-any.whl` | `uv build` locally; optionally upload to PyPI or attach to the GitHub Release |
 
 **Install options:**
 
@@ -266,14 +266,14 @@ live on Hugging Face (or your disk) separately.
 pip install -e ".[dev]"
 
 # pinned release from git
-pip install "ponyexl3 @ git+https://github.com/beamster/ponyexl3.git@v0.1.7"
+pip install "ponyexl3 @ git+https://github.com/beamivalice/PonyExl3.git@v0.2.0"
 
 # from a built wheel
-pip install ponyexl3-0.1.7-py3-none-any.whl
+pip install ponyexl3-0.2.0-py3-none-any.whl
 ```
 
 A release GitHub Action is **optional** — tag + publish a GitHub Release manually is
-enough for v0.1.7. Add automation later if you want PyPI publish or changelog →
+enough. Add automation later if you want PyPI publish or changelog →
 release notes on every tag.
 
 ---
