@@ -173,12 +173,56 @@ def _calibration_capture_progress(event: str, data: dict[str, object]) -> None:
     )
 
 
+def _source_plan_dir(args: argparse.Namespace) -> Path:
+    if args.work_dir is not None:
+        return args.work_dir / "source_quant_plan"
+    if args.out_dir is not None:
+        return args.out_dir.with_name(f".{args.out_dir.name}.source_quant_plan")
+    if args.capture_calibration_map is not None:
+        capture_path = Path(args.capture_calibration_map)
+        return capture_path.with_name(f".{capture_path.stem}.source_quant_plan")
+    raise ValueError("source-only conversion requires --work-dir or --out-dir")
+
+
+def _write_source_quant_plan(args: argparse.Namespace, plan_dir: Path) -> dict[str, object]:
+    from ponyexl3.convert.discovery import (
+        discover_exl3_module_keys,
+        write_quantization_plan,
+    )
+
+    bit_overrides: dict[str, int] = {}
+    if args.layer_bits:
+        module_keys = discover_exl3_module_keys(
+            args.in_dir,
+            include_routed_experts=args.include_routed_experts,
+        )
+        bit_overrides = _parse_layer_bit_overrides(args.layer_bits, module_keys)
+    return write_quantization_plan(
+        args.in_dir,
+        plan_dir,
+        bits=args.bits,
+        head_bits=args.head_bits,
+        codebook=args.codebook,
+        include_routed_experts=args.include_routed_experts,
+        bit_overrides=bit_overrides or None,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in-dir", required=True, type=Path, help="source HF checkpoint")
     parser.add_argument("--out-dir", type=Path, help="write converted EXL3 output bundle")
     parser.add_argument("--work-dir", type=Path, help="reserved for resumable conversion state")
-    parser.add_argument("--oracle-dir", required=True, type=Path, help="EXL3 oracle checkpoint")
+    parser.add_argument(
+        "--oracle-dir",
+        type=Path,
+        help="EXL3 oracle checkpoint, or a plan-only dir from --init-quant-config",
+    )
+    parser.add_argument(
+        "--init-quant-config",
+        action="store_true",
+        help="write quantization_config.json (+ HF assets) from BF16 source only",
+    )
     parser.add_argument("--bits", type=float, default=4.0, help="target decoder bpw")
     parser.add_argument("--head-bits", type=int, default=6, help="target head bpw")
     parser.add_argument(
@@ -375,6 +419,76 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true", help="print JSON only")
     args = parser.parse_args()
+
+    if args.init_quant_config:
+        if args.out_dir is None:
+            raise SystemExit("--init-quant-config requires --out-dir")
+        try:
+            summary = _write_source_quant_plan(args, args.out_dir)
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        if args.json:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+        else:
+            print(
+                f"quant plan: out={summary['out_dir']} "
+                f"exl3={summary['exl3_modules']} plain={summary['plain_tensors']} "
+                f"bits={_as_float(summary['bits']):.2f} "
+                f"head_bits={_as_int(summary['head_bits'])} "
+                f"codebook={summary['codebook']}"
+            )
+            copied_assets = summary.get("copied_assets")
+            if isinstance(copied_assets, list) and copied_assets:
+                print(f"assets: {', '.join(str(item) for item in copied_assets)}")
+            print(
+                "next: ponyexl3-convert --in-dir ... --oracle-dir "
+                f"{summary['out_dir']} --out-dir <weights> "
+                "--direct-layer --model-modules --scale-mode computed"
+            )
+        return 0
+
+    source_plan_generated = False
+    if args.oracle_dir is None:
+        try:
+            plan_dir = _source_plan_dir(args)
+            summary = _write_source_quant_plan(args, plan_dir)
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        args.oracle_dir = plan_dir
+        source_plan_generated = True
+        if not args.json:
+            print(
+                f"source quant plan: out={summary['out_dir']} "
+                f"exl3={summary['exl3_modules']} plain={summary['plain_tensors']} "
+                f"bits={_as_float(summary['bits']):.2f} "
+                f"head_bits={_as_int(summary['head_bits'])} "
+                f"codebook={summary['codebook']}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    from ponyexl3.convert.discovery import is_plan_only_checkpoint
+
+    plan_only = is_plan_only_checkpoint(args.oracle_dir)
+    if plan_only and args.oracle_metrics:
+        raise SystemExit(
+            f"{args.oracle_dir} is plan-only (no trellis weights); "
+            "--oracle-metrics requires a real EXL3 oracle"
+        )
+    if plan_only and args.scale_mode in ("oracle", "oracle_safe"):
+        if source_plan_generated:
+            args.scale_mode = "computed"
+            if not args.json:
+                print(
+                    "source quant plan is plan-only; using --scale-mode computed",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            raise SystemExit(
+                f"{args.oracle_dir} is plan-only (no trellis weights); "
+                "use --scale-mode computed or identity"
+            )
 
     if args.search_backend == "auto":
         try:

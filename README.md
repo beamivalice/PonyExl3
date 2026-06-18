@@ -7,7 +7,7 @@
 
 # PonyExl3
 
-v0.2.0 - Update, Converter now landed but it's still in beta shape since I haven't tested the tool against a few supported models. But the results with Qwen and MiniCPM were good enough to justify a land. The quality is similar to what you expect from CUDA quantizer.
+v0.2.1 — Converter can build a quantization plan from BF16 source alone (`--init-quant-config`); bit budget via `--bits` / `--head-bits` / `--layer-bits`. Still beta; Qwen and MiniCPM quality matches turboderp-class oracles.
 
 ---
 
@@ -259,9 +259,9 @@ live on Hugging Face (or your disk) separately.
 
 | Artifact | Format | How to get it |
 |----------|--------|---------------|
-| Git tag | `v0.2.0` | `git checkout v0.2.0` |
+| Git tag | `v0.2.1` | `git checkout v0.2.1` |
 | GitHub Release | `.tar.gz` / `.zip` source archives | Auto-attached when you publish a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) from the tag |
-| Python packages | `ponyexl3-0.2.0.tar.gz` (sdist) + `ponyexl3-0.2.0-py3-none-any.whl` | `uv build` locally; optionally upload to PyPI or attach to the GitHub Release |
+| Python packages | `ponyexl3-0.2.1.tar.gz` (sdist) + `ponyexl3-0.2.1-py3-none-any.whl` | `uv build` locally; optionally upload to PyPI or attach to the GitHub Release |
 
 **Install options:**
 
@@ -270,10 +270,10 @@ live on Hugging Face (or your disk) separately.
 pip install -e ".[dev]"
 
 # pinned release from git
-pip install "ponyexl3 @ git+https://github.com/beamivalice/PonyExl3.git@v0.2.0"
+pip install "ponyexl3 @ git+https://github.com/beamivalice/PonyExl3.git@v0.2.1"
 
 # from a built wheel
-pip install ponyexl3-0.2.0-py3-none-any.whl
+pip install ponyexl3-0.2.1-py3-none-any.whl
 ```
 
 A release GitHub Action is **optional** — tag + publish a GitHub Release manually is
@@ -340,7 +340,7 @@ Installed by `pip install -e .`:
 |---------|---------|
 | `ponyexl3-generate` | End-to-end text generation |
 | `ponyexl3-generate-bench` | Prefill/decode throughput sweep (1k–32k context, 128 gen) |
-| `ponyexl3-convert` | HF → EXL3 conversion (module/layer/model scope) |
+| `ponyexl3-convert` | HF → EXL3 conversion; `--init-quant-config` builds plan from BF16 source |
 | `ponyexl3-compare-layer` | Per-layer correctness ladder (probe → tile → slice → forward) |
 | `ponyexl3-compare-engines` | End-to-end engine agreement + logit drift report |
 
@@ -359,6 +359,23 @@ python -m ponyexl3.cli.generate_synthetic_layer
 ```
 
 ### Convert a model
+
+**Apple Silicon-first (no turboderp oracle):** generate a quantization plan from BF16
+source, then convert with computed scales:
+
+```bash
+# step 1: write quantization_config.json + HF assets from source alone
+ponyexl3-convert --in-dir /path/to/MiniCPM5-1B \
+  --out-dir /path/to/MiniCPM5-plan --init-quant-config
+
+# step 2: quantize weights (plan dir is --oracle-dir; use computed scales)
+ponyexl3-convert --in-dir /path/to/MiniCPM5-1B \
+  --oracle-dir /path/to/MiniCPM5-plan \
+  --out-dir /path/to/MiniCPM5-exl3 \
+  --direct-layer --model-modules --scale-mode computed
+```
+
+**With a turboderp oracle** (oracle-safe scales, comparable to reference checkpoints):
 
 ```bash
 # one module smoke (direct quant, oracle-safe scales)

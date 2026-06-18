@@ -12,6 +12,7 @@ build/
 .vscode/
 .venv/
 venv/
+.work
 
 # Local datasets / caches (not shipped)
 data/wikitext/

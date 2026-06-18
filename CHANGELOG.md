@@ -2,6 +2,23 @@
 
 All notable changes to PonyExl3 are documented here.
 
+## [0.2.1] — 2026-06-19
+
+### Converter (`ponyexl3-convert`)
+
+- **Source-only planning** — `--init-quant-config` writes `quantization_config.json` (+ HF assets) from BF16 weights alone; no turboderp oracle required
+- Plan-only dirs work as `--oracle-dir` with `--scale-mode computed` (shape stubs when trellis weights are absent)
+- M5a bit budget: `--bits`, `--head-bits`, `--use-bit-allocation`, `--layer-bits REGEX:K`, `--allocation-dry-run`
+- Apple Silicon-first two-step convert workflow documented in README
+
+### Housekeeping
+
+- `.work/` gitignored (local converter scratch/logs)
+
+### Tests
+
+- `tests/test_convert_discovery.py` — source plan generation, plan-only oracle stubs, MiniCPM module-set gate
+
 ## [0.2.0] — 2026-06-18
 
 ### Inference

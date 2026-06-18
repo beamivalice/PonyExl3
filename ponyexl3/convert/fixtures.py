@@ -333,7 +333,25 @@ def read_source_public_block(
 
 
 def load_oracle_linear(model_dir: str | Path, module_key: str) -> OracleLinear:
-    layer = load_exl3_layer(str(model_dir), module_key)
+    """Load oracle metadata; uses a shape-only stub when weights are not materialized."""
+
+    from ponyexl3.ref.loader import has_exl3_layer_weights, layer_meta_from_config
+
+    plan_dir = str(model_dir)
+    if has_exl3_layer_weights(plan_dir, module_key):
+        layer = load_exl3_layer(plan_dir, module_key)
+    else:
+        meta = layer_meta_from_config(plan_dir, module_key)
+        in_tiles, out_tiles, packed = meta["trellis_shape"]
+        layer = EXL3Layer(
+            key=module_key,
+            in_features=int(meta["in_features"]),
+            out_features=int(meta["out_features"]),
+            k=int(meta["k"]),
+            trellis=np.zeros((in_tiles, out_tiles, packed), dtype=np.uint16),
+            mcg=bool(meta["mcg"]),
+            mul1=bool(meta["mul1"]),
+        )
     cb = codebook_mode_from_flags(mcg=layer.mcg, mul1=layer.mul1)
     return OracleLinear(key=module_key, layer=layer, cb=cb)
 

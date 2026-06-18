@@ -129,8 +129,16 @@ def _load_tensor(model_dir: str, tensor_key: str) -> np.ndarray | None:
         return _read_tensor(st, tensor_key)
 
 
+def has_exl3_layer_weights(model_dir: str, module_key: str) -> bool:
+    """True when trellis weights exist on disk (vs a plan-only quantization_config)."""
+
+    return _load_tensor(model_dir, f"{module_key}.trellis") is not None
+
+
 def load_exl3_layer(model_dir: str, module_key: str) -> EXL3Layer:
     """Load one EXL3 linear layer by module key (e.g. model.layers.0.mlp.gate_proj)."""
+    if not has_exl3_layer_weights(model_dir, module_key):
+        raise FileNotFoundError(f"{module_key}.trellis")
     cfg = layer_meta_from_config(model_dir, module_key)
     trellis_key = f"{module_key}.trellis"
     trellis = _load_tensor(model_dir, trellis_key)

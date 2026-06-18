@@ -133,6 +133,20 @@ Current checkpoint-backed pilot:
   The same `--model-modules`, `--layer-modules`, `--only-layer`, and
   `--module-limit` selection flags are supported. A one-row MiniCPM5 smoke
   wrote a loadable map in `1.77 s`.
+- Source-only bpw selection:
+  when `--oracle-dir` is omitted, `ponyexl3-convert` now writes a
+  BF16-source-derived plan into `--work-dir/source_quant_plan` (or a hidden
+  sibling of `--out-dir`) and uses that plan for module discovery, shapes,
+  codebook flags, and K selection. This avoids inheriting K from an oracle
+  `quantization_config.json`. Exact 4.00bpw means passing both `--bits 4.00`
+  and `--head-bits 4`; otherwise the default K6 head override intentionally
+  raises the weighted average above 4.00. Plan-only conversion cannot use
+  `--oracle-metrics`; if the default oracle-safe scale mode is still selected,
+  the auto source-plan path switches to `--scale-mode computed`.
+  MiniCPM5 source-only smoke: full-model allocation dry-run produced `169`
+  modules, weighted average `4.0`, and all modules at K4; a bounded direct
+  conversion of `model.layers.0.mlp.down_proj` from the source-generated plan
+  wrote a strict-loadable K4 layer in `3.49 s` wall time.
 
 ---
 
@@ -222,6 +236,11 @@ Current checkpoint-backed pilot:
 - `convert/calibration.py` — pre-captured calibration activation loader for
   `.npy`, `.npz`, and `.safetensors`; fixtures validate shape/finite values
   against the selected module's input dimension before Hessian capture.
+- `convert/discovery.py` — source-only quantization planning: discovers EXL3
+  linears and plain tensors from BF16 safetensors, runs M5a bit allocation,
+  and writes `quantization_config.json` via `--init-quant-config`. Plan-only
+  dirs (config without trellis weights) work as `--oracle-dir` with
+  `--scale-mode computed`.
 - `convert/driver.py` — M4 module-set driver: discovers EXL3 modules for a
   layer from oracle `quantization_config.json`, filters to source adapters,
   optionally includes routed experts, applies `direct` or `ldlq`, emits one
@@ -481,6 +500,30 @@ set -o pipefail
   --calibration-seq-len 2048 \
   --model-modules \
   2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-calib-r250.capture.log
+```
+
+For a source-only exact 4.00bpw run without consulting the oracle config, omit
+`--oracle-dir` and set the head to K4 as well:
+
+```bash
+cd /Users/beam/llm/PonyExl3
+mkdir -p /Users/beam/llm/PonyExl3/.work/logs
+CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
+test -f "$CALIB" || { echo "missing calibration map: $CALIB" >&2; exit 2; }
+set -o pipefail
+/usr/bin/time -p .venv/bin/ponyexl3-convert \
+  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
+  --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.00bpw \
+  --work-dir /Users/beam/llm/PonyExl3/.work/qwen3.6-27b-source-4.00bpw \
+  --bits 4.00 \
+  --head-bits 4 \
+  --ldlq-layer \
+  --model-modules \
+  --search-backend metal \
+  --scale-mode computed \
+  --calibration-activations-map "$CALIB" \
+  --resume \
+  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.00bpw.source.convert.log
 ```
 
 Then run this conversion command when the machine is free:
