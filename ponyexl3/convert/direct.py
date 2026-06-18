@@ -12,22 +12,29 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from ponyexl3.convert.fixtures import (
+    SafetensorIndex,
     SearchBackend,
+    SourceLinear,
     build_layer_fixture,
     read_source_public_block,
 )
 from ponyexl3.convert.reference_search import quantize_tile_reference
+from ponyexl3.convert.regularize import (
+    apply_global_scale,
+    g_scale_gss,
+    regularize_public_weight,
+    sample_tile_matrix,
+)
 from ponyexl3.ref.codebook import CodebookMode
 from ponyexl3.ref.hadamard import HAD_DIM, preapply_had_left, preapply_had_right
 from ponyexl3.ref.layer import EXL3Layer
 from ponyexl3.ref.loader import load_exl3_layer
 from ponyexl3.ref.perm import kernel_order_to_row_major, tensor_core_perm
-from ponyexl3.ref.reconstruct import reconstruct_public_weights
 from ponyexl3.ref.signs import unpack_signs_or_pass
 from ponyexl3.ref.trellis import pack_trellis, unpack_trellis
 
 
-ScaleMode = Literal["oracle", "oracle_safe", "identity"]
+ScaleMode = Literal["oracle", "oracle_safe", "identity", "computed"]
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,17 @@ class DirectLayerResult:
 
 
 DirectResult = DirectWindowResult | DirectLayerResult
+
+
+@dataclass(frozen=True)
+class LayerQuantizationBasis:
+    """Source public weights plus the inner-domain target and scales."""
+
+    source_public: np.ndarray
+    target_inner: np.ndarray
+    suh: np.ndarray | None
+    svh: np.ndarray | None
+    stats: dict[str, float | bool]
 
 _MODEL_ASSET_NAMES = (
     "config.json",
@@ -109,6 +127,8 @@ def scale_full_for_mode(
     size: int,
     mode: ScaleMode,
 ) -> tuple[np.ndarray | None, int]:
+    if mode == "computed":
+        raise ValueError("computed scale mode requires source-weight regularization")
     if mode == "identity":
         return None, 0
     out = _scale_window(scale, 0, size)
@@ -140,6 +160,186 @@ def public_block_to_inner_with_scale_slices(
         block = block / su.reshape(HAD_DIM, 1).astype(np.float32)
         block = preapply_had_left(block.astype(np.float32)).astype(np.float32)
     return block
+
+
+def inner_matrix_to_public(
+    inner: np.ndarray,
+    *,
+    suh: np.ndarray | None,
+    svh: np.ndarray | None,
+) -> np.ndarray:
+    """Reconstruct public weights from an already-decoded inner matrix."""
+
+    if inner.ndim != 2:
+        raise ValueError(f"expected 2D inner matrix, got {inner.shape}")
+    rows, cols = inner.shape
+    if rows % HAD_DIM != 0 or cols % HAD_DIM != 0:
+        raise ValueError(f"inner weight shape must be 128-multiple, got {inner.shape}")
+    out = inner.astype(np.float32, copy=True)
+    if suh is not None:
+        if suh.shape[0] != rows:
+            raise ValueError(f"suh shape {suh.shape} does not match rows {rows}")
+        out = preapply_had_left(out).astype(np.float32, copy=False)
+        out *= suh.reshape(rows, 1).astype(np.float32)
+    if svh is not None:
+        if svh.shape[0] != cols:
+            raise ValueError(f"svh shape {svh.shape} does not match cols {cols}")
+        out = preapply_had_right(out).astype(np.float32, copy=False)
+        out *= svh.reshape(1, cols).astype(np.float32)
+    return out.astype(np.float16).astype(np.float32)
+
+
+def read_source_public_matrix(
+    source_dir: str | Path,
+    source: SourceLinear,
+) -> np.ndarray:
+    """Read a full source linear in public EXL3 layout ``(in, out)``."""
+
+    if source.in_features % HAD_DIM != 0 or source.out_features % HAD_DIM != 0:
+        raise ValueError("full source matrix read requires 128-multiple dimensions")
+    index = SafetensorIndex(source_dir)
+    if source.layout == "linear_t":
+        weight = index.read_tensor(source.source_tensor_key)
+        return weight.T.astype(np.float32, copy=False)
+
+    if source.expert is None:
+        raise ValueError(f"{source.key}: expert index missing")
+    if source.layout in ("qwen_gate", "qwen_up"):
+        if source.gate_up_mid is None:
+            raise ValueError(f"{source.key}: gate/up midpoint missing")
+        source_out_start = 0 if source.layout == "qwen_gate" else source.gate_up_mid
+        weight = index.read_slice(
+            source.source_tensor_key,
+            (source.expert, source_out_start, 0),
+            (1, source.out_features, source.in_features),
+        )[0]
+        return weight.T.astype(np.float32, copy=False)
+
+    weight = index.read_slice(
+        source.source_tensor_key,
+        (source.expert, 0, 0),
+        (1, source.out_features, source.in_features),
+    )[0]
+    return weight.T.astype(np.float32, copy=False)
+
+
+def _oracle_or_identity_basis(
+    source_public: np.ndarray,
+    ref_layer: EXL3Layer,
+    *,
+    scale_mode: ScaleMode,
+) -> LayerQuantizationBasis:
+    suh, suh_zero_count = scale_full_for_mode(ref_layer.suh, ref_layer.in_features, scale_mode)
+    svh, svh_zero_count = scale_full_for_mode(ref_layer.svh, ref_layer.out_features, scale_mode)
+    target_inner = np.empty_like(source_public, dtype=np.float32)
+    for in_start in range(0, ref_layer.in_features, HAD_DIM):
+        su_slice = None if suh is None else suh[in_start : in_start + HAD_DIM]
+        for out_start in range(0, ref_layer.out_features, HAD_DIM):
+            sv_slice = None if svh is None else svh[out_start : out_start + HAD_DIM]
+            target_inner[
+                in_start : in_start + HAD_DIM,
+                out_start : out_start + HAD_DIM,
+            ] = public_block_to_inner_with_scale_slices(
+                source_public[
+                    in_start : in_start + HAD_DIM,
+                    out_start : out_start + HAD_DIM,
+                ],
+                su=su_slice,
+                sv=sv_slice,
+            )
+    return LayerQuantizationBasis(
+        source_public=source_public,
+        target_inner=target_inner,
+        suh=suh,
+        svh=svh,
+        stats={
+            "suh_zero_replacements": float(suh_zero_count),
+            "svh_zero_replacements": float(svh_zero_count),
+            "regularize_computed_scales": False,
+        },
+    )
+
+
+def prepare_layer_quantization_basis(
+    source_dir: str | Path,
+    source: SourceLinear,
+    ref_layer: EXL3Layer,
+    cb: CodebookMode,
+    *,
+    scale_mode: ScaleMode,
+    search_backend: SearchBackend,
+    max_pins: int = 4,
+    skip_g_scale: bool = False,
+    regularization_seed: int = 0,
+    g_scale_width: int = 3,
+) -> LayerQuantizationBasis:
+    """Build the source, inner target, and scales shared by direct and LDLQ."""
+
+    source_public = read_source_public_matrix(source_dir, source)
+    if scale_mode != "computed":
+        return _oracle_or_identity_basis(source_public, ref_layer, scale_mode=scale_mode)
+
+    regularized = regularize_public_weight(
+        source_public,
+        seed=regularization_seed,
+    )
+    stats = dict(regularized.stats)
+    stats.update(
+        {
+            "regularize_computed_scales": True,
+            "suh_zero_replacements": 0.0,
+            "svh_zero_replacements": float(stats["regularize_zero_out_scales"]),
+        }
+    )
+    if skip_g_scale:
+        stats["regularize_g_scale_skipped"] = True
+    else:
+        sample = sample_tile_matrix(regularized.inner, width=g_scale_width)
+
+        def score(scale: float) -> float:
+            scaled = (sample * np.float32(scale)).astype(np.float32, copy=False)
+            _packed, _states, reconstructed = quantize_inner_matrix_direct(
+                scaled,
+                k=ref_layer.k,
+                cb=cb,
+                search_backend=search_backend,
+                max_pins=max_pins,
+            )
+            delta = reconstructed / np.float32(scale) - sample
+            return float(np.mean(delta * delta, dtype=np.float64))
+
+        gss = g_scale_gss(score)
+        regularized = apply_global_scale(regularized, gss)
+        stats = dict(regularized.stats)
+        stats.update(
+            {
+                "regularize_computed_scales": True,
+                "regularize_g_scale_skipped": False,
+                "suh_zero_replacements": 0.0,
+                "svh_zero_replacements": float(stats["regularize_zero_out_scales"]),
+            }
+        )
+
+    return LayerQuantizationBasis(
+        source_public=source_public,
+        target_inner=regularized.inner,
+        suh=regularized.suh,
+        svh=regularized.svh,
+        stats=stats,
+    )
+
+
+def read_source_plain_tensors(
+    source_dir: str | Path,
+    tensor_keys: Sequence[str],
+) -> dict[str, np.ndarray]:
+    """Read non-EXL3 source tensors for a strict-loadable emitted model."""
+
+    index = SafetensorIndex(source_dir)
+    tensors: dict[str, np.ndarray] = {}
+    for key in tensor_keys:
+        tensors[key] = index.read_tensor(key).astype(np.float16, copy=False)
+    return tensors
 
 
 def _inner_to_kernel_tiles(inner: np.ndarray) -> np.ndarray:
@@ -267,14 +467,11 @@ def direct_quantize_window(
         mul1=layer.mul1,
     )
     out_layer.validate()
-    reconstructed_public = reconstruct_public_weights(
-        out_layer.trellis,
-        out_layer.suh,
-        out_layer.svh,
-        out_layer.k,
-        mcg=out_layer.mcg,
-        mul1=out_layer.mul1,
-    ).astype(np.float32)
+    reconstructed_public = inner_matrix_to_public(
+        reconstructed_inner,
+        suh=out_layer.suh,
+        svh=out_layer.svh,
+    )
 
     x = fixture.activations[:, in_start : in_start + HAD_DIM].astype(np.float32)
     source_y = x @ source_public.astype(np.float32)
@@ -312,10 +509,18 @@ def direct_quantize_layer(
     search_backend: SearchBackend = "metal",
     scale_mode: ScaleMode = "oracle_safe",
     max_pins: int = 4,
+    calibration_activations: np.ndarray | None = None,
+    skip_g_scale: bool = False,
+    regularization_seed: int = 0,
 ) -> DirectLayerResult:
-    """Directly quantize one full linear module, using oracle scales."""
+    """Directly quantize one full linear module."""
 
-    fixture = build_layer_fixture(source_dir, oracle_dir, module_key)
+    fixture = build_layer_fixture(
+        source_dir,
+        oracle_dir,
+        module_key,
+        activations=calibration_activations,
+    )
     source = fixture.source
     oracle = fixture.oracle
     ref_layer = oracle.layer
@@ -323,13 +528,25 @@ def direct_quantize_layer(
         raise ValueError("direct layer conversion requires 128-multiple dimensions")
 
     in_blocks = ref_layer.in_features // HAD_DIM
-    out_blocks = ref_layer.out_features // HAD_DIM
     in_tiles = ref_layer.in_features // 16
     out_tiles = ref_layer.out_features // 16
     packed_size = ref_layer.packed_tile_size
     trellis = np.empty((in_tiles, out_tiles, packed_size), dtype=np.uint16)
-    suh, suh_zero_count = scale_full_for_mode(ref_layer.suh, ref_layer.in_features, scale_mode)
-    svh, svh_zero_count = scale_full_for_mode(ref_layer.svh, ref_layer.out_features, scale_mode)
+    basis = prepare_layer_quantization_basis(
+        source_dir,
+        source,
+        ref_layer,
+        oracle.cb,
+        scale_mode=scale_mode,
+        search_backend=search_backend,
+        max_pins=max_pins,
+        skip_g_scale=skip_g_scale,
+        regularization_seed=regularization_seed,
+    )
+    source_public = basis.source_public
+    target_inner = basis.target_inner
+    suh = basis.suh
+    svh = basis.svh
 
     x = fixture.activations.astype(np.float32)
     source_y = np.zeros((x.shape[0], ref_layer.out_features), dtype=np.float32)
@@ -341,28 +558,8 @@ def direct_quantize_layer(
 
     for ib in range(in_blocks):
         in_start = ib * HAD_DIM
-        source_public_row = np.empty((HAD_DIM, ref_layer.out_features), dtype=np.float32)
-        target_inner_row = np.empty_like(source_public_row)
-        for ob in range(out_blocks):
-            out_start = ob * HAD_DIM
-            c0 = out_start
-            c1 = out_start + HAD_DIM
-            public_block = read_source_public_block(
-                source_dir,
-                source,
-                in_start=in_start,
-                out_start=out_start,
-                rows=HAD_DIM,
-                cols=HAD_DIM,
-            )
-            source_public_row[:, c0:c1] = public_block
-            su_slice = None if suh is None else suh[in_start : in_start + HAD_DIM]
-            sv_slice = None if svh is None else svh[out_start : out_start + HAD_DIM]
-            target_inner_row[:, c0:c1] = public_block_to_inner_with_scale_slices(
-                public_block,
-                su=su_slice,
-                sv=sv_slice,
-            )
+        source_public_row = source_public[in_start : in_start + HAD_DIM]
+        target_inner_row = target_inner[in_start : in_start + HAD_DIM]
 
         packed_row, _states, reconstructed_inner_row = quantize_inner_matrix_direct(
             target_inner_row,
@@ -374,25 +571,11 @@ def direct_quantize_layer(
         tk0 = in_start // 16
         trellis[tk0 : tk0 + HAD_DIM // 16, :, :] = packed_row
 
-        row_layer = EXL3Layer(
-            key=module_key,
-            in_features=HAD_DIM,
-            out_features=ref_layer.out_features,
-            k=ref_layer.k,
-            trellis=packed_row,
-            suh=None if suh is None else suh[in_start : in_start + HAD_DIM].copy(),
+        reconstructed_public_row = inner_matrix_to_public(
+            reconstructed_inner_row,
+            suh=None if suh is None else suh[in_start : in_start + HAD_DIM],
             svh=svh,
-            mcg=ref_layer.mcg,
-            mul1=ref_layer.mul1,
         )
-        reconstructed_public_row = reconstruct_public_weights(
-            row_layer.trellis,
-            row_layer.suh,
-            row_layer.svh,
-            row_layer.k,
-            mcg=row_layer.mcg,
-            mul1=row_layer.mul1,
-        ).astype(np.float32)
 
         inner_delta = reconstructed_inner_row.astype(np.float32) - target_inner_row
         public_delta = reconstructed_public_row - source_public_row
@@ -432,9 +615,8 @@ def direct_quantize_layer(
         "output_mse": mse_from_sse(output_sse, output_count),
         "output_rel_rms": rel_rms_from_sse(output_sse, output_ref_ss, output_count),
         "pack_roundtrip": True,
-        "suh_zero_replacements": float(suh_zero_count),
-        "svh_zero_replacements": float(svh_zero_count),
     }
+    stats.update(basis.stats)
     return DirectLayerResult(
         module_key=module_key,
         search_backend=search_backend,
@@ -487,6 +669,7 @@ def write_exl3_layers_bundle(
     *,
     asset_dir: str | Path | None = None,
     manifest: dict[str, Any] | None = None,
+    plain_tensors: dict[str, np.ndarray] | None = None,
 ) -> list[EXL3Layer]:
     """Write one safetensors shard containing multiple converted EXL3 layers."""
 
@@ -496,6 +679,10 @@ def write_exl3_layers_bundle(
     out.mkdir(parents=True, exist_ok=True)
 
     tensors: dict[str, np.ndarray] = {}
+    for name, arr in (plain_tensors or {}).items():
+        if name in tensors:
+            raise ValueError(f"duplicate tensor in bundle: {name}")
+        tensors[name] = arr
     for layer in layers:
         layer.validate()
         for name, arr in _layer_tensors(layer).items():
@@ -513,6 +700,11 @@ def write_exl3_layers_bundle(
     )
 
     tensor_storage: dict[str, Any] = {}
+    for name, arr in (plain_tensors or {}).items():
+        storage_key = name[: -len(".weight")] if name.endswith(".weight") else name
+        tensor_storage[storage_key] = {
+            "stored_tensors": {name: _stored_tensor_meta(arr)},
+        }
     for layer in layers:
         layer_tensor_names = [name for name in tensors if name.startswith(f"{layer.key}.")]
         tensor_storage[layer.key] = {

@@ -212,3 +212,35 @@ def test_ldlq_layer_identity_synthetic_emits_loadable_layer(tmp_path: Path):
     assert loaded.in_features == 128
     assert loaded.out_features == 128
     assert loaded.trellis.shape == result.layer.trellis.shape
+
+
+@pytest.mark.skipif(not _metal_available(), reason="Metal is required for the 128x128 layer gate")
+def test_ldlq_layer_computed_scales_with_calibration_rows(tmp_path: Path):
+    source_dir = tmp_path / "source"
+    oracle_dir = tmp_path / "oracle"
+    source_dir.mkdir()
+    oracle_dir.mkdir()
+    rng = np.random.default_rng(106)
+    public_weight = (rng.standard_normal((128, 128)) * 0.05).astype(np.float32)
+    activations = rng.standard_normal((32, 128)).astype(np.float32)
+    _write_synthetic_source(source_dir, PILOT_MODULE, public_weight)
+    _write_synthetic_oracle(oracle_dir, PILOT_MODULE)
+
+    result = ldlq_quantize_layer(
+        source_dir,
+        oracle_dir,
+        PILOT_MODULE,
+        search_backend="metal",
+        scale_mode="computed",
+        buf_size_rows=128,
+        calibration_activations=activations,
+        skip_g_scale=True,
+        regularization_seed=3,
+    )
+
+    assert result.layer.suh is not None
+    assert result.layer.svh is not None
+    assert result.stats["regularize_computed_scales"] is True
+    assert result.stats["regularize_g_scale_skipped"] is True
+    np.testing.assert_allclose(result.activations, activations, rtol=0.0, atol=0.0)
+    assert np.isfinite(result.converted_output).all()

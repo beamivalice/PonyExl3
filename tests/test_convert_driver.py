@@ -6,9 +6,16 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from ponyexl3.convert.direct import write_exl3_layers_bundle
-from ponyexl3.convert.driver import convert_module_set, layer_module_keys
+from ponyexl3.convert.driver import (
+    convert_module_set,
+    layer_module_keys,
+    model_module_keys,
+    plain_tensor_keys,
+    supported_model_module_keys,
+)
 from ponyexl3.ref.layer import EXL3Layer
 
 
@@ -91,3 +98,39 @@ def test_module_set_resume_loads_existing_layer(tmp_path: Path):
     assert result.completed[0]["resumed"] is True
     manifest = json.loads((out_dir / "ponyexl3_convert_manifest.json").read_text(encoding="utf-8"))
     assert manifest["completed"][0]["resumed"] is True
+
+
+MINICPM_SOURCE = Path("/Users/beam/llm/models/MiniCPM5-1B")
+MINICPM_ORACLE = Path("/Users/beam/llm/models/Exl3/MiniCPM5-1B-exl3-4.00bpw")
+
+
+@pytest.mark.skipif(
+    not (
+        (MINICPM_SOURCE / "model.safetensors.index.json").is_file()
+        and (MINICPM_ORACLE / "quantization_config.json").is_file()
+    ),
+    reason="local MiniCPM5 source/oracle checkpoints not present",
+)
+def test_minicpm5_model_discovery_matches_oracle():
+    layer0 = layer_module_keys(MINICPM_ORACLE, 0)
+    assert layer0 == [
+        "model.layers.0.mlp.down_proj",
+        "model.layers.0.mlp.gate_proj",
+        "model.layers.0.mlp.up_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.v_proj",
+    ]
+
+    all_modules = model_module_keys(MINICPM_ORACLE)
+    assert "lm_head" in all_modules
+    assert len(all_modules) == 169
+    plain = plain_tensor_keys(MINICPM_ORACLE)
+    assert "model.embed_tokens.weight" in plain
+    assert "model.norm.weight" in plain
+    assert len(plain) == 50
+
+    supported, skipped = supported_model_module_keys(MINICPM_SOURCE, MINICPM_ORACLE)
+    assert supported == all_modules
+    assert skipped == []

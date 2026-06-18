@@ -49,6 +49,29 @@ def pack_trellis_tile(encoded: np.ndarray, k: int) -> np.ndarray:
     return s_packed
 
 
+def _pack_trellis_div16(encoded: np.ndarray, k: int) -> np.ndarray:
+    """Vectorized pack path for K values that evenly divide 16."""
+
+    vals_per_word = 16 // k
+    words_per_span = k
+    mask = np.uint32((1 << k) - 1)
+    vals = (encoded.astype(np.uint32, copy=False) & mask).reshape(
+        *encoded.shape[:-1],
+        16,
+        words_per_span,
+        vals_per_word,
+    )
+    shifts = (np.arange(vals_per_word - 1, -1, -1, dtype=np.uint32) * np.uint32(k)).reshape(
+        *((1,) * (vals.ndim - 1)),
+        vals_per_word,
+    )
+    words = np.sum(vals << shifts, axis=-1, dtype=np.uint32).astype(np.uint16, copy=False)
+    flat = words.reshape(*encoded.shape[:-1], 256 * k // 16).copy()
+    pairs = flat.reshape(*flat.shape[:-1], flat.shape[-1] // 2, 2)
+    pairs[...] = pairs[..., ::-1]
+    return flat
+
+
 def unpack_trellis_tile(packed: np.ndarray, k: int) -> np.ndarray:
     """
   Unpack one trellis tile to 256 uint16 codewords.
@@ -92,11 +115,34 @@ def pack_trellis(encoded: np.ndarray, k: int) -> np.ndarray:
     """Pack a trellis tensor of shape (tiles_k, tiles_n, 256)."""
     if encoded.ndim != 3 or encoded.shape[-1] != 256:
         raise ValueError(f"expected shape (tiles_k, tiles_n, 256), got {encoded.shape}")
+    if k in (1, 2, 4, 8):
+        return _pack_trellis_div16(encoded, k)
     tiles_k, tiles_n, _ = encoded.shape
     out = np.empty((tiles_k, tiles_n, 256 * k // 16), dtype=np.uint16)
     for tk in range(tiles_k):
         for tn in range(tiles_n):
             out[tk, tn] = pack_trellis_tile(encoded[tk, tn], k)
+    return out
+
+
+def _unpack_trellis_div16(packed: np.ndarray, k: int) -> np.ndarray:
+    """Vectorized unpack path for K values that evenly divide 16."""
+
+    vals_per_word = 16 // k
+    words_per_span = k
+    mask = np.uint16((1 << k) - 1)
+    flat = packed.astype(np.uint16, copy=True)
+    pairs = flat.reshape(*flat.shape[:-1], flat.shape[-1] // 2, 2)
+    pairs[...] = pairs[..., ::-1]
+    words = flat.reshape(*flat.shape[:-1], 16, words_per_span)
+    shifts = (np.arange(vals_per_word - 1, -1, -1, dtype=np.uint16) * np.uint16(k)).reshape(
+        *((1,) * words.ndim),
+        vals_per_word,
+    )
+    vals = ((words[..., None] >> shifts) & mask).reshape(*packed.shape[:-1], 256)
+    out = np.zeros_like(vals, dtype=np.uint16)
+    for lag in range(vals_per_word):
+        out |= (np.roll(vals, lag, axis=-1).astype(np.uint16) << np.uint16(lag * k))
     return out
 
 
@@ -107,6 +153,8 @@ def unpack_trellis(packed: np.ndarray, k: int) -> np.ndarray:
     packed_size = 256 * k // 16
     if packed.shape[-1] != packed_size:
         raise ValueError(f"expected last dim {packed_size}, got {packed.shape[-1]}")
+    if k in (1, 2, 4, 8):
+        return _unpack_trellis_div16(packed, k)
     tiles_k, tiles_n, _ = packed.shape
     out = np.empty((tiles_k, tiles_n, 256), dtype=np.uint16)
     for tk in range(tiles_k):

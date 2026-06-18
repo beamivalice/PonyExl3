@@ -5,8 +5,9 @@ EXL3-quantized linear for :class:`EXL3Linear`. Non-quantized tensors (norms,
 embeddings, DeltaNet params) load through the architecture's ``sanitize`` so
 HF-side conventions (conv1d layout, zero-centered norms) are handled by mlx_lm.
 
-Mapped architectures: ``qwen3_5`` / ``qwen3_5_moe`` (Qwen3.5/3.6) and
-``gemma4`` / ``gemma4_text`` (Gemma4 26B-A4B MoE with hybrid SWA/full attn).
+Mapped architectures: ``qwen3_5`` / ``qwen3_5_moe`` (Qwen3.5/3.6),
+``gemma4`` / ``gemma4_text`` (Gemma4 26B-A4B MoE with hybrid SWA/full attn),
+and ``llama`` for Llama-layout checkpoints such as MiniCPM5.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ _ARCHITECTURES = {
     "qwen3_5_moe_text": "qwen3_5_moe",
     "gemma4": "gemma4",
     "gemma4_text": "gemma4_text",
+    "llama": "llama",
 }
 
 _QWEN_ARCHES = frozenset({"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"})
@@ -132,7 +134,10 @@ def _build_gemma4_moe_experts(
     verbose: bool,
 ) -> set[str]:
     """Stack Gemma4 routed experts into EXL3Gemma4MoEBlock (shared MLP stays)."""
-    from ponyexl3.mlx.exl3_moe import EXL3Gemma4MoEBlock, _Gemma4ExpertsShim
+    from ponyexl3.mlx.exl3_moe import (
+        EXL3Gemma4MoEBlock,
+        _Gemma4ExpertsShim,  # pyright: ignore[reportPrivateUsage]
+    )
 
     legacy = os.environ.get("PONYEXL3_GEMMA4_LEGACY_MOE", "").strip() in (
         "1",
@@ -176,7 +181,11 @@ def _build_gemma4_moe_experts(
         )
         path = f"language_model.model.layers.{li}"
         _set_module(model, f"{path}.router", block)
-        _set_module(model, f"{path}.experts", _Gemma4ExpertsShim(block))
+        _set_module(
+            model,
+            f"{path}.experts",
+            _Gemma4ExpertsShim(block),  # pyright: ignore[reportPrivateUsage]
+        )
         if verbose:
             print(f"  gemma4 moe layer {li}: {E} routed experts, k={k} (EXL3Gemma4MoEBlock)")
     return consumed
@@ -298,8 +307,17 @@ def _build_exl3_layer(key: str, info: JsonDict, weights: dict[str, mx.array]) ->
     )
 
 
-def _module_path(checkpoint_key: str) -> str:
+def _module_path(checkpoint_key: str, *, language_model_wrapper: bool = True) -> str:
     """Translate a checkpoint module key to the mlx_lm attribute path."""
+    if not language_model_wrapper:
+        if checkpoint_key == "lm_head":
+            return "lm_head"
+        if checkpoint_key.startswith("model."):
+            return checkpoint_key
+        if checkpoint_key.startswith("model.language_model."):
+            return "model." + checkpoint_key[len("model.language_model."):]
+        return checkpoint_key
+
     if checkpoint_key == "lm_head":
         return "language_model.lm_head"
     for prefix in ("model.language_model.", "model."):
@@ -585,6 +603,7 @@ def load_model(
     else:
         cfg["tie_word_embeddings"] = False
     model = arch.Model(arch.ModelArgs.from_dict(cfg))
+    language_model_wrapper = hasattr(model, "language_model")
 
     weights = _load_all_tensors(model_dir)
     storage = _exl3_storage(qcfg)
@@ -602,11 +621,15 @@ def load_model(
     moe_consumed = _build_moe_experts(model, storage, weights, verbose)
     if moe_consumed:
         mx.clear_cache()
-    for n, (key, info) in enumerate(sorted(storage.items())):
+    for key, info in sorted(storage.items()):
         if _is_routed_expert_key(key) or key in moe_consumed:
             continue
         layer = _build_exl3_layer(key, info, weights)
-        _set_module(model, _module_path(key), EXL3Linear(layer))
+        _set_module(
+            model,
+            _module_path(key, language_model_wrapper=language_model_wrapper),
+            EXL3Linear(layer),
+        )
         for sfx in _EXL3_SUFFIXES:
             weights.pop(f"{key}.{sfx}", None)
         # release the just-consumed source buffer every layer so it never

@@ -16,6 +16,7 @@ from ponyexl3.convert.fixtures import (
 from ponyexl3.convert.direct import (
     direct_quantize_layer,
     direct_quantize_window,
+    read_source_public_matrix,
     write_direct_layer_bundle,
     write_direct_window_bundle,
 )
@@ -149,6 +150,28 @@ def test_direct_layer_identity_synthetic_emits_loadable_layer(tmp_path: Path):
     assert loaded.in_features == 128
     assert loaded.out_features == 128
     assert loaded.trellis.shape == result.layer.trellis.shape
+
+
+def test_read_source_public_matrix_matches_block_reader(tmp_path: Path):
+    module_key = "model.layers.0.self_attn.q_proj"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    rng = np.random.default_rng(124)
+    public_weight = (rng.standard_normal((128, 256)) * 0.05).astype(np.float32)
+    _write_synthetic_source(source_dir, module_key, public_weight)
+
+    source = resolve_source_linear(source_dir, module_key)
+    full = read_source_public_matrix(source_dir, source)
+    block = read_source_public_block(
+        source_dir,
+        source,
+        in_start=0,
+        out_start=128,
+        rows=128,
+        cols=128,
+    )
+
+    np.testing.assert_allclose(block, full[:, 128:256])
 
 
 @pytest.mark.skipif(

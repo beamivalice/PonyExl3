@@ -1,9 +1,13 @@
 # pony-quant: HF → EXL3 converter — engineering roadmap (handoff)
 
 Updated 2026-06-18. Status: **M1 complete, M2 complete, M3b direct full-layer
-emit/load gate complete, M4 complete for selected-module/layer-set LDLQ emit**
+emit/load gate complete, M4 complete for selected-module/layer-set LDLQ emit,
+post-M4 computed-scale/calibration inputs complete, MiniCPM5 direct full-model
+conversion/load gated, and M5a scaffolded**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`,
-`tests/test_convert_hessian.py`, `tests/test_convert_driver.py`).
+`tests/test_convert_hessian.py`, `tests/test_convert_driver.py`,
+`tests/test_convert_regularize.py`, `tests/test_convert_calibration.py`,
+`tests/test_convert_allocation.py`, `tests/test_minicpm5_model.py`).
 
 Goal: accept a HuggingFace checkpoint (safetensors), emit an EXL3 checkpoint
 that `ponyexl3/mlx/model.py` loads unmodified, with per-layer bit
@@ -46,6 +50,15 @@ Current checkpoint-backed pilot:
   `0.012307`, oracle proxy rel-RMS `0.076510`, proxy/oracle ratio
   `0.160857`, public rel-RMS `0.069466`, inner MSE `5.562147e-03`;
   `oracle_safe` again replaced `112` zero `svh` entries.
+- MiniCPM5 gate:
+  source `/Users/beam/llm/models/MiniCPM5-1B`, oracle
+  `/Users/beam/llm/models/Exl3/MiniCPM5-1B-exl3-4.00bpw`, generated output
+  `/Users/beam/llm/models/Exl3/MiniCPM5-1B-ponyexl3-4.00bpw`. The generated
+  bundle has `169` EXL3 linears, `50` plain tensors, `557` stored tensors,
+  and strict `load_model(warm=False)` succeeds through the `llama` mlx_lm
+  mapping. Full direct/oracle-scale conversion took `428 s`; the fast
+  `model.layers.0.self_attn.q_proj` gate dropped from `24.6 s` to about
+  `0.95 s` after eliminating CPU packed-trellis decode from metric paths.
 
 ---
 
@@ -95,29 +108,59 @@ Current checkpoint-backed pilot:
   promotes direct/LDLQ conversion to a bounded module-set driver; routed
   experts are opt-in via `--include-routed-experts`, and `--module-limit`
   keeps smoke runs bounded. `--scale-mode oracle_safe` keeps oracle scales
-  but replaces zero entries with `1.0`.
+  but replaces zero entries with `1.0`; `--scale-mode computed` derives fresh
+  `suh`/`svh` from source weights. `--calibration-activations` accepts
+  pre-captured `.npy`, `.npz`, or `.safetensors` activation rows for layer
+  modes. `--skip-g-scale` bypasses computed-scale GSS for fast smoke runs.
+  `--model-modules` converts every supported EXL3 module in the oracle
+  checkpoint and includes plain tensors for strict-loadable full bundles.
+  Module-set/model-set runs write live progress to stderr even when `--json`
+  reserves stdout for final machine-readable output.
 - `convert/direct.py` — no-LDL direct conversion for one 128×128 Hadamard
   block and for a full linear module: source BF16 public blocks → scaled inner
   blocks → M2 tile quantization → `EXL3Layer`. It now owns the shared
-  single-shard EXL3 writer for one or more converted layers:
+  source/inner/scales basis builder used by both direct and LDLQ conversion,
+  including computed-scale regularization and optional GSS when
+  `scale_mode="computed"`. It also owns the shared single-shard EXL3 writer
+  for one or more converted layers:
   `model.safetensors`, `model.safetensors.index.json`,
   `quantization_config.json`, optional copied model assets, and
   `ponyexl3_convert_manifest.json` for module-set runs.
   Identity/no-scale mode now leaves public weights in the public basis instead
   of applying unused Hadamards; Qwen oracle-scale paths are unchanged.
+  Full source linears are read in one safetensors slice, K∈{1,2,4,8}
+  trellis pack/unpack is vectorized, and metric paths reuse Metal-returned
+  reconstructed inner weights instead of decoding the packed trellis on CPU.
 - `convert/hessian.py` — M4b Hessian/LDLQ primitives: activation Hessian
   capture, upstream-style diagonal damping, NumPy/Accelerate block-LDL,
   reverse 16-row LDLQ over inner-domain weights, Hessian proxy metrics, and a
   fixture-backed one-linear `ldlq_quantize_layer` path that emits the same
-  minimal loadable bundle as direct conversion. M4b adds
+  minimal loadable bundle as direct conversion. LDLQ now consumes the same
+  computed/oracle/identity basis as direct conversion, so source scales and
+  activation-space Hessians stay aligned. M4b adds
   `public_matrix_to_inner` and oracle comparison weights, so the same Hessian
   reports converted-vs-source, oracle-vs-source, and converted/oracle proxy
   and output ratios.
+- `convert/regularize.py` — post-M4 regularization port: blockwise RMS,
+  deterministic random sign flips, upstream `CODEBOOK_SCALE`, output/input
+  channel scales, 128-block Hadamards, wrapped-diagonal tile sampling, and
+  golden-section global scale search.
+- `convert/calibration.py` — pre-captured calibration activation loader for
+  `.npy`, `.npz`, and `.safetensors`; fixtures validate shape/finite values
+  against the selected module's input dimension before Hessian capture.
 - `convert/driver.py` — M4 module-set driver: discovers EXL3 modules for a
   layer from oracle `quantization_config.json`, filters to source adapters,
   optionally includes routed experts, applies `direct` or `ldlq`, emits one
   multi-layer bundle, records completed/skipped modules in the manifest, and
-  resumes requested modules already present in `--out-dir`.
+  resumes requested modules already present in `--out-dir`. Module-set runs
+  now carry calibration row counts, `skip_g_scale`, and regularization seed
+  into the manifest. Model-wide discovery handles MiniCPM/Llama-style
+  `model.layers.*` keys and carries non-EXL3 plain tensors into emitted
+  full-model bundles.
+- `convert/allocation.py` — M5a scaffold: deterministic priority allocation
+  from a target bpw to per-module integer `K` values. This is the cheap
+  allocation tier; M5b will replace static priorities with measured proxy-loss
+  deltas.
 - `tests/test_convert.py` — transition invariant + bit round-trip +
   MSE bounds, k∈{2,3}, BF16 reader gate, Qwen source adapter gate, CPU
   one-tile oracle gate, guarded Metal one-tile oracle gate, and expected
@@ -138,12 +181,24 @@ Current checkpoint-backed pilot:
   and layer counts, and layer-module discovery excludes routed experts unless
   explicitly requested. Resume reloads an existing emitted layer without
   touching the source/oracle checkpoint.
+- `tests/test_convert_regularize.py` — post-M4 gates for block RMS,
+  regularize/public→inner inverse parity, tile sampling, and GSS.
+- `tests/test_convert_calibration.py` — activation loader gates for `.npy`,
+  `.npz`, `.safetensors`, and shape validation.
+- `tests/test_convert_allocation.py` — M5a priority allocation gates.
+- `tests/test_minicpm5_model.py` — MiniCPM5 oracle load gate through the
+  `llama` architecture mapping.
 - Verification as of 2026-06-18:
   `python -m pytest tests/test_convert.py tests/test_convert_metal.py
-  tests/test_convert_hessian.py tests/test_convert_driver.py -q` → 29
-  passed; `python -m pyright ponyexl3/convert ponyexl3/cli/convert.py
+  tests/test_convert_hessian.py tests/test_convert_driver.py
+  tests/test_convert_regularize.py tests/test_convert_calibration.py
+  tests/test_convert_allocation.py tests/test_minicpm5_model.py -q` →
+  59 passed. `python -m pyright ponyexl3/convert ponyexl3/cli/convert.py
+  ponyexl3/mlx/model.py
   tests/test_convert.py tests/test_convert_metal.py tests/test_convert_hessian.py
-  tests/test_convert_driver.py` → clean.
+  tests/test_convert_driver.py tests/test_convert_regularize.py
+  tests/test_convert_calibration.py tests/test_convert_allocation.py
+  tests/test_minicpm5_model.py` → clean.
 
 ---
 
@@ -210,21 +265,17 @@ Original kernel constraints still apply:
 
 ## M3 — Regularize + direct one-linear conversion
 
-Status: **M3b complete for direct no-LDL full-layer conversion**. The current
-direct path does not yet regularize or choose scales from scratch; it can use
-identity scales for synthetic tests or `oracle_safe` scales for the Qwen pilot.
-`oracle_safe` borrows oracle `suh`/`svh` but replaces zero scale entries with
-`1.0`, because real `in_proj_qkv` oracle metadata contains non-source-zero
-output channels with zero `svh`.
+Status: **M3b complete for direct no-LDL full-layer conversion** and
+post-M4 direct-scale work is in place. Direct conversion can use identity
+scales for synthetic tests, `oracle_safe` for oracle diagnostics, or
+`computed` for freshly derived `suh`/`svh` from the source weight. The
+computed path ports upstream block RMS, random sign flips, 128-block
+Hadamards, codebook scale, and global-scale GSS.
 
-Remaining direct-path work should stay on the same lightweight pilot before
-expanding:
-
-1. Port upstream `regularize`, `block_rms`, Hadamard transforms, MCG/default
-   codebook flags, and global scale GSS. Gate with one converted EXL3 layer
-   loaded through the existing `EXL3Layer`/`EXL3Linear`.
-2. Replace `oracle_safe` with freshly computed `suh`/`svh` from regularize
-   and compare against the current oracle-safe baseline.
+Remaining direct-path work is now quality tuning, not plumbing: compare
+`computed` against the current `oracle_safe` Qwen baseline over the fast
+module and decide whether MCG/default codebook selection needs an explicit
+policy before full-model conversion.
 
 ## M4 — Hessian/LDLQ, Driver + Emit
 
@@ -255,13 +306,16 @@ surface:
 - CLI: `--ldlq-layer`, `--sigma-reg`, `--buf-size-rows`,
   `--layer-modules`, `--include-routed-experts`, and `--module-limit`.
 
-Post-M4 work:
+Post-M4 work is complete within the current checkpoint-backed fixture scope:
 
-1. Port regularized/GSS scale selection so LDLQ no longer depends on oracle
-   scale metadata.
-2. Replace fixture random activations with a real calibration-data streamer.
-3. Promote module-set conversion to a full block-sequential driver with
-   quantized re-forwarding between layers.
+1. Regularized/GSS scale selection landed as `scale_mode="computed"`, so
+   direct and LDLQ no longer require oracle scale metadata.
+2. Fixture random activations can be replaced with pre-captured calibration
+   rows via `--calibration-activations`; full text/model streaming remains
+   the M5b/M6 layer-sequential driver work below.
+3. Module-set conversion has the manifest and resume hooks needed for the
+   full block-sequential driver; quantized re-forwarding between layers is the
+   next architectural step, not a storage blocker.
 
 - Future `hessian.py`: layer-sequential driver. Load the HF model with mlx_lm's
   classes (qwen3_5/qwen3_5_moe already mapped); stream calibration rows
@@ -275,14 +329,14 @@ Post-M4 work:
   weights before capturing block i+1 (GPTQ error propagation) —
   `convert_model.py`'s main loop is the ordering reference.
 - `regularize` port (quantize.py:835): seeded random sign flips (su/sv),
-  128-block Hadamard, JSD accept heuristic. fp32.
+  128-block Hadamard, block RMS, codebook scale, and GSS are in place. JSD
+  accept heuristics remain future quality tuning. fp32.
 - `block_ldl` port (quantize.py:292): Cholesky on H with the `sigma_reg`
   damping retry ladder. numpy/CPU is fine — microseconds per layer.
 - `ldlq` port (quantize.py:365): per 16-row block in kernel order
   (`ref/perm.py` has tensor_core_perm), quantize tiles via M2 with
   error feedback through L, two passes like upstream (call site
-  quantize.py:1065). Port `g_scale_gss` (golden-section global scale)
-  and `block_rms` faithfully — they shape final quality.
+  quantize.py:1065). `g_scale_gss` and `block_rms` are now ported.
 - **Gate**: quantize ONE Qwen3.5-2B layer; proxy error
   tr(EHEᵀ)/tr(WHWᵀ) within ~10% of the corresponding layer in the
   upstream-made 4.00bpw checkpoint (dequantize theirs and recompute).
@@ -304,11 +358,11 @@ Post-M4 work:
 ## M5 — per-layer bit calibration (~2-3 days)
 
 Port both upstream tiers, in this order:
-- **M5a priority allocation** (`conversion/allocation.py::
-  create_q_strategy`): integer base K = floor(bpw); spend the remaining
-  budget one bit at a time by module-group priority (qgroups,
-  `q_priority`). Cheap, no extra compute — produces "4.15bpw"-style
-  mixes. CLI: `--bpw`, `--head-bits`.
+- **M5a priority allocation** (`convert/allocation.py` now scaffolded):
+  integer base K = floor(bpw); spend the remaining budget one bit at a time
+  by module priority. Cheap, no extra compute — produces "4.15bpw"-style
+  mixes. Next: wire it into CLI/model emit as `--bpw`, `--head-bits`, and
+  optional regex overrides.
 - **M5b measured allocation** (`measure_model.py` + `optimize_model.py`):
   quantize a sample of each module at candidate K, record proxy error,
   optimize the allocation under the budget — the full "calibrate bits per

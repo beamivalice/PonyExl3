@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
+import json
 import re
 from pathlib import Path
+import time
 from typing import Any, Literal, Sequence
+
+import numpy as np
 
 from ponyexl3.convert.direct import (
     DirectLayerResult,
     ScaleMode,
     direct_layer_summary,
     direct_quantize_layer,
+    read_source_plain_tensors,
     write_exl3_layers_bundle,
 )
 from ponyexl3.convert.fixtures import SearchBackend, resolve_source_linear
@@ -21,6 +27,7 @@ from ponyexl3.ref.loader import list_exl3_layers, load_exl3_layer
 
 
 LayerQuantizer = Literal["direct", "ldlq"]
+ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -49,11 +56,14 @@ def layer_module_keys(
 ) -> list[str]:
     """List EXL3 module keys for one transformer layer."""
 
-    prefix = f"model.language_model.layers.{layer_index}."
+    prefixes = (
+        f"model.language_model.layers.{layer_index}.",
+        f"model.layers.{layer_index}.",
+    )
     keys = [info["key"] for info in list_exl3_layers(str(oracle_dir))]
     out = []
     for key in keys:
-        if not key.startswith(prefix):
+        if not key.startswith(prefixes):
             continue
         if not include_routed_experts and ".experts." in key:
             continue
@@ -62,6 +72,42 @@ def layer_module_keys(
     if module_limit is not None:
         out = out[:module_limit]
     return out
+
+
+def model_module_keys(
+    oracle_dir: str | Path,
+    *,
+    include_routed_experts: bool = False,
+    module_limit: int | None = None,
+) -> list[str]:
+    """List all EXL3 module keys in one oracle checkpoint."""
+
+    keys = [info["key"] for info in list_exl3_layers(str(oracle_dir))]
+    out = []
+    for key in keys:
+        if not include_routed_experts and ".experts." in key:
+            continue
+        out.append(key)
+    out = sorted(out, key=_natural_key)
+    if module_limit is not None:
+        out = out[:module_limit]
+    return out
+
+
+def plain_tensor_keys(oracle_dir: str | Path) -> list[str]:
+    """Return non-EXL3 tensor names from an oracle quantization config."""
+
+    qcfg = Path(oracle_dir) / "quantization_config.json"
+    with qcfg.open(encoding="utf-8") as f:
+        storage = dict(json.load(f).get("tensor_storage", {}))
+    out: list[str] = []
+    for info in storage.values():
+        if not isinstance(info, dict) or info.get("quant_format") == "exl3":
+            continue
+        stored = info.get("stored_tensors", {})
+        if isinstance(stored, dict):
+            out.extend(str(name) for name in stored)
+    return sorted(out, key=_natural_key)
 
 
 def supported_module_keys(
@@ -92,6 +138,32 @@ def supported_module_keys(
     return supported, skipped
 
 
+def supported_model_module_keys(
+    source_dir: str | Path,
+    oracle_dir: str | Path,
+    *,
+    include_routed_experts: bool = False,
+    module_limit: int | None = None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Return all model module keys supported by current source adapters."""
+
+    selected = model_module_keys(
+        oracle_dir,
+        include_routed_experts=include_routed_experts,
+        module_limit=module_limit,
+    )
+    supported: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for key in selected:
+        try:
+            resolve_source_linear(source_dir, key)
+        except (KeyError, ValueError, FileNotFoundError) as exc:
+            skipped.append({"module": key, "reason": str(exc)})
+            continue
+        supported.append(key)
+    return supported, skipped
+
+
 def _convert_one(
     quantizer: LayerQuantizer,
     source_dir: str | Path,
@@ -102,6 +174,9 @@ def _convert_one(
     scale_mode: ScaleMode,
     sigma_reg: float,
     buf_size_rows: int,
+    calibration_activations: np.ndarray | None,
+    skip_g_scale: bool,
+    regularization_seed: int,
 ) -> DirectLayerResult:
     if quantizer == "direct":
         return direct_quantize_layer(
@@ -110,6 +185,9 @@ def _convert_one(
             module_key,
             search_backend=search_backend,
             scale_mode=scale_mode,
+            calibration_activations=calibration_activations,
+            skip_g_scale=skip_g_scale,
+            regularization_seed=regularization_seed,
         )
     return ldlq_quantize_layer(
         source_dir,
@@ -119,6 +197,9 @@ def _convert_one(
         scale_mode=scale_mode,
         sigma_reg=sigma_reg,
         buf_size_rows=buf_size_rows,
+        calibration_activations=calibration_activations,
+        skip_g_scale=skip_g_scale,
+        regularization_seed=regularization_seed,
     )
 
 
@@ -142,6 +223,11 @@ def convert_module_set(
     skip_unsupported: bool = True,
     asset_dir: str | Path | None = None,
     resume: bool = False,
+    calibration_activations: np.ndarray | None = None,
+    skip_g_scale: bool = False,
+    regularization_seed: int = 0,
+    include_plain_tensors: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> ModuleSetResult:
     """Convert a selected module set and optionally emit one bundle."""
 
@@ -149,6 +235,17 @@ def convert_module_set(
     skipped: list[dict[str, str]] = []
     layers: list[EXL3Layer] = []
     requested = list(module_keys)
+    total_start = time.perf_counter()
+    if progress is not None:
+        progress(
+            "start",
+            {
+                "total": len(requested),
+                "quantizer": quantizer,
+                "search_backend": search_backend,
+                "scale_mode": scale_mode,
+            },
+        )
     existing: dict[str, EXL3Layer] = {}
     if resume:
         if out_dir is None:
@@ -160,7 +257,18 @@ def convert_module_set(
                 if key in available:
                     existing[key] = load_exl3_layer(str(out_dir), key)
 
-    for key in requested:
+    for index, key in enumerate(requested, start=1):
+        module_start = time.perf_counter()
+        if progress is not None:
+            progress(
+                "module_start",
+                {
+                    "index": index,
+                    "total": len(requested),
+                    "module": key,
+                    "elapsed_s": module_start - total_start,
+                },
+            )
         if key in existing:
             layer = existing[key]
             layers.append(layer)
@@ -173,6 +281,19 @@ def convert_module_set(
                     "stats": {},
                 }
             )
+            if progress is not None:
+                progress(
+                    "module_resumed",
+                    {
+                        "index": index,
+                        "total": len(requested),
+                        "module": key,
+                        "shape": [layer.in_features, layer.out_features],
+                        "k": layer.k,
+                        "module_s": time.perf_counter() - module_start,
+                        "elapsed_s": time.perf_counter() - total_start,
+                    },
+                )
             continue
         try:
             result = _convert_one(
@@ -184,17 +305,73 @@ def convert_module_set(
                 scale_mode=scale_mode,
                 sigma_reg=sigma_reg,
                 buf_size_rows=buf_size_rows,
+                calibration_activations=calibration_activations,
+                skip_g_scale=skip_g_scale,
+                regularization_seed=regularization_seed,
             )
         except (KeyError, ValueError, FileNotFoundError) as exc:
             if not skip_unsupported:
                 raise
             skipped.append({"module": key, "reason": str(exc)})
+            if progress is not None:
+                progress(
+                    "module_skipped",
+                    {
+                        "index": index,
+                        "total": len(requested),
+                        "module": key,
+                        "reason": str(exc),
+                        "module_s": time.perf_counter() - module_start,
+                        "elapsed_s": time.perf_counter() - total_start,
+                    },
+                )
             continue
         layers.append(result.layer)
-        completed.append(_summary(quantizer, result))
+        item = _summary(quantizer, result)
+        completed.append(item)
+        if progress is not None:
+            stats = item.get("stats", {})
+            progress(
+                "module_done",
+                {
+                    "index": index,
+                    "total": len(requested),
+                    "module": key,
+                    "shape": item.get("shape"),
+                    "k": item.get("k"),
+                    "output_rel_rms": stats.get("output_rel_rms"),
+                    "public_rel_rms": stats.get("public_rel_rms"),
+                    "hessian_proxy_rel_rms": stats.get("hessian_proxy_rel_rms"),
+                    "module_s": time.perf_counter() - module_start,
+                    "elapsed_s": time.perf_counter() - total_start,
+                },
+            )
 
     loaded: list[EXL3Layer] = []
     if out_dir is not None and layers:
+        if progress is not None:
+            progress(
+                "plain_start",
+                {
+                    "include_plain_tensors": include_plain_tensors,
+                    "elapsed_s": time.perf_counter() - total_start,
+                },
+            )
+        plain_tensors = (
+            read_source_plain_tensors(source_dir, plain_tensor_keys(oracle_dir))
+            if include_plain_tensors
+            else None
+        )
+        if progress is not None:
+            progress(
+                "write_start",
+                {
+                    "layers": len(layers),
+                    "plain_tensors": 0 if plain_tensors is None else len(plain_tensors),
+                    "out_dir": str(out_dir),
+                    "elapsed_s": time.perf_counter() - total_start,
+                },
+            )
         manifest = {
             "quantizer": quantizer,
             "search_backend": search_backend,
@@ -202,6 +379,13 @@ def convert_module_set(
             "sigma_reg": sigma_reg,
             "buf_size_rows": buf_size_rows,
             "resume": resume,
+            "calibration_rows": 0
+            if calibration_activations is None
+            else int(calibration_activations.shape[0]),
+            "skip_g_scale": skip_g_scale,
+            "regularization_seed": regularization_seed,
+            "include_plain_tensors": include_plain_tensors,
+            "plain_tensor_count": 0 if plain_tensors is None else len(plain_tensors),
             "requested_modules": requested,
             "completed": completed,
             "skipped": skipped,
@@ -211,6 +395,27 @@ def convert_module_set(
             out_dir,
             asset_dir=source_dir if asset_dir is None else asset_dir,
             manifest=manifest,
+            plain_tensors=plain_tensors,
+        )
+        if progress is not None:
+            progress(
+                "write_done",
+                {
+                    "layers": len(layers),
+                    "loaded_layers": len(loaded),
+                    "out_dir": str(out_dir),
+                    "elapsed_s": time.perf_counter() - total_start,
+                },
+            )
+
+    if progress is not None:
+        progress(
+            "done",
+            {
+                "completed": len(completed),
+                "skipped": len(skipped),
+                "elapsed_s": time.perf_counter() - total_start,
+            },
         )
 
     return ModuleSetResult(

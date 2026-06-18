@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from ponyexl3.convert.calibration import validate_activation_matrix
 from ponyexl3.convert.reference_search import quantize_tile_reference
 from ponyexl3.ref.codebook import CodebookMode, codebook_mode_from_flags
 from ponyexl3.ref.decode import decode_packed_tile
@@ -224,6 +225,19 @@ class SafetensorIndex:
         arr = np.stack(rows, axis=0).reshape(sizes)
         return arr
 
+    def read_tensor(self, key: str) -> np.ndarray:
+        """Read a complete tensor from its safetensors shard."""
+
+        info = self.tensor_info(key)
+        bpe = _dtype_nbytes(info.dtype)
+        header_len, _header = self._header(info.shard)
+        data_base = 8 + header_len + info.data_offsets[0]
+        n_elem = int(np.prod(info.shape, dtype=np.int64))
+        with info.shard.open("rb") as f:
+            f.seek(data_base)
+            raw = f.read(n_elem * bpe)
+        return _decode_raw(raw, info.dtype).reshape(info.shape)
+
 
 def resolve_source_linear(model_dir: str | Path, module_key: str) -> SourceLinear:
     """Resolve a supported HF source tensor for an EXL3 module key."""
@@ -331,6 +345,7 @@ def build_layer_fixture(
     *,
     activation_rows: int = 4,
     seed: int = 0,
+    activations: np.ndarray | None = None,
 ) -> LayerFixture:
     source = resolve_source_linear(source_dir, module_key)
     oracle = load_oracle_linear(oracle_dir, module_key)
@@ -344,12 +359,18 @@ def build_layer_fixture(
             f"{module_key}: source out_features={source.out_features} "
             f"!= oracle {oracle.layer.out_features}"
         )
-    rng = np.random.default_rng(seed)
-    activations = rng.standard_normal(
-        (activation_rows, source.in_features),
-        dtype=np.float32,
-    ).astype(np.float16)
-    return LayerFixture(source=source, oracle=oracle, activations=activations)
+    if activations is None:
+        rng = np.random.default_rng(seed)
+        fixture_activations = rng.standard_normal(
+            (activation_rows, source.in_features),
+            dtype=np.float32,
+        ).astype(np.float16)
+    else:
+        fixture_activations = validate_activation_matrix(
+            activations,
+            expected_features=source.in_features,
+        )
+    return LayerFixture(source=source, oracle=oracle, activations=fixture_activations)
 
 
 def _scale_slice(scale: np.ndarray | None, start: int, size: int) -> np.ndarray | None:

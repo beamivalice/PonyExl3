@@ -12,11 +12,122 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
+from ponyexl3.convert.calibration import load_calibration_activations
 from ponyexl3.convert.fixtures import run_tile_pilot, tile_pilot_summary
 
 
 DEFAULT_PILOT_MODULE = "model.language_model.layers.0.linear_attn.in_proj_qkv"
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    return 0.0
+
+
+def _as_int(value: object) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return 0
+
+
+def _format_seconds(value: object) -> str:
+    seconds = _as_float(value)
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes, rem = divmod(seconds, 60.0)
+    if minutes < 60.0:
+        return f"{int(minutes)}m{rem:04.1f}s"
+    hours, minutes = divmod(minutes, 60.0)
+    return f"{int(hours)}h{int(minutes):02d}m{rem:04.1f}s"
+
+
+def _progress_value(value: object) -> str:
+    return "nan" if value is None else f"{_as_float(value):.6f}"
+
+
+def _module_set_progress(scope: str):
+    def emit(event: str, data: dict[str, object]) -> None:
+        prefix = f"[convert:{scope}]"
+        if event == "start":
+            print(
+                f"{prefix} start modules={data['total']} quantizer={data['quantizer']} "
+                f"backend={data['search_backend']} scale={data['scale_mode']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "module_start":
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"start {data['module']} elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "module_done":
+            shape = data.get("shape")
+            shape_s = "?"
+            if isinstance(shape, list | tuple) and len(shape) == 2:
+                shape_s = f"{shape[0]}x{shape[1]}"
+            proxy = data.get("hessian_proxy_rel_rms")
+            proxy_s = "" if proxy is None else f" proxy={_progress_value(proxy)}"
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"done {data['module']} shape={shape_s} k={data.get('k')} "
+                f"output={_progress_value(data.get('output_rel_rms'))} "
+                f"public={_progress_value(data.get('public_rel_rms'))}{proxy_s} "
+                f"module={_format_seconds(data['module_s'])} "
+                f"elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "module_resumed":
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"resumed {data['module']} elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "module_skipped":
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"skipped {data['module']}: {data['reason']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "plain_start":
+            if data.get("include_plain_tensors"):
+                print(
+                    f"{prefix} reading plain tensors elapsed={_format_seconds(data['elapsed_s'])}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        elif event == "write_start":
+            print(
+                f"{prefix} writing layers={data['layers']} plain={data['plain_tensors']} "
+                f"out={data['out_dir']} elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "write_done":
+            print(
+                f"{prefix} wrote loaded_layers={data['loaded_layers']} out={data['out_dir']} "
+                f"elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "done":
+            print(
+                f"{prefix} done completed={data['completed']} skipped={data['skipped']} "
+                f"elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    return emit
 
 
 def main() -> int:
@@ -64,6 +175,11 @@ def main() -> int:
         help="convert supported EXL3 modules in --only-layer instead of --only-module",
     )
     parser.add_argument(
+        "--model-modules",
+        action="store_true",
+        help="convert all supported EXL3 modules in the oracle checkpoint",
+    )
+    parser.add_argument(
         "--include-routed-experts",
         action="store_true",
         help="include routed MoE experts in --layer-modules",
@@ -75,9 +191,14 @@ def main() -> int:
     )
     parser.add_argument(
         "--scale-mode",
-        choices=("oracle", "oracle_safe", "identity"),
+        choices=("oracle", "oracle_safe", "identity", "computed"),
         default="oracle_safe",
-        help="scale source for layer modes; oracle_safe replaces zero oracle scales with 1",
+        help="scale source for layer modes; computed derives fresh suh/svh from source weights",
+    )
+    parser.add_argument(
+        "--calibration-activations",
+        type=Path,
+        help="pre-captured 2D activations (.npy/.npz/.safetensors) for layer modes",
     )
     parser.add_argument(
         "--search-backend",
@@ -93,30 +214,62 @@ def main() -> int:
         help="LDLQ row buffer size; must be a 16-multiple",
     )
     parser.add_argument("--resume", action="store_true", help="reserved for full conversion")
+    parser.add_argument(
+        "--skip-g-scale",
+        action="store_true",
+        help="skip computed-scale global scale search for faster smoke runs",
+    )
+    parser.add_argument(
+        "--regularization-seed",
+        type=int,
+        default=0,
+        help="seed for computed-scale sign flips",
+    )
     parser.add_argument("--json", action="store_true", help="print JSON only")
     args = parser.parse_args()
 
     try:
+        calibration_activations = (
+            None
+            if args.calibration_activations is None
+            else load_calibration_activations(args.calibration_activations)
+        )
         layer_modes = int(args.direct_window) + int(args.direct_layer) + int(args.ldlq_layer)
         if layer_modes > 1:
             raise ValueError("--direct-window, --direct-layer, and --ldlq-layer are mutually exclusive")
         if args.direct_layer or args.ldlq_layer:
-            if args.layer_modules:
-                if args.only_layer is None:
+            if args.layer_modules or args.model_modules:
+                if args.layer_modules and args.model_modules:
+                    raise ValueError("--layer-modules and --model-modules are mutually exclusive")
+                if args.layer_modules and args.only_layer is None:
                     raise ValueError("--layer-modules requires --only-layer")
                 from ponyexl3.convert.driver import (
                     convert_module_set,
+                    model_module_keys,
                     module_set_summary,
+                    supported_model_module_keys,
                     supported_module_keys,
                 )
 
-                module_keys, pre_skipped = supported_module_keys(
-                    args.in_dir,
-                    args.oracle_dir,
-                    args.only_layer,
-                    include_routed_experts=args.include_routed_experts,
-                    module_limit=args.module_limit,
-                )
+                if args.model_modules:
+                    module_keys, pre_skipped = supported_model_module_keys(
+                        args.in_dir,
+                        args.oracle_dir,
+                        include_routed_experts=args.include_routed_experts,
+                        module_limit=args.module_limit,
+                    )
+                    selected_scope = "model"
+                    selected_total = len(model_module_keys(args.oracle_dir))
+                else:
+                    module_keys, pre_skipped = supported_module_keys(
+                        args.in_dir,
+                        args.oracle_dir,
+                        args.only_layer,
+                        include_routed_experts=args.include_routed_experts,
+                        module_limit=args.module_limit,
+                    )
+                    selected_scope = f"layer={args.only_layer}"
+                    selected_total = len(module_keys) + len(pre_skipped)
                 result = convert_module_set(
                     args.in_dir,
                     args.oracle_dir,
@@ -128,6 +281,11 @@ def main() -> int:
                     sigma_reg=args.sigma_reg,
                     buf_size_rows=args.buf_size_rows,
                     resume=bool(args.resume),
+                    calibration_activations=calibration_activations,
+                    skip_g_scale=bool(args.skip_g_scale),
+                    regularization_seed=args.regularization_seed,
+                    include_plain_tensors=bool(args.model_modules),
+                    progress=_module_set_progress(selected_scope),
                 )
                 summary = module_set_summary(result)
                 summary["pre_skipped"] = pre_skipped
@@ -138,18 +296,29 @@ def main() -> int:
                     "out_dir": None if args.out_dir is None else str(args.out_dir),
                     "work_dir": None if args.work_dir is None else str(args.work_dir),
                     "only_layer": args.only_layer,
+                    "model_modules": bool(args.model_modules),
                     "include_routed_experts": bool(args.include_routed_experts),
                     "module_limit": args.module_limit,
+                    "selected_scope": selected_scope,
+                    "selected_total": selected_total,
                     "search_backend": args.search_backend,
                     "scale_mode": args.scale_mode,
                     "sigma_reg": args.sigma_reg,
                     "buf_size_rows": args.buf_size_rows,
                     "resume": bool(args.resume),
+                    "calibration_activations": None
+                    if args.calibration_activations is None
+                    else str(args.calibration_activations),
+                    "calibration_rows": 0
+                    if calibration_activations is None
+                    else int(calibration_activations.shape[0]),
+                    "skip_g_scale": bool(args.skip_g_scale),
+                    "regularization_seed": args.regularization_seed,
                 }
                 if args.json:
                     print(json.dumps(summary, indent=2, sort_keys=True))
                     return 0
-                print(f"layer modules: layer={args.only_layer} quantizer={summary['quantizer']}")
+                print(f"module set: {selected_scope} quantizer={summary['quantizer']}")
                 print(
                     f"completed={len(summary['completed'])} "
                     f"skipped={len(summary['skipped']) + len(pre_skipped)} "
@@ -183,6 +352,9 @@ def main() -> int:
                     scale_mode=args.scale_mode,
                     sigma_reg=args.sigma_reg,
                     buf_size_rows=args.buf_size_rows,
+                    calibration_activations=calibration_activations,
+                    skip_g_scale=bool(args.skip_g_scale),
+                    regularization_seed=args.regularization_seed,
                 )
                 summary = ldlq_layer_summary(result)
             else:
@@ -192,6 +364,9 @@ def main() -> int:
                     args.only_module,
                     search_backend=args.search_backend,
                     scale_mode=args.scale_mode,
+                    calibration_activations=calibration_activations,
+                    skip_g_scale=bool(args.skip_g_scale),
+                    regularization_seed=args.regularization_seed,
                 )
                 summary = direct_layer_summary(result)
             summary["requested"] = {
@@ -206,6 +381,14 @@ def main() -> int:
                 "sigma_reg": args.sigma_reg,
                 "buf_size_rows": args.buf_size_rows,
                 "resume": bool(args.resume),
+                "calibration_activations": None
+                if args.calibration_activations is None
+                else str(args.calibration_activations),
+                "calibration_rows": 0
+                if calibration_activations is None
+                else int(calibration_activations.shape[0]),
+                "skip_g_scale": bool(args.skip_g_scale),
+                "regularization_seed": args.regularization_seed,
             }
             if args.out_dir is not None:
                 loaded = write_direct_layer_bundle(result, args.out_dir)

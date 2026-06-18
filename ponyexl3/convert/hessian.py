@@ -12,13 +12,14 @@ from ponyexl3.convert.direct import (
     DirectLayerResult,
     ScaleMode,
     direct_layer_summary,
+    inner_matrix_to_public,
     mse_from_sse,
     public_block_to_inner_with_scale_slices,
+    prepare_layer_quantization_basis,
     quantize_inner_matrix_direct,
     rel_rms_from_sse,
-    scale_full_for_mode,
 )
-from ponyexl3.convert.fixtures import SearchBackend, build_layer_fixture, read_source_public_block
+from ponyexl3.convert.fixtures import SearchBackend, build_layer_fixture
 from ponyexl3.ref.codebook import CodebookMode
 from ponyexl3.ref.hadamard import HAD_DIM, had_r_128
 from ponyexl3.ref.layer import EXL3Layer
@@ -353,47 +354,39 @@ def ldlq_quantize_layer(
     sigma_reg: float = 0.025,
     buf_size_rows: int = 128,
     max_pins: int = 4,
+    calibration_activations: np.ndarray | None = None,
+    skip_g_scale: bool = False,
+    regularization_seed: int = 0,
 ) -> DirectLayerResult:
     """Quantize one full linear module with activation-aware LDLQ."""
 
-    fixture = build_layer_fixture(source_dir, oracle_dir, module_key)
+    fixture = build_layer_fixture(
+        source_dir,
+        oracle_dir,
+        module_key,
+        activations=calibration_activations,
+    )
     source = fixture.source
     oracle = fixture.oracle
     ref_layer = oracle.layer
     if ref_layer.in_features % HAD_DIM != 0 or ref_layer.out_features % HAD_DIM != 0:
         raise ValueError("LDLQ layer conversion requires 128-multiple dimensions")
 
-    suh, suh_zero_count = scale_full_for_mode(ref_layer.suh, ref_layer.in_features, scale_mode)
-    svh, svh_zero_count = scale_full_for_mode(ref_layer.svh, ref_layer.out_features, scale_mode)
-    in_blocks = ref_layer.in_features // HAD_DIM
-    out_blocks = ref_layer.out_features // HAD_DIM
-    target_inner = np.empty((ref_layer.in_features, ref_layer.out_features), dtype=np.float32)
-    source_public = np.empty_like(target_inner, dtype=np.float32)
-
-    for ib in range(in_blocks):
-        in_start = ib * HAD_DIM
-        su_slice = None if suh is None else suh[in_start : in_start + HAD_DIM]
-        for ob in range(out_blocks):
-            out_start = ob * HAD_DIM
-            sv_slice = None if svh is None else svh[out_start : out_start + HAD_DIM]
-            public_block = read_source_public_block(
-                source_dir,
-                source,
-                in_start=in_start,
-                out_start=out_start,
-                rows=HAD_DIM,
-                cols=HAD_DIM,
-            )
-            r0 = in_start
-            r1 = in_start + HAD_DIM
-            c0 = out_start
-            c1 = out_start + HAD_DIM
-            source_public[r0:r1, c0:c1] = public_block
-            target_inner[r0:r1, c0:c1] = public_block_to_inner_with_scale_slices(
-                public_block,
-                su=su_slice,
-                sv=sv_slice,
-            )
+    basis = prepare_layer_quantization_basis(
+        source_dir,
+        source,
+        ref_layer,
+        oracle.cb,
+        scale_mode=scale_mode,
+        search_backend=search_backend,
+        max_pins=max_pins,
+        skip_g_scale=skip_g_scale,
+        regularization_seed=regularization_seed,
+    )
+    target_inner = basis.target_inner
+    source_public = basis.source_public
+    suh = basis.suh
+    svh = basis.svh
 
     inner_acts = public_activations_to_inner(fixture.activations, suh)
     prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
@@ -423,14 +416,11 @@ def ldlq_quantize_layer(
     )
     out_layer.validate()
 
-    reconstructed_public = reconstruct_public_weights(
-        out_layer.trellis,
-        out_layer.suh,
-        out_layer.svh,
-        out_layer.k,
-        mcg=out_layer.mcg,
-        mul1=out_layer.mul1,
-    ).astype(np.float32)
+    reconstructed_public = inner_matrix_to_public(
+        quantized.reconstructed,
+        suh=suh,
+        svh=svh,
+    )
 
     x = fixture.activations.astype(np.float32)
     source_y = x @ source_public
@@ -487,12 +477,11 @@ def ldlq_quantize_layer(
                 np.sqrt(mse_from_sse(output_sse, int(source_y.size)))
                 / (np.sqrt(mse_from_sse(oracle_output_sse, int(source_y.size))) + 1e-20)
             ),
-            "suh_zero_replacements": float(suh_zero_count),
-            "svh_zero_replacements": float(svh_zero_count),
             "hessian_diag_mean": prepared.diag_mean,
             "ldl_retries": float(ldl.retries),
         }
     )
+    stats.update(basis.stats)
     return DirectLayerResult(
         module_key=module_key,
         search_backend=search_backend,
