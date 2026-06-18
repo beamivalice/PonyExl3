@@ -12,6 +12,12 @@ from typing import Any, Literal, Sequence
 
 import numpy as np
 
+from ponyexl3.convert.allocation import (
+    ModuleAllocation,
+    allocate_priority_bits,
+    allocation_summary,
+    default_module_priority,
+)
 from ponyexl3.convert.direct import (
     DirectLayerResult,
     ScaleMode,
@@ -23,7 +29,7 @@ from ponyexl3.convert.direct import (
 from ponyexl3.convert.fixtures import SearchBackend, resolve_source_linear
 from ponyexl3.convert.hessian import ldlq_layer_summary, ldlq_quantize_layer
 from ponyexl3.ref.layer import EXL3Layer
-from ponyexl3.ref.loader import list_exl3_layers, load_exl3_layer
+from ponyexl3.ref.loader import layer_meta_from_config, list_exl3_layers, load_exl3_layer
 
 
 LayerQuantizer = Literal["direct", "ldlq"]
@@ -110,6 +116,73 @@ def plain_tensor_keys(oracle_dir: str | Path) -> list[str]:
     return sorted(out, key=_natural_key)
 
 
+def module_weight_map(
+    oracle_dir: str | Path,
+    module_keys: Sequence[str],
+) -> dict[str, int]:
+    """Return parameter-count weights for EXL3 modules."""
+
+    out: dict[str, int] = {}
+    for key in module_keys:
+        meta = layer_meta_from_config(str(oracle_dir), key)
+        out[key] = int(meta["in_features"] * meta["out_features"])
+    return out
+
+
+def priority_bit_allocations(
+    oracle_dir: str | Path,
+    module_keys: Sequence[str],
+    *,
+    target_bpw: float,
+    head_bits: int | None = None,
+    bit_overrides: dict[str, int] | None = None,
+) -> list[ModuleAllocation]:
+    """Build the M5a parameter-weighted priority allocation plan."""
+
+    keys = list(module_keys)
+    weights = module_weight_map(oracle_dir, keys)
+    priorities = {key: default_module_priority(key) for key in keys}
+    forced: dict[str, int] = {}
+    if head_bits is not None:
+        forced.update({key: int(head_bits) for key in keys if key == "lm_head"})
+    forced.update({key: int(bits) for key, bits in (bit_overrides or {}).items()})
+    return allocate_priority_bits(
+        keys,
+        target_bpw=target_bpw,
+        priorities=priorities,
+        weights=weights,
+        fixed_bits=forced,
+    )
+
+
+def bit_plan_from_allocations(allocations: Sequence[ModuleAllocation]) -> dict[str, int]:
+    """Convert allocation records into the driver bit-plan mapping."""
+
+    return {item.key: int(item.bits) for item in allocations}
+
+
+def bit_allocation_summary(
+    allocations: Sequence[ModuleAllocation],
+    *,
+    target_bpw: float,
+) -> dict[str, Any]:
+    """JSON-friendly allocation plan summary."""
+
+    summary: dict[str, Any] = dict(allocation_summary(allocations))
+    summary["target_bpw"] = float(target_bpw)
+    summary["average_bits_delta"] = float(summary["average_bits"] - target_bpw)
+    summary["allocations"] = [
+        {
+            "module": item.key,
+            "bits": int(item.bits),
+            "priority": float(item.priority),
+            "weight": int(item.weight),
+        }
+        for item in allocations
+    ]
+    return summary
+
+
 def supported_module_keys(
     source_dir: str | Path,
     oracle_dir: str | Path,
@@ -177,6 +250,7 @@ def _convert_one(
     calibration_activations: np.ndarray | None,
     skip_g_scale: bool,
     regularization_seed: int,
+    quant_bits: int | None,
 ) -> DirectLayerResult:
     if quantizer == "direct":
         return direct_quantize_layer(
@@ -188,6 +262,7 @@ def _convert_one(
             calibration_activations=calibration_activations,
             skip_g_scale=skip_g_scale,
             regularization_seed=regularization_seed,
+            quant_bits=quant_bits,
         )
     return ldlq_quantize_layer(
         source_dir,
@@ -200,6 +275,7 @@ def _convert_one(
         calibration_activations=calibration_activations,
         skip_g_scale=skip_g_scale,
         regularization_seed=regularization_seed,
+        quant_bits=quant_bits,
     )
 
 
@@ -227,6 +303,7 @@ def convert_module_set(
     skip_g_scale: bool = False,
     regularization_seed: int = 0,
     include_plain_tensors: bool = False,
+    bit_plan: dict[str, int] | None = None,
     progress: ProgressCallback | None = None,
 ) -> ModuleSetResult:
     """Convert a selected module set and optionally emit one bundle."""
@@ -235,6 +312,7 @@ def convert_module_set(
     skipped: list[dict[str, str]] = []
     layers: list[EXL3Layer] = []
     requested = list(module_keys)
+    planned_bits = {key: int(bits) for key, bits in (bit_plan or {}).items()}
     total_start = time.perf_counter()
     if progress is not None:
         progress(
@@ -244,6 +322,7 @@ def convert_module_set(
                 "quantizer": quantizer,
                 "search_backend": search_backend,
                 "scale_mode": scale_mode,
+                "bit_plan_enabled": bool(planned_bits),
             },
         )
     existing: dict[str, EXL3Layer] = {}
@@ -260,12 +339,14 @@ def convert_module_set(
     for index, key in enumerate(requested, start=1):
         module_start = time.perf_counter()
         if progress is not None:
+            planned_k = planned_bits.get(key)
             progress(
                 "module_start",
                 {
                     "index": index,
                     "total": len(requested),
                     "module": key,
+                    "planned_k": planned_k,
                     "elapsed_s": module_start - total_start,
                 },
             )
@@ -308,6 +389,7 @@ def convert_module_set(
                 calibration_activations=calibration_activations,
                 skip_g_scale=skip_g_scale,
                 regularization_seed=regularization_seed,
+                quant_bits=planned_bits.get(key),
             )
         except (KeyError, ValueError, FileNotFoundError) as exc:
             if not skip_unsupported:
@@ -386,6 +468,7 @@ def convert_module_set(
             "regularization_seed": regularization_seed,
             "include_plain_tensors": include_plain_tensors,
             "plain_tensor_count": 0 if plain_tensors is None else len(plain_tensors),
+            "bit_plan": planned_bits,
             "requested_modules": requested,
             "completed": completed,
             "skipped": skipped,

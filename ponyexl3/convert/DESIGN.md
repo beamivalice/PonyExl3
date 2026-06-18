@@ -3,7 +3,7 @@
 Updated 2026-06-18. Status: **M1 complete, M2 complete, M3b direct full-layer
 emit/load gate complete, M4 complete for selected-module/layer-set LDLQ emit,
 post-M4 computed-scale/calibration inputs complete, MiniCPM5 direct full-model
-conversion/load/KLD gated, and M5a scaffolded**
+conversion/load/KLD gated, and M5a priority allocation wired**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`,
 `tests/test_convert_hessian.py`, `tests/test_convert_driver.py`,
 `tests/test_convert_regularize.py`, `tests/test_convert_calibration.py`,
@@ -70,6 +70,15 @@ Current checkpoint-backed pilot:
   LDLQ/calibration quality work should use this original-reference gate.
   Converted-vs-oracle (`KLD=0.116699`) remains only a diagnostic, not the
   main acceptance metric.
+- MiniCPM5 M5 optimization smoke:
+  one-module direct override proved allocation plumbing by forcing
+  `model.layers.0.mlp.down_proj` to K=5; it emitted/reloaded a
+  `288 x 96 x 80` trellis in `8.3 s` with output rel-RMS `0.034803`.
+  More importantly, same-module LDLQ at the oracle K=4 took `56.8 s` and
+  reduced output rel-RMS to `0.003690` (`0.046x` the oracle output rel-RMS
+  under the fixture Hessian). This confirms the next quality phase should
+  prioritize full-model LDLQ/calibration and measured proxy allocation over
+  naive extra-bit spending.
 
 ---
 
@@ -169,7 +178,9 @@ Current checkpoint-backed pilot:
   `model.layers.*` keys and carries non-EXL3 plain tensors into emitted
   full-model bundles.
 - `convert/allocation.py` — M5a scaffold: deterministic priority allocation
-  from a target bpw to per-module integer `K` values. This is the cheap
+  from a target bpw to per-module integer `K` values. It is now
+  parameter-weighted, supports fixed-cost overrides (`lm_head`/regex), and
+  reports weighted average bits plus target delta. This is the cheap
   allocation tier; M5b will replace static priorities with measured proxy-loss
   deltas.
 - `tests/test_convert.py` — transition invariant + bit round-trip +
@@ -369,16 +380,30 @@ Post-M4 work is complete within the current checkpoint-backed fixture scope:
 ## M5 — per-layer bit calibration (~2-3 days)
 
 Port both upstream tiers, in this order:
-- **M5a priority allocation** (`convert/allocation.py` now scaffolded):
-  integer base K = floor(bpw); spend the remaining budget one bit at a time
-  by module priority. Cheap, no extra compute — produces "4.15bpw"-style
-  mixes. Next: wire it into CLI/model emit as `--bpw`, `--head-bits`, and
-  optional regex overrides.
+- **M5a priority allocation** (`convert/allocation.py` now wired):
+  integer base K = floor(bpw); spend the remaining weighted budget one bit at
+  a time by module priority. Cheap, no extra compute — produces
+  "4.15bpw"-style mixes when the fixed-cost overrides make the requested
+  budget feasible. CLI/driver support is in place:
+  `--allocation-dry-run`, `--use-bit-allocation`, `--bits`, `--head-bits`,
+  and repeated `--layer-bits REGEX:K`. Default conversion remains unchanged
+  unless allocation/override flags are supplied. MiniCPM dry-run example:
+  `--bits 4.60 --head-bits 6` yields weighted average `4.599643`, with
+  `63` modules at K=5, `1` module (`lm_head`) at K=6, and `105` at K=4.
+  `--bits 4.15 --head-bits 6` is over budget at `4.455764` before any
+  upgrades because the fixed `lm_head=6` cost alone exceeds the target.
+  Real smoke: forcing one MiniCPM `model.layers.0.mlp.down_proj` to K=5
+  emitted and reloaded a `288 x 96 x 80` trellis in `8.3 s`; module output
+  rel-RMS was `0.034803` vs the prior K=4 smoke's `~0.068`.
 - **M5b measured allocation** (`measure_model.py` + `optimize_model.py`):
   quantize a sample of each module at candidate K, record proxy error,
   optimize the allocation under the budget — the full "calibrate bits per
-  layer". Mitigate the K-candidate multiplier by measuring on row subsets
-  like upstream. CLI: `--hq`, `--layer-bits regex:K` overrides.
+  layer". Same-K LDLQ already shows a large MiniCPM module-level improvement
+  (`down_proj` K=4 output rel-RMS `0.003690` vs direct `~0.068`), so M5b
+  should first measure direct-vs-LDLQ and candidate K deltas on bounded
+  row/layer subsets before attempting a full KLD sweep. Mitigate the
+  K-candidate multiplier by measuring on row subsets like upstream. CLI:
+  `--hq`, `--layer-bits regex:K` overrides.
 
 ## M6 — polish
 

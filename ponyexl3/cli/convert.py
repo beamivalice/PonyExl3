@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 
 from ponyexl3.convert.calibration import load_calibration_activations
@@ -50,20 +51,45 @@ def _progress_value(value: object) -> str:
     return "nan" if value is None else f"{_as_float(value):.6f}"
 
 
+def _parse_layer_bit_overrides(
+    specs: list[str],
+    module_keys: list[str],
+) -> dict[str, int]:
+    overrides: dict[str, int] = {}
+    for spec in specs:
+        pattern, sep, bits_s = spec.rpartition(":")
+        if not sep or not pattern:
+            raise ValueError(f"--layer-bits must be REGEX:K, got {spec!r}")
+        bits = int(bits_s)
+        if bits < 1 or bits > 8:
+            raise ValueError(f"--layer-bits K must be in [1, 8], got {bits}")
+        rx = re.compile(pattern)
+        matched = [key for key in module_keys if rx.search(key)]
+        if not matched:
+            raise ValueError(f"--layer-bits pattern matched no selected modules: {pattern!r}")
+        for key in matched:
+            overrides[key] = bits
+    return overrides
+
+
 def _module_set_progress(scope: str):
     def emit(event: str, data: dict[str, object]) -> None:
         prefix = f"[convert:{scope}]"
         if event == "start":
+            alloc = " allocation=on" if data.get("bit_plan_enabled") else ""
             print(
                 f"{prefix} start modules={data['total']} quantizer={data['quantizer']} "
-                f"backend={data['search_backend']} scale={data['scale_mode']}",
+                f"backend={data['search_backend']} scale={data['scale_mode']}{alloc}",
                 file=sys.stderr,
                 flush=True,
             )
         elif event == "module_start":
+            planned = data.get("planned_k")
+            planned_s = "" if planned is None else f" K={planned}"
             print(
                 f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
-                f"start {data['module']} elapsed={_format_seconds(data['elapsed_s'])}",
+                f"start {data['module']}{planned_s} "
+                f"elapsed={_format_seconds(data['elapsed_s'])}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -190,6 +216,23 @@ def main() -> int:
         help="limit selected modules for bounded layer-driver smoke runs",
     )
     parser.add_argument(
+        "--use-bit-allocation",
+        action="store_true",
+        help="apply the M5a weighted priority K plan from --bits/--head-bits",
+    )
+    parser.add_argument(
+        "--allocation-dry-run",
+        action="store_true",
+        help="print the selected module K allocation plan and exit",
+    )
+    parser.add_argument(
+        "--layer-bits",
+        action="append",
+        default=[],
+        metavar="REGEX:K",
+        help="force selected module bits; may be repeated and later matches win",
+    )
+    parser.add_argument(
         "--scale-mode",
         choices=("oracle", "oracle_safe", "identity", "computed"),
         default="oracle_safe",
@@ -237,6 +280,14 @@ def main() -> int:
         layer_modes = int(args.direct_window) + int(args.direct_layer) + int(args.ldlq_layer)
         if layer_modes > 1:
             raise ValueError("--direct-window, --direct-layer, and --ldlq-layer are mutually exclusive")
+        allocation_requested = bool(
+            args.use_bit_allocation or args.allocation_dry_run or args.layer_bits
+        )
+        if allocation_requested and not (args.layer_modules or args.model_modules):
+            raise ValueError(
+                "--use-bit-allocation, --allocation-dry-run, and --layer-bits "
+                "require --layer-modules or --model-modules"
+            )
         if args.direct_layer or args.ldlq_layer:
             if args.layer_modules or args.model_modules:
                 if args.layer_modules and args.model_modules:
@@ -244,9 +295,12 @@ def main() -> int:
                 if args.layer_modules and args.only_layer is None:
                     raise ValueError("--layer-modules requires --only-layer")
                 from ponyexl3.convert.driver import (
+                    bit_allocation_summary,
+                    bit_plan_from_allocations,
                     convert_module_set,
                     model_module_keys,
                     module_set_summary,
+                    priority_bit_allocations,
                     supported_model_module_keys,
                     supported_module_keys,
                 )
@@ -270,6 +324,56 @@ def main() -> int:
                     )
                     selected_scope = f"layer={args.only_layer}"
                     selected_total = len(module_keys) + len(pre_skipped)
+                bit_overrides = _parse_layer_bit_overrides(args.layer_bits, module_keys)
+                allocation = None
+                allocation_info = None
+                bit_plan = bit_overrides or None
+                if args.use_bit_allocation or args.allocation_dry_run:
+                    allocation = priority_bit_allocations(
+                        args.oracle_dir,
+                        module_keys,
+                        target_bpw=args.bits,
+                        head_bits=args.head_bits,
+                        bit_overrides=bit_overrides,
+                    )
+                    bit_plan = bit_plan_from_allocations(allocation)
+                    allocation_info = bit_allocation_summary(
+                        allocation,
+                        target_bpw=args.bits,
+                    )
+                elif bit_overrides:
+                    allocation_info = {
+                        "target_bpw": args.bits,
+                        "manual_overrides": bit_overrides,
+                    }
+                if args.allocation_dry_run:
+                    dry = {
+                        "scope": selected_scope,
+                        "selected_total": selected_total,
+                        "supported_modules": len(module_keys),
+                        "pre_skipped": pre_skipped,
+                        "allocation": allocation_info,
+                        "bit_plan": bit_plan or {},
+                    }
+                    if args.json:
+                        print(json.dumps(dry, indent=2, sort_keys=True))
+                    else:
+                        plan_for_print = bit_plan or {}
+                        print(f"allocation dry-run: {selected_scope}")
+                        print(
+                            f"modules={len(module_keys)} selected_total={selected_total} "
+                            f"target_bpw={args.bits:.3f}"
+                        )
+                        if allocation_info is not None:
+                            print(
+                                f"weighted average bits="
+                                f"{allocation_info['average_bits']:.6f} "
+                                f"range={allocation_info['min_bits']}-"
+                                f"{allocation_info['max_bits']}"
+                            )
+                        for key in module_keys:
+                            print(f"  K={plan_for_print.get(key, 'oracle')} {key}")
+                    return 0
                 result = convert_module_set(
                     args.in_dir,
                     args.oracle_dir,
@@ -285,9 +389,11 @@ def main() -> int:
                     skip_g_scale=bool(args.skip_g_scale),
                     regularization_seed=args.regularization_seed,
                     include_plain_tensors=bool(args.model_modules),
+                    bit_plan=bit_plan,
                     progress=_module_set_progress(selected_scope),
                 )
                 summary = module_set_summary(result)
+                summary["allocation"] = allocation_info
                 summary["pre_skipped"] = pre_skipped
                 summary["requested"] = {
                     "bits": args.bits,

@@ -14,6 +14,7 @@ class ModuleAllocation:
     key: str
     bits: int
     priority: float
+    weight: int = 1
 
 
 def allocate_priority_bits(
@@ -22,6 +23,8 @@ def allocate_priority_bits(
     target_bpw: float,
     base_bits: int | None = None,
     priorities: dict[str, float] | None = None,
+    weights: dict[str, int] | None = None,
+    fixed_bits: dict[str, int] | None = None,
 ) -> list[ModuleAllocation]:
     """
     Cheap M5a allocation: floor bpw plus one-bit upgrades by priority.
@@ -40,19 +43,37 @@ def allocate_priority_bits(
     if floor_bits < 1:
         raise ValueError(f"base bits must be >= 1, got {floor_bits}")
 
-    extra_budget = int(round((target_bpw - floor_bits) * len(keys)))
-    extra_budget = max(0, min(len(keys), extra_budget))
+    wt = {key: max(1, int((weights or {}).get(key, 1))) for key in keys}
+    total_weight = sum(wt.values())
+    fixed = {key: int(bits) for key, bits in (fixed_bits or {}).items() if key in wt}
+    for key, bits in fixed.items():
+        if bits < 1:
+            raise ValueError(f"fixed bits for {key!r} must be >= 1, got {bits}")
+    target_weighted_bits = int(round(target_bpw * total_weight))
+    base_weighted_bits = sum(fixed.get(key, floor_bits) * wt[key] for key in keys)
+    extra_budget = max(0, target_weighted_bits - base_weighted_bits)
+    extra_budget = min(extra_budget, sum(wt[key] for key in keys if key not in fixed))
     pr = priorities or {}
     ranked = sorted(
         enumerate(keys),
         key=lambda item: (-float(pr.get(item[1], 0.0)), item[0]),
     )
-    upgraded = {key for _idx, key in ranked[:extra_budget]}
+    upgraded: set[str] = set()
+    spent = 0
+    for _idx, key in ranked:
+        if key in fixed:
+            continue
+        cost = wt[key]
+        if spent + cost > extra_budget:
+            continue
+        upgraded.add(key)
+        spent += cost
     return [
         ModuleAllocation(
             key=key,
-            bits=floor_bits + (1 if key in upgraded else 0),
+            bits=fixed.get(key, floor_bits + (1 if key in upgraded else 0)),
             priority=float(pr.get(key, 0.0)),
+            weight=wt[key],
         )
         for key in keys
     ]
@@ -64,9 +85,31 @@ def allocation_summary(allocations: Sequence[ModuleAllocation]) -> dict[str, flo
     if not allocations:
         return {"module_count": 0, "average_bits": 0.0, "min_bits": 0, "max_bits": 0}
     bits = [item.bits for item in allocations]
+    weights = [max(1, int(item.weight)) for item in allocations]
+    total_weight = sum(weights)
     return {
         "module_count": len(bits),
-        "average_bits": float(sum(bits) / len(bits)),
+        "average_bits": float(
+            sum(bit * weight for bit, weight in zip(bits, weights, strict=True))
+            / total_weight
+        ),
         "min_bits": int(min(bits)),
         "max_bits": int(max(bits)),
+        "total_weight": int(total_weight),
     }
+
+
+def default_module_priority(key: str) -> float:
+    """Cheap M5a quality priority used before measured proxy deltas exist."""
+
+    if key == "lm_head" or key.endswith(".lm_head"):
+        return 100.0
+    if ".self_attn.o_proj" in key or ".attention.o_proj" in key:
+        return 80.0
+    if any(part in key for part in (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj")):
+        return 70.0
+    if ".mlp.down_proj" in key:
+        return 60.0
+    if any(part in key for part in (".mlp.gate_proj", ".mlp.up_proj")):
+        return 50.0
+    return 0.0

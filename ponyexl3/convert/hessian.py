@@ -357,6 +357,7 @@ def ldlq_quantize_layer(
     calibration_activations: np.ndarray | None = None,
     skip_g_scale: bool = False,
     regularization_seed: int = 0,
+    quant_bits: int | None = None,
 ) -> DirectLayerResult:
     """Quantize one full linear module with activation-aware LDLQ."""
 
@@ -371,6 +372,9 @@ def ldlq_quantize_layer(
     ref_layer = oracle.layer
     if ref_layer.in_features % HAD_DIM != 0 or ref_layer.out_features % HAD_DIM != 0:
         raise ValueError("LDLQ layer conversion requires 128-multiple dimensions")
+    k = ref_layer.k if quant_bits is None else int(quant_bits)
+    if k < 1 or k > 8:
+        raise ValueError(f"EXL3 trellis K must be in [1, 8], got {k}")
 
     basis = prepare_layer_quantization_basis(
         source_dir,
@@ -382,6 +386,7 @@ def ldlq_quantize_layer(
         max_pins=max_pins,
         skip_g_scale=skip_g_scale,
         regularization_seed=regularization_seed,
+        quant_bits=k,
     )
     target_inner = basis.target_inner
     source_public = basis.source_public
@@ -395,7 +400,7 @@ def ldlq_quantize_layer(
     quantized = ldlq_inner_matrix(
         target_inner,
         ldl.l,
-        k=ref_layer.k,
+        k=k,
         cb=oracle.cb,
         hessian=prepared.hessian,
         search_backend=search_backend,
@@ -407,7 +412,7 @@ def ldlq_quantize_layer(
         key=module_key,
         in_features=ref_layer.in_features,
         out_features=ref_layer.out_features,
-        k=ref_layer.k,
+        k=k,
         trellis=quantized.packed,
         suh=suh,
         svh=svh,

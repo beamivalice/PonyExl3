@@ -272,6 +272,7 @@ def prepare_layer_quantization_basis(
     skip_g_scale: bool = False,
     regularization_seed: int = 0,
     g_scale_width: int = 3,
+    quant_bits: int | None = None,
 ) -> LayerQuantizationBasis:
     """Build the source, inner target, and scales shared by direct and LDLQ."""
 
@@ -279,6 +280,7 @@ def prepare_layer_quantization_basis(
     if scale_mode != "computed":
         return _oracle_or_identity_basis(source_public, ref_layer, scale_mode=scale_mode)
 
+    k = ref_layer.k if quant_bits is None else int(quant_bits)
     regularized = regularize_public_weight(
         source_public,
         seed=regularization_seed,
@@ -300,7 +302,7 @@ def prepare_layer_quantization_basis(
             scaled = (sample * np.float32(scale)).astype(np.float32, copy=False)
             _packed, _states, reconstructed = quantize_inner_matrix_direct(
                 scaled,
-                k=ref_layer.k,
+                k=k,
                 cb=cb,
                 search_backend=search_backend,
                 max_pins=max_pins,
@@ -512,6 +514,7 @@ def direct_quantize_layer(
     calibration_activations: np.ndarray | None = None,
     skip_g_scale: bool = False,
     regularization_seed: int = 0,
+    quant_bits: int | None = None,
 ) -> DirectLayerResult:
     """Directly quantize one full linear module."""
 
@@ -526,11 +529,14 @@ def direct_quantize_layer(
     ref_layer = oracle.layer
     if ref_layer.in_features % HAD_DIM != 0 or ref_layer.out_features % HAD_DIM != 0:
         raise ValueError("direct layer conversion requires 128-multiple dimensions")
+    k = ref_layer.k if quant_bits is None else int(quant_bits)
+    if k < 1 or k > 8:
+        raise ValueError(f"EXL3 trellis K must be in [1, 8], got {k}")
 
     in_blocks = ref_layer.in_features // HAD_DIM
     in_tiles = ref_layer.in_features // 16
     out_tiles = ref_layer.out_features // 16
-    packed_size = ref_layer.packed_tile_size
+    packed_size = 256 * k // 16
     trellis = np.empty((in_tiles, out_tiles, packed_size), dtype=np.uint16)
     basis = prepare_layer_quantization_basis(
         source_dir,
@@ -542,6 +548,7 @@ def direct_quantize_layer(
         max_pins=max_pins,
         skip_g_scale=skip_g_scale,
         regularization_seed=regularization_seed,
+        quant_bits=k,
     )
     source_public = basis.source_public
     target_inner = basis.target_inner
@@ -563,7 +570,7 @@ def direct_quantize_layer(
 
         packed_row, _states, reconstructed_inner_row = quantize_inner_matrix_direct(
             target_inner_row,
-            k=ref_layer.k,
+            k=k,
             cb=oracle.cb,
             search_backend=search_backend,
             max_pins=max_pins,
@@ -594,7 +601,7 @@ def direct_quantize_layer(
         key=module_key,
         in_features=ref_layer.in_features,
         out_features=ref_layer.out_features,
-        k=ref_layer.k,
+        k=k,
         trellis=trellis,
         suh=suh,
         svh=svh,

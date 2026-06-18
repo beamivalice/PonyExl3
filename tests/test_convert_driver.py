@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from ponyexl3.convert import driver as convert_driver
+from ponyexl3.convert.direct import DirectLayerResult
 from ponyexl3.convert.direct import write_exl3_layers_bundle
 from ponyexl3.convert.driver import (
     convert_module_set,
@@ -19,13 +21,13 @@ from ponyexl3.convert.driver import (
 from ponyexl3.ref.layer import EXL3Layer
 
 
-def _layer(key: str, *, out_tiles: int = 8) -> EXL3Layer:
+def _layer(key: str, *, out_tiles: int = 8, k: int = 4) -> EXL3Layer:
     return EXL3Layer(
         key=key,
         in_features=128,
         out_features=out_tiles * 16,
-        k=4,
-        trellis=np.zeros((8, out_tiles, 64), dtype=np.uint16),
+        k=k,
+        trellis=np.zeros((8, out_tiles, 256 * k // 16), dtype=np.uint16),
         mcg=True,
     )
 
@@ -98,6 +100,43 @@ def test_module_set_resume_loads_existing_layer(tmp_path: Path):
     assert result.completed[0]["resumed"] is True
     manifest = json.loads((out_dir / "ponyexl3_convert_manifest.json").read_text(encoding="utf-8"))
     assert manifest["completed"][0]["resumed"] is True
+
+
+def test_module_set_bit_plan_overrides_emitted_k(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    key = "model.language_model.layers.0.linear_attn.in_proj_qkv"
+    out_dir = tmp_path / "out"
+
+    def fake_convert_one(*args, **kwargs):  # noqa: ARG001
+        quant_bits = kwargs["quant_bits"]
+        layer = _layer(key, k=quant_bits)
+        return DirectLayerResult(
+            module_key=key,
+            search_backend="cpu",
+            scale_mode="identity",
+            layer=layer,
+            activations=np.zeros((1, layer.in_features), dtype=np.float32),
+            source_output=np.zeros((1, layer.out_features), dtype=np.float32),
+            converted_output=np.zeros((1, layer.out_features), dtype=np.float32),
+            stats={"output_rel_rms": 0.0, "public_rel_rms": 0.0},
+        )
+
+    monkeypatch.setattr(convert_driver, "_convert_one", fake_convert_one)
+
+    result = convert_driver.convert_module_set(
+        tmp_path / "source",
+        tmp_path / "oracle",
+        [key],
+        quantizer="direct",
+        out_dir=out_dir,
+        search_backend="cpu",
+        scale_mode="identity",
+        bit_plan={key: 5},
+    )
+
+    assert result.loaded_layers[0].k == 5
+    assert result.completed[0]["k"] == 5
+    manifest = json.loads((out_dir / "ponyexl3_convert_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["bit_plan"] == {key: 5}
 
 
 MINICPM_SOURCE = Path("/Users/beam/llm/models/MiniCPM5-1B")

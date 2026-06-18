@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from ponyexl3.cli._generate_common import build_prefill_prompt_ids, resolve_prompt_file
+from ponyexl3.cli.convert import _parse_layer_bit_overrides
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,19 @@ def test_generate_bench_invalid_prefill_sizes():
     )
     assert proc.returncode != 0
     assert "invalid --prefill-sizes" in proc.stderr or "invalid --prefill-sizes" in proc.stdout
+
+
+def test_convert_layer_bit_override_parser():
+    modules = [
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.mlp.down_proj",
+    ]
+
+    assert _parse_layer_bit_overrides([r"self_attn\..*_proj:5"], modules) == {
+        "model.layers.0.self_attn.q_proj": 5,
+    }
+    with pytest.raises(ValueError, match="matched no selected modules"):
+        _parse_layer_bit_overrides(["nope:5"], modules)
 
 
 def test_generate_bench_missing_prompt_file():
