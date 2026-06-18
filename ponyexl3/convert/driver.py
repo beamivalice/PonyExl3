@@ -255,6 +255,7 @@ def _convert_one(
     regularization_seed: int,
     quant_bits: int | None,
     compare_oracle: bool,
+    fast_metrics: bool,
 ) -> DirectLayerResult:
     module_activations = activation_for_module(
         calibration_activations,
@@ -287,6 +288,7 @@ def _convert_one(
         regularization_seed=regularization_seed,
         quant_bits=quant_bits,
         compare_oracle=compare_oracle,
+        fast_metrics=fast_metrics,
     )
 
 
@@ -309,6 +311,7 @@ def convert_module_set(
     buf_size_rows: int = 128,
     feedback_rows: int = 16,
     compare_oracle: bool = True,
+    fast_metrics: bool = False,
     skip_unsupported: bool = True,
     asset_dir: str | Path | None = None,
     resume: bool = False,
@@ -338,6 +341,7 @@ def convert_module_set(
                 "scale_mode": scale_mode,
                 "feedback_rows": feedback_rows,
                 "compare_oracle": compare_oracle,
+                "fast_metrics": fast_metrics,
                 "bit_plan_enabled": bool(planned_bits),
             },
         )
@@ -409,6 +413,7 @@ def convert_module_set(
                 regularization_seed=regularization_seed,
                 quant_bits=planned_bits.get(key),
                 compare_oracle=compare_oracle,
+                fast_metrics=fast_metrics,
             )
         except (KeyError, ValueError, FileNotFoundError) as exc:
             if not skip_unsupported:
@@ -481,6 +486,7 @@ def convert_module_set(
             "buf_size_rows": buf_size_rows,
             "feedback_rows": feedback_rows,
             "compare_oracle": compare_oracle,
+            "fast_metrics": fast_metrics,
             "resume": resume,
             "calibration_rows": 0
             if calibration_activations is None

@@ -64,6 +64,27 @@ def test_convert_layer_bit_override_parser():
         _parse_layer_bit_overrides(["nope:5"], modules)
 
 
+def test_convert_oracle_metrics_requires_full_layer_metrics():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ponyexl3.cli.convert",
+            "--in-dir",
+            "/tmp",
+            "--oracle-dir",
+            "/tmp",
+            "--ldlq-layer",
+            "--oracle-metrics",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "--oracle-metrics requires --full-layer-metrics" in proc.stderr
+
+
 def test_generate_bench_missing_prompt_file():
     proc = subprocess.run(
         [

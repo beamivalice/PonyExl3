@@ -277,9 +277,36 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--skip-oracle-metrics",
+        "--oracle-metrics",
+        dest="oracle_metrics",
         action="store_true",
-        help="skip expensive oracle dequantization metrics in LDLQ conversion",
+        default=False,
+        help="compute expensive oracle dequantization metrics in LDLQ conversion",
+    )
+    parser.add_argument(
+        "--skip-oracle-metrics",
+        dest="oracle_metrics",
+        action="store_false",
+        help="skip expensive oracle dequantization metrics in LDLQ conversion (default)",
+    )
+    parser.add_argument(
+        "--fast-layer-metrics",
+        dest="fast_layer_metrics",
+        action="store_true",
+        default=True,
+        help=(
+            "skip full reconstructed-public/output/proxy diagnostics in LDLQ conversion; "
+            "default production speed path"
+        ),
+    )
+    parser.add_argument(
+        "--full-layer-metrics",
+        dest="fast_layer_metrics",
+        action="store_false",
+        help=(
+            "compute full reconstructed-public/output/proxy diagnostics in LDLQ conversion; "
+            "required with --oracle-metrics"
+        ),
     )
     parser.add_argument("--resume", action="store_true", help="reserved for full conversion")
     parser.add_argument(
@@ -310,6 +337,9 @@ def main() -> int:
         layer_modes = int(args.direct_window) + int(args.direct_layer) + int(args.ldlq_layer)
         if layer_modes > 1:
             raise ValueError("--direct-window, --direct-layer, and --ldlq-layer are mutually exclusive")
+        ldlq_fast_metrics = bool(args.ldlq_layer and args.fast_layer_metrics)
+        if args.oracle_metrics and ldlq_fast_metrics:
+            raise ValueError("--oracle-metrics requires --full-layer-metrics")
         allocation_requested = bool(
             args.use_bit_allocation or args.allocation_dry_run or args.layer_bits
         )
@@ -415,7 +445,8 @@ def main() -> int:
                     sigma_reg=args.sigma_reg,
                     buf_size_rows=args.buf_size_rows,
                     feedback_rows=args.ldlq_feedback_rows,
-                    compare_oracle=not args.skip_oracle_metrics,
+                    compare_oracle=bool(args.oracle_metrics),
+                    fast_metrics=ldlq_fast_metrics,
                     resume=bool(args.resume),
                     calibration_activations=calibration_activations,
                     calibration_activations_by_module=calibration_activations_by_module,
@@ -445,7 +476,8 @@ def main() -> int:
                     "sigma_reg": args.sigma_reg,
                     "buf_size_rows": args.buf_size_rows,
                     "ldlq_feedback_rows": args.ldlq_feedback_rows,
-                    "oracle_metrics": not args.skip_oracle_metrics,
+                    "oracle_metrics": bool(args.oracle_metrics),
+                    "fast_layer_metrics": ldlq_fast_metrics,
                     "resume": bool(args.resume),
                     "calibration_activations": None
                     if args.calibration_activations is None
@@ -477,7 +509,7 @@ def main() -> int:
                         continue
                     stats = item["stats"]
                     print(
-                        f"  {item['module']}: output={stats['output_rel_rms']:.6f} "
+                        f"  {item['module']}: output={stats.get('output_rel_rms', float('nan')):.6f} "
                         f"proxy={stats.get('hessian_proxy_rel_rms', float('nan')):.6f}"
                     )
                 return 0
@@ -500,7 +532,8 @@ def main() -> int:
                     sigma_reg=args.sigma_reg,
                     buf_size_rows=args.buf_size_rows,
                     feedback_rows=args.ldlq_feedback_rows,
-                    compare_oracle=not args.skip_oracle_metrics,
+                    compare_oracle=bool(args.oracle_metrics),
+                    fast_metrics=ldlq_fast_metrics,
                     calibration_activations=calibration_activations,
                     skip_g_scale=bool(args.skip_g_scale),
                     regularization_seed=args.regularization_seed,
@@ -530,7 +563,8 @@ def main() -> int:
                 "sigma_reg": args.sigma_reg,
                 "buf_size_rows": args.buf_size_rows,
                 "ldlq_feedback_rows": args.ldlq_feedback_rows,
-                "oracle_metrics": not args.skip_oracle_metrics,
+                "oracle_metrics": bool(args.oracle_metrics),
+                "fast_layer_metrics": ldlq_fast_metrics,
                 "resume": bool(args.resume),
                 "calibration_activations": None
                 if args.calibration_activations is None

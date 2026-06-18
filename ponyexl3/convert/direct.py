@@ -381,7 +381,8 @@ def quantize_inner_matrix_direct(
     search_backend: SearchBackend = "metal",
     max_pins: int = 4,
     verify_roundtrip: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return_states: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
     """Quantize an inner-domain matrix tilewise, without LDL error feedback."""
 
     kernel_tiles = _inner_to_kernel_tiles(inner.astype(np.float32, copy=False))
@@ -410,7 +411,7 @@ def quantize_inner_matrix_direct(
         if not np.array_equal(roundtrip.astype(np.uint16), states):
             raise AssertionError("direct quantization produced non-round-trippable trellis")
     reconstructed_inner = _kernel_tiles_to_inner(decoded_tiles, inner.shape[0], inner.shape[1])
-    return packed, states, reconstructed_inner
+    return packed, states if return_states else None, reconstructed_inner
 
 
 def direct_quantize_window(
@@ -476,6 +477,7 @@ def direct_quantize_window(
     x = fixture.activations[:, in_start : in_start + HAD_DIM].astype(np.float32)
     source_y = x @ source_public.astype(np.float32)
     converted_y = x @ reconstructed_public.astype(np.float32)
+    assert _states is not None
     stats: dict[str, float | bool] = {
         "inner_mse": _mse(reconstructed_inner, target_inner),
         "inner_rel_rms": _rel_rms(reconstructed_inner, target_inner),

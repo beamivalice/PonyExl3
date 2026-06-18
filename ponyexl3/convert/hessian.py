@@ -61,7 +61,7 @@ class LDLQResult:
     """One LDLQ-quantized inner-domain matrix."""
 
     packed: np.ndarray
-    states: np.ndarray
+    states: np.ndarray | None
     reconstructed: np.ndarray
     stats: dict[str, float | bool]
 
@@ -259,6 +259,8 @@ def ldlq_inner_matrix(
     buf_size_rows: int = 128,
     feedback_rows: int = 16,
     max_pins: int = 4,
+    collect_states: bool = True,
+    compute_proxy: bool = True,
 ) -> LDLQResult:
     """Reverse 16-row LDLQ over an EXL3 inner-domain matrix."""
 
@@ -284,7 +286,7 @@ def ldlq_inner_matrix(
     tiles_n = cols // 16
     packed_size = 256 * k // 16
     packed = np.empty((tiles_k, tiles_n, packed_size), dtype=np.uint16)
-    states = np.empty((tiles_k, tiles_n, 256), dtype=np.uint16)
+    states = np.empty((tiles_k, tiles_n, 256), dtype=np.uint16) if collect_states else None
     reconstructed = np.zeros_like(weight, dtype=np.float32)
     prod_cache = np.zeros_like(weight, dtype=np.float32)
 
@@ -315,11 +317,13 @@ def ldlq_inner_matrix(
                 cb=cb,
                 search_backend=search_backend,
                 max_pins=max_pins,
+                return_states=collect_states,
             )
             tk = (i + bi) // 16
             tk1 = tk + (bj - bi) // 16
             packed[tk:tk1] = block_packed
-            states[tk:tk1] = block_states
+            if states is not None and block_states is not None:
+                states[tk:tk1] = block_states
             b_reconstructed[bi:bj] = block_reconstructed
 
         b_err = b_weight - b_reconstructed
@@ -336,7 +340,7 @@ def ldlq_inner_matrix(
         "pack_roundtrip": True,
         "ldlq_feedback_rows": float(feedback_rows),
     }
-    if hessian is not None:
+    if hessian is not None and compute_proxy:
         proxy = hessian_proxy_stats(delta, hessian, reference=weight)
         stats.update(
             {
@@ -370,8 +374,12 @@ def ldlq_quantize_layer(
     regularization_seed: int = 0,
     quant_bits: int | None = None,
     compare_oracle: bool = True,
+    fast_metrics: bool = False,
 ) -> DirectLayerResult:
     """Quantize one full linear module with activation-aware LDLQ."""
+
+    if fast_metrics and compare_oracle:
+        raise ValueError("fast_metrics requires compare_oracle=False")
 
     fixture = build_layer_fixture(
         source_dir,
@@ -418,6 +426,8 @@ def ldlq_quantize_layer(
         buf_size_rows=buf_size_rows,
         feedback_rows=feedback_rows,
         max_pins=max_pins,
+        collect_states=False,
+        compute_proxy=not fast_metrics,
     )
 
     out_layer = EXL3Layer(
@@ -433,78 +443,98 @@ def ldlq_quantize_layer(
     )
     out_layer.validate()
 
-    reconstructed_public = inner_matrix_to_public(
-        quantized.reconstructed,
-        suh=suh,
-        svh=svh,
-    )
-
     x = fixture.activations.astype(np.float32)
-    source_y = x @ source_public
-    converted_y = x @ reconstructed_public
-    public_delta = reconstructed_public - source_public
-    output_delta = converted_y - source_y
-    public_sse = float(np.sum(public_delta * public_delta))
     public_ref_ss = float(np.sum(source_public * source_public))
-    output_sse = float(np.sum(output_delta * output_delta))
-    output_ref_ss = float(np.sum(source_y * source_y))
 
     stats = dict(quantized.stats)
     stats.update(
         {
-            "public_mse": mse_from_sse(public_sse, int(source_public.size)),
-            "public_rel_rms": rel_rms_from_sse(
-                public_sse,
-                public_ref_ss,
-                int(source_public.size),
-            ),
-            "output_mse": mse_from_sse(output_sse, int(source_y.size)),
-            "output_rel_rms": rel_rms_from_sse(output_sse, output_ref_ss, int(source_y.size)),
             "hessian_diag_mean": prepared.diag_mean,
             "ldl_retries": float(ldl.retries),
             "oracle_metrics": bool(compare_oracle),
+            "fast_metrics": bool(fast_metrics),
         }
     )
-    if compare_oracle:
-        oracle_inner, oracle_public = oracle_comparison_weights(ref_layer, suh=suh, svh=svh)
-        oracle_y = x @ oracle_public
-        oracle_public_delta = oracle_public - source_public
-        oracle_output_delta = oracle_y - source_y
-        oracle_public_sse = float(np.sum(oracle_public_delta * oracle_public_delta))
-        oracle_output_sse = float(np.sum(oracle_output_delta * oracle_output_delta))
-        oracle_proxy = hessian_proxy_stats(
-            oracle_inner - target_inner,
-            prepared.hessian,
-            reference=target_inner,
-        )
-        converted_proxy_rel = float(quantized.stats.get("hessian_proxy_rel_rms", float("nan")))
-        oracle_proxy_rel = oracle_proxy.proxy_rel_rms
+    if fast_metrics:
+        source_y = np.empty((0, 0), dtype=np.float32)
+        converted_y = np.empty((0, 0), dtype=np.float32)
         stats.update(
             {
-                "oracle_public_mse": mse_from_sse(oracle_public_sse, int(source_public.size)),
-                "oracle_public_rel_rms": rel_rms_from_sse(
-                    oracle_public_sse,
+                "public_mse": float("nan"),
+                "public_rel_rms": float("nan"),
+                "output_mse": float("nan"),
+                "output_rel_rms": float("nan"),
+            }
+        )
+    else:
+        reconstructed_public = inner_matrix_to_public(
+            quantized.reconstructed,
+            suh=suh,
+            svh=svh,
+        )
+        source_y = x @ source_public
+        converted_y = x @ reconstructed_public
+        public_delta = reconstructed_public - source_public
+        output_delta = converted_y - source_y
+        public_sse = float(np.sum(public_delta * public_delta))
+        output_sse = float(np.sum(output_delta * output_delta))
+        output_ref_ss = float(np.sum(source_y * source_y))
+        stats.update(
+            {
+                "public_mse": mse_from_sse(public_sse, int(source_public.size)),
+                "public_rel_rms": rel_rms_from_sse(
+                    public_sse,
                     public_ref_ss,
                     int(source_public.size),
                 ),
-                "oracle_output_mse": mse_from_sse(oracle_output_sse, int(source_y.size)),
-                "oracle_output_rel_rms": rel_rms_from_sse(
-                    oracle_output_sse,
+                "output_mse": mse_from_sse(output_sse, int(source_y.size)),
+                "output_rel_rms": rel_rms_from_sse(
+                    output_sse,
                     output_ref_ss,
                     int(source_y.size),
                 ),
-                "oracle_hessian_proxy_sse": oracle_proxy.proxy_sse,
-                "oracle_hessian_proxy_mse": oracle_proxy.proxy_mse,
-                "oracle_hessian_proxy_rel_rms": oracle_proxy_rel,
-                "hessian_proxy_rel_rms_over_oracle": float(
-                    converted_proxy_rel / (oracle_proxy_rel + 1e-20)
-                ),
-                "output_rel_rms_over_oracle": float(
-                    np.sqrt(mse_from_sse(output_sse, int(source_y.size)))
-                    / (np.sqrt(mse_from_sse(oracle_output_sse, int(source_y.size))) + 1e-20)
-                ),
             }
         )
+        if compare_oracle:
+            oracle_inner, oracle_public = oracle_comparison_weights(ref_layer, suh=suh, svh=svh)
+            oracle_y = x @ oracle_public
+            oracle_public_delta = oracle_public - source_public
+            oracle_output_delta = oracle_y - source_y
+            oracle_public_sse = float(np.sum(oracle_public_delta * oracle_public_delta))
+            oracle_output_sse = float(np.sum(oracle_output_delta * oracle_output_delta))
+            oracle_proxy = hessian_proxy_stats(
+                oracle_inner - target_inner,
+                prepared.hessian,
+                reference=target_inner,
+            )
+            converted_proxy_rel = float(quantized.stats.get("hessian_proxy_rel_rms", float("nan")))
+            oracle_proxy_rel = oracle_proxy.proxy_rel_rms
+            stats.update(
+                {
+                    "oracle_public_mse": mse_from_sse(oracle_public_sse, int(source_public.size)),
+                    "oracle_public_rel_rms": rel_rms_from_sse(
+                        oracle_public_sse,
+                        public_ref_ss,
+                        int(source_public.size),
+                    ),
+                    "oracle_output_mse": mse_from_sse(oracle_output_sse, int(source_y.size)),
+                    "oracle_output_rel_rms": rel_rms_from_sse(
+                        oracle_output_sse,
+                        output_ref_ss,
+                        int(source_y.size),
+                    ),
+                    "oracle_hessian_proxy_sse": oracle_proxy.proxy_sse,
+                    "oracle_hessian_proxy_mse": oracle_proxy.proxy_mse,
+                    "oracle_hessian_proxy_rel_rms": oracle_proxy_rel,
+                    "hessian_proxy_rel_rms_over_oracle": float(
+                        converted_proxy_rel / (oracle_proxy_rel + 1e-20)
+                    ),
+                    "output_rel_rms_over_oracle": float(
+                        np.sqrt(mse_from_sse(output_sse, int(source_y.size)))
+                        / (np.sqrt(mse_from_sse(oracle_output_sse, int(source_y.size))) + 1e-20)
+                    ),
+                }
+            )
     stats.update(basis.stats)
     return DirectLayerResult(
         module_key=module_key,

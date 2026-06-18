@@ -172,6 +172,30 @@ def test_ldlq_rejects_invalid_feedback_rows():
         )
 
 
+def test_ldlq_can_skip_diagnostic_state_and_proxy():
+    rng = np.random.default_rng(107)
+    inner = (rng.standard_normal((32, 32)) * 0.05).astype(np.float32)
+    activations = rng.standard_normal((64, 32)).astype(np.float32)
+    prepared = prepare_hessian_for_ldl(capture_hessian(activations))
+
+    result = ldlq_inner_matrix(
+        inner,
+        np.eye(32, dtype=np.float32),
+        k=2,
+        cb=CodebookMode.DEFAULT,
+        hessian=prepared.hessian,
+        search_backend="cpu",
+        buf_size_rows=32,
+        collect_states=False,
+        compute_proxy=False,
+    )
+
+    assert result.states is None
+    assert "hessian_proxy_rel_rms" not in result.stats
+    assert result.packed.shape == (2, 2, 32)
+    assert result.reconstructed.shape == inner.shape
+
+
 def test_public_matrix_to_inner_identity_mode_is_noop():
     rng = np.random.default_rng(105)
     public = rng.standard_normal((128, 128)).astype(np.float32)
