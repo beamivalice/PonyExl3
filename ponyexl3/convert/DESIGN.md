@@ -3,7 +3,7 @@
 Updated 2026-06-18. Status: **M1 complete, M2 complete, M3b direct full-layer
 emit/load gate complete, M4 complete for selected-module/layer-set LDLQ emit,
 post-M4 computed-scale/calibration inputs complete, MiniCPM5 direct full-model
-conversion/load gated, and M5a scaffolded**
+conversion/load/KLD gated, and M5a scaffolded**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`,
 `tests/test_convert_hessian.py`, `tests/test_convert_driver.py`,
 `tests/test_convert_regularize.py`, `tests/test_convert_calibration.py`,
@@ -59,6 +59,17 @@ Current checkpoint-backed pilot:
   mapping. Full direct/oracle-scale conversion took `428 s`; the fast
   `model.layers.0.self_attn.q_proj` gate dropped from `24.6 s` to about
   `0.95 s` after eliminating CPU packed-trellis decode from metric paths.
+  KLD proof used `/Users/beam/llm/kld-eval` with the BF16 original as the
+  reference distribution over `4 x 512` tokens. Original-vs-original
+  self-control is `KLD=0.000000`; official oracle-vs-original is
+  `KLD=0.042778`, `p95=0.145305`, `p99=0.315975`, `ΔPPL=+0.243127`,
+  `ΔAcc@1=+0.002446`; converted-vs-original is `KLD=0.098458`,
+  `p95=0.307598`, `p99=0.658334`, `ΔPPL=+0.879679`,
+  `ΔAcc@1=-0.000000`. The converted bundle is sane, but still about
+  `2.30x` the oracle's KLD on this small sample; M5b measured allocation and
+  LDLQ/calibration quality work should use this original-reference gate.
+  Converted-vs-oracle (`KLD=0.116699`) remains only a diagnostic, not the
+  main acceptance metric.
 
 ---
 
@@ -377,13 +388,25 @@ degenerate H / odd layers); MCG/MUL1 codebook flags (DEFAULT suffices for
 new conversions); README for converted models (recommend the Phase-26
 runtime env, e.g. EXL3_WCACHE default).
 
-## Runtime expectations (M5 Max, post-M2 target)
+## Runtime Expectations
 
-| model | search | total (1 pass, incl. Hessian+LDLQ) |
-|---|---|---|
-| 2B | ~4 min | ~1-2 h |
-| 27B | ~50 min | overnight |
-| 35B-A3B | ~1 h (experts are small tiles) | overnight |
+Measured on the current M5 Max workflow unless noted. These are wall-clock
+times for the converter, not KLD scoring. They should be treated as planning
+bounds until M5b measured allocation and the M6 layer-sequential streamer land.
+
+| scope | mode | observed / expected time | notes |
+|---|---|---:|---|
+| MiniCPM5 `model.layers.0.self_attn.q_proj` | direct, Metal, oracle-safe scales | `~0.95 s` | Fast iteration gate after removing CPU trellis decode from metrics. |
+| MiniCPM5 `model.layers.0.mlp.down_proj` | direct, Metal, oracle-safe scales | `~1.8 s` | Representative small smoke module with live progress output. |
+| MiniCPM5-1B full model | direct, Metal, oracle-safe scales | `428 s` (`7.1 min`) | `169` EXL3 linears + `50` plain tensors; strict-loadable output. |
+| Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
+| Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |
+| Qwen3.6-35B-A3B full model | current fixture-style path | overnight expected | M5b/M6 should add measured allocation, block-sequential calibration, resume, and better progress before relying on this path. |
+
+KLD scoring is much faster for MiniCPM-sized windows: original reference
+generation for `4 x 512` tokens took `1.49 s`, oracle-vs-original compare took
+`1.39 s`, and converted-vs-original compare took `1.40 s`; saved reference
+windows are large (`~510 MB` for `4 x 512`).
 
 ## Open questions for the implementer
 

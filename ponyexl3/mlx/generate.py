@@ -17,6 +17,12 @@ import mlx.core as mx
 from ponyexl3.types import DraftModule, KvCache, MlxLmModel, Tokenizer
 
 
+def _lm_parts(model: Any) -> tuple[Any, Any, Any]:
+    lm = getattr(model, "language_model", model)
+    inner = getattr(lm, "model", lm)
+    return lm, inner, lm.lm_head
+
+
 def max_position_embeddings(config: dict[str, Any]) -> int | None:
     text_cfg = config.get("text_config", config)
     limit = text_cfg.get("max_position_embeddings")
@@ -112,29 +118,28 @@ def stream_generate(
     eos_ids: set[int] | frozenset[int] = frozenset(),
     stats: GenStats | None = None,
 ) -> Iterator[int]:
-    """Yield generated token ids one at a time. ``model`` is the mlx_lm-style
-    top-level Model (``model.language_model.{model,lm_head}``)."""
+    """Yield generated token ids one at a time from wrapped or bare mlx_lm models."""
     validate_generation_params(
         prompt_ids,
         max_tokens=max_tokens,
         prefill_chunk=prefill_chunk,
     )
-    lm = model.language_model
+    lm, inner, lm_head = _lm_parts(model)
     cache = lm.make_cache()
     stats = stats if stats is not None else GenStats()
     stats.prompt_tokens = len(prompt_ids)
 
     tic = time.perf_counter()
     toks = mx.array([prompt_ids])
-    h = _prefill_hidden(lm.model, toks, cache, chunk=prefill_chunk)
+    h = _prefill_hidden(inner, toks, cache, chunk=prefill_chunk)
     mx.eval(h)
-    logits = lm.lm_head(h[:, -1:, :])
+    logits = lm_head(h[:, -1:, :])
     mx.eval(logits)
     stats.prefill_s = time.perf_counter() - tic
 
     def _step(prev_y: mx.array) -> mx.array:
-        h = lm.model(prev_y[:, None], cache=cache)
-        return lm.lm_head(h)
+        h = inner(prev_y[:, None], cache=cache)
+        return lm_head(h)
 
     # Pipelined decode: while the host syncs on token t (item() + detokenize),
     # the GPU is already running step t+1.
@@ -1048,6 +1053,7 @@ def generate_text(
             prompt_ids = tokenizer.encode(prompt)
     else:
         prompt_ids = list(prompt_ids)
+    prompt_ids = list(cast(list[int], prompt_ids))
 
     using_spec = bool(
         dflash is not None
@@ -1056,7 +1062,7 @@ def generate_text(
         or (lookup and temp <= 0.0)
     )
     validate_generation_params(
-        list(prompt_ids),
+        prompt_ids,
         max_tokens=max_tokens,
         prefill_chunk=prefill_chunk,
         num_draft=num_draft,
@@ -1076,7 +1082,7 @@ def generate_text(
         gen = dflash_stream_generate(
             model,
             dflash,
-            list(prompt_ids),
+            prompt_ids,
             max_tokens=max_tokens,
             num_draft=num_draft,
             prefill_chunk=prefill_chunk,
@@ -1088,7 +1094,7 @@ def generate_text(
         gen = eagle3_stream_generate(
             model,
             eagle3,
-            list(prompt_ids),
+            prompt_ids,
             max_tokens=max_tokens,
             num_draft=num_draft,
             prefill_chunk=prefill_chunk,
@@ -1100,7 +1106,7 @@ def generate_text(
         gen = speculative_stream_generate(
             model,
             mtp,
-            list(prompt_ids),
+            prompt_ids,
             max_tokens=max_tokens,
             num_draft=num_draft,
             prefill_chunk=prefill_chunk,
@@ -1111,7 +1117,7 @@ def generate_text(
     elif lookup and temp <= 0.0:
         gen = lookup_stream_generate(
             model,
-            list(prompt_ids),
+            prompt_ids,
             max_tokens=max_tokens,
             num_draft=num_draft,
             prefill_chunk=prefill_chunk,
@@ -1121,7 +1127,7 @@ def generate_text(
     else:
         gen = stream_generate(
             model,
-            list(prompt_ids),
+            prompt_ids,
             max_tokens=max_tokens,
             temp=temp,
             prefill_chunk=prefill_chunk,
