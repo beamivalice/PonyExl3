@@ -1,8 +1,8 @@
 """HF -> EXL3 converter bring-up CLI.
 
-The current implementation is the fast oracle-comparable tile pilot.  It
-quantizes one 16x16 tile from a source checkpoint and compares it to the same
-tile in an existing EXL3 oracle checkpoint.
+The default mode is the fast oracle-comparable tile pilot.  `--direct-window`
+quantizes one 128x128 Hadamard block and can emit a minimal loadable EXL3
+bundle for the current M3 direct-conversion sprint.
 """
 
 from __future__ import annotations
@@ -39,6 +39,13 @@ def main() -> int:
     )
     parser.add_argument("--tile-k", type=int, default=0, help="input tile index")
     parser.add_argument("--tile-n", type=int, default=0, help="output tile index")
+    parser.add_argument("--block-k", type=int, default=0, help="128-row block index for direct mode")
+    parser.add_argument("--block-n", type=int, default=0, help="128-column block index for direct mode")
+    parser.add_argument(
+        "--direct-window",
+        action="store_true",
+        help="directly quantize one 128x128 block instead of one 16x16 tile",
+    )
     parser.add_argument(
         "--search-backend",
         choices=("cpu", "metal"),
@@ -50,6 +57,64 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        if args.direct_window:
+            from ponyexl3.convert.direct import (
+                direct_quantize_window,
+                direct_window_summary,
+                write_direct_window_bundle,
+            )
+
+            result = direct_quantize_window(
+                args.in_dir,
+                args.oracle_dir,
+                args.only_module,
+                in_start=args.block_k * 128,
+                out_start=args.block_n * 128,
+                search_backend=args.search_backend,
+            )
+            summary = direct_window_summary(result)
+            summary["requested"] = {
+                "bits": args.bits,
+                "head_bits": args.head_bits,
+                "codebook": args.codebook,
+                "out_dir": None if args.out_dir is None else str(args.out_dir),
+                "work_dir": None if args.work_dir is None else str(args.work_dir),
+                "only_layer": args.only_layer,
+                "search_backend": args.search_backend,
+                "resume": bool(args.resume),
+            }
+            if args.out_dir is not None:
+                loaded = write_direct_window_bundle(result, args.out_dir)
+                summary["emitted"] = {
+                    "out_dir": str(args.out_dir),
+                    "loaded_shape": [loaded.in_features, loaded.out_features],
+                    "trellis_shape": [int(x) for x in loaded.trellis.shape],
+                }
+            if args.json:
+                print(json.dumps(summary, indent=2, sort_keys=True))
+                return 0
+            stats = summary["stats"]
+            print(f"module: {summary['module']}")
+            print(
+                f"block: [{args.block_k}, {args.block_n}]  "
+                f"shape={summary['shape']}  K={summary['k']}  "
+                f"codebook={summary['codebook']}  backend={summary['search_backend']}"
+            )
+            print(
+                "public rel RMS: "
+                f"{stats['public_rel_rms']:.6f}  output rel RMS: {stats['output_rel_rms']:.6f}"
+            )
+            print(
+                "MSE: "
+                f"inner={stats['inner_mse']:.6e}  "
+                f"public={stats['public_mse']:.6e}  "
+                f"output={stats['output_mse']:.6e}"
+            )
+            print(f"pack roundtrip: {stats['pack_roundtrip']}")
+            if "emitted" in summary:
+                print(f"emitted: {summary['emitted']['out_dir']}")
+            return 0
+
         result = run_tile_pilot(
             args.in_dir,
             args.oracle_dir,

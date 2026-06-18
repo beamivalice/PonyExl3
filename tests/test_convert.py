@@ -11,7 +11,9 @@ from ponyexl3.convert.fixtures import (
     resolve_source_linear,
     run_tile_pilot,
 )
+from ponyexl3.convert.direct import direct_quantize_window, write_direct_window_bundle
 from ponyexl3.convert.reference_search import quantize_tile_reference
+from ponyexl3.ref.reconstruct import reconstruct_public_weights
 from ponyexl3.ref.trellis import pack_trellis_tile, unpack_trellis_tile
 
 
@@ -117,6 +119,44 @@ def test_one_tile_pilot_metal_backend_compares_with_oracle():
     assert result.stats["oracle_pack_roundtrip"] is True
     assert np.isfinite(result.converted_tile).all()
     assert result.stats["converted_target_mse"] < 0.05
+
+
+@pytest.mark.skipif(
+    not (
+        (SOURCE_35B / "model.safetensors.index.json").is_file()
+        and (ORACLE_35B / "quantization_config.json").is_file()
+        and _metal_available()
+    ),
+    reason="local Qwen3.6-35B-A3B checkpoints or Metal are not present",
+)
+def test_direct_window_emits_loadable_mini_layer(tmp_path):
+    result = direct_quantize_window(
+        SOURCE_35B,
+        ORACLE_35B,
+        PILOT_MODULE,
+        search_backend="metal",
+    )
+    assert result.layer.in_features == 128
+    assert result.layer.out_features == 128
+    assert result.layer.trellis.shape == (8, 8, 64)
+    assert result.stats["pack_roundtrip"] is True
+    assert result.stats["public_rel_rms"] < 0.12
+    assert result.stats["output_rel_rms"] < 0.12
+
+    loaded = write_direct_window_bundle(result, tmp_path)
+    assert loaded.key == PILOT_MODULE
+    assert loaded.in_features == 128
+    assert loaded.out_features == 128
+    assert loaded.k == result.layer.k
+    loaded_public = reconstruct_public_weights(
+        loaded.trellis,
+        loaded.suh,
+        loaded.svh,
+        loaded.k,
+        mcg=loaded.mcg,
+        mul1=loaded.mul1,
+    ).astype(np.float32)
+    np.testing.assert_array_equal(loaded_public, result.reconstructed_public)
 
 
 @pytest.mark.skipif(

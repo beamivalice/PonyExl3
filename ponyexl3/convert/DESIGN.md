@@ -1,6 +1,7 @@
 # pony-quant: HF → EXL3 converter — engineering roadmap (handoff)
 
-Updated 2026-06-18. Status: **M1 complete, M2 Metal trellis search complete**
+Updated 2026-06-18. Status: **M1 complete, M2 complete, M3a direct-window
+emit/load gate complete**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`).
 
 Goal: accept a HuggingFace checkpoint (safetensors), emit an EXL3 checkpoint
@@ -28,6 +29,10 @@ Current checkpoint-backed pilot:
   converted target MSE `4.659796e-03`, oracle target MSE `8.931810e-03`,
   converted rel-RMS `0.065796`, oracle rel-RMS `0.091093`, pack round-trip
   `True`.
+- Latest M3 direct-window result on the fast 128×128 block:
+  public rel-RMS `0.067390`, output rel-RMS `0.070094`, inner MSE
+  `5.283837e-03`, public MSE `1.360480e-06`, output MSE `1.704962e-04`,
+  mini bundle reloads through `load_exl3_layer`.
 
 ---
 
@@ -50,7 +55,7 @@ Current checkpoint-backed pilot:
    against each other. Real checkpoints are the only arbiter for format
    conventions.
 
-## What exists now (M1 + M2)
+## What exists now (M1 + M2 + M3a)
 
 - `convert/reference_search.py` — exact numpy Viterbi, any K∈[1,8], any
   codebook mode; tail-biting via pinned re-passes; ~0.5-2 s/tile. This is
@@ -69,8 +74,14 @@ Current checkpoint-backed pilot:
   K≥4 keeps costs in threadgroup memory; K=2/3 uses device cost scratch.
   Batches are split by `max_scratch_bytes` to bound backpointer/cost scratch.
 - `cli/convert.py` / `ponyexl3-convert` — current CLI is the oracle-comparable
-  one-tile pilot. It accepts `--search-backend cpu|metal`; CPU remains the
-  stable default, Metal is the M2 backend.
+  one-tile pilot by default. It accepts `--search-backend cpu|metal`; CPU
+  remains the stable default. `--direct-window` runs the M3 direct 128×128
+  block quantizer and writes a minimal loadable EXL3 bundle when `--out-dir`
+  is provided.
+- `convert/direct.py` — no-LDL direct conversion for one 128×128 Hadamard
+  block: source BF16 public block → oracle-scale inner block → M2 tile
+  quantization → mini `EXL3Layer` → optional safetensors bundle +
+  `quantization_config.json`/`model.safetensors.index.json` reload gate.
 - `tests/test_convert.py` — transition invariant + bit round-trip +
   MSE bounds, k∈{2,3}, BF16 reader gate, Qwen source adapter gate, CPU
   one-tile oracle gate, guarded Metal one-tile oracle gate, and expected
@@ -82,7 +93,7 @@ Current checkpoint-backed pilot:
   rejection.
 - Verification as of 2026-06-18:
   `python -m pytest tests/test_convert.py tests/test_convert_metal.py -q`
-  → 19 passed; `python -m pyright ponyexl3/convert ponyexl3/cli/convert.py
+  → 20 passed; `python -m pyright ponyexl3/convert ponyexl3/cli/convert.py
   tests/test_convert.py tests/test_convert_metal.py` → clean.
 
 ---
@@ -150,11 +161,16 @@ Original kernel constraints still apply:
 
 ## M3 — Regularize + direct one-linear conversion, then Hessian + LDLQ
 
+Status: **M3a complete for one 128×128 window**. The current direct path
+does not yet regularize or choose scales; it borrows oracle `suh`/`svh` for
+the selected Hadamard block so storage, reconstruction, output-space metrics,
+and loader compatibility are gated before adding scale search.
+
 Next milestone should stay on the same lightweight pilot before expanding:
 
-1. Port the no-LDL direct path first for
-   `model.language_model.layers.0.linear_attn.in_proj_qkv`, using the existing
-   oracle `suh`/`svh` fixture path to validate storage and output-space error.
+1. Expand direct conversion from one 128×128 window to the whole
+   `model.language_model.layers.0.linear_attn.in_proj_qkv` module, still
+   no-LDL and still using oracle or freshly computed scales for comparison.
 2. Port upstream `regularize`, `block_rms`, Hadamard transforms, MCG/default
    codebook flags, and global scale GSS. Gate with one converted EXL3 layer
    loaded through the existing `EXL3Layer`/`EXL3Linear`.
