@@ -72,6 +72,36 @@ def _pack_trellis_div16(encoded: np.ndarray, k: int) -> np.ndarray:
     return flat
 
 
+def _pack_trellis_general(encoded: np.ndarray, k: int) -> np.ndarray:
+    """Vectorized pack path for K values that do not evenly divide 16."""
+
+    mask = np.uint32((1 << k) - 1)
+    vals = (encoded.astype(np.uint32, copy=False) & mask).reshape(
+        *encoded.shape[:-1],
+        16,
+        16,
+    )
+    words = np.zeros((*encoded.shape[:-1], 16, k), dtype=np.uint32)
+    for i in range(16):
+        bit_start = i * k
+        word = bit_start // 16
+        offset = bit_start % 16
+        v = vals[..., i]
+        if offset + k <= 16:
+            words[..., word] |= v << np.uint32(16 - offset - k)
+        else:
+            high_bits = 16 - offset
+            low_bits = k - high_bits
+            words[..., word] |= v >> np.uint32(low_bits)
+            words[..., word + 1] |= (v & np.uint32((1 << low_bits) - 1)) << np.uint32(
+                16 - low_bits
+            )
+    flat = words.astype(np.uint16, copy=False).reshape(*encoded.shape[:-1], 256 * k // 16).copy()
+    pairs = flat.reshape(*flat.shape[:-1], flat.shape[-1] // 2, 2)
+    pairs[...] = pairs[..., ::-1]
+    return flat
+
+
 def unpack_trellis_tile(packed: np.ndarray, k: int) -> np.ndarray:
     """
   Unpack one trellis tile to 256 uint16 codewords.
@@ -117,12 +147,7 @@ def pack_trellis(encoded: np.ndarray, k: int) -> np.ndarray:
         raise ValueError(f"expected shape (tiles_k, tiles_n, 256), got {encoded.shape}")
     if k in (1, 2, 4, 8):
         return _pack_trellis_div16(encoded, k)
-    tiles_k, tiles_n, _ = encoded.shape
-    out = np.empty((tiles_k, tiles_n, 256 * k // 16), dtype=np.uint16)
-    for tk in range(tiles_k):
-        for tn in range(tiles_n):
-            out[tk, tn] = pack_trellis_tile(encoded[tk, tn], k)
-    return out
+    return _pack_trellis_general(encoded, k)
 
 
 def _unpack_trellis_div16(packed: np.ndarray, k: int) -> np.ndarray:
@@ -146,6 +171,37 @@ def _unpack_trellis_div16(packed: np.ndarray, k: int) -> np.ndarray:
     return out
 
 
+def _unpack_trellis_general(packed: np.ndarray, k: int) -> np.ndarray:
+    """Vectorized unpack path for K values that do not evenly divide 16."""
+
+    flat = packed.astype(np.uint16, copy=True)
+    pairs = flat.reshape(*flat.shape[:-1], flat.shape[-1] // 2, 2)
+    pairs[...] = pairs[..., ::-1]
+    words = flat.reshape(*flat.shape[:-1], 16, k).astype(np.uint32, copy=False)
+    fresh = np.empty((*packed.shape[:-1], 16, 16), dtype=np.uint32)
+    mask = np.uint32((1 << k) - 1)
+    for i in range(16):
+        bit_start = i * k
+        word = bit_start // 16
+        offset = bit_start % 16
+        if offset + k <= 16:
+            fresh[..., i] = (words[..., word] >> np.uint32(16 - offset - k)) & mask
+        else:
+            high_bits = 16 - offset
+            low_bits = k - high_bits
+            high = (words[..., word] & np.uint32((1 << high_bits) - 1)) << np.uint32(low_bits)
+            low = words[..., word + 1] >> np.uint32(16 - low_bits)
+            fresh[..., i] = (high | low) & mask
+
+    fresh_flat = fresh.reshape(*packed.shape[:-1], 256)
+    out = np.zeros_like(fresh_flat, dtype=np.uint16)
+    state = np.zeros(fresh_flat.shape[:-1], dtype=np.uint32)
+    for t in list(range(256)) * 2:
+        state = ((state << np.uint32(k)) | fresh_flat[..., t]) & np.uint32(0xFFFF)
+        out[..., t] = state.astype(np.uint16, copy=False)
+    return out
+
+
 def unpack_trellis(packed: np.ndarray, k: int) -> np.ndarray:
     """Unpack trellis tensor of shape (tiles_k, tiles_n, 256 * k // 16)."""
     if packed.ndim != 3:
@@ -155,9 +211,4 @@ def unpack_trellis(packed: np.ndarray, k: int) -> np.ndarray:
         raise ValueError(f"expected last dim {packed_size}, got {packed.shape[-1]}")
     if k in (1, 2, 4, 8):
         return _unpack_trellis_div16(packed, k)
-    tiles_k, tiles_n, _ = packed.shape
-    out = np.empty((tiles_k, tiles_n, 256), dtype=np.uint16)
-    for tk in range(tiles_k):
-        for tn in range(tiles_n):
-            out[tk, tn] = unpack_trellis_tile(packed[tk, tn], k)
-    return out
+    return _unpack_trellis_general(packed, k)

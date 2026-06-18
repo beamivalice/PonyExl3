@@ -47,7 +47,7 @@ def test_unpack_states_shift_consistent(k):
         assert states[(t + 1) % 256] >> k == (states[t] & keep), f"t={t}"
 
 
-@pytest.mark.parametrize("k", [2, 4, 8])
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_pack_unpack_roundtrip_tensor(k):
     rng = np.random.default_rng(99 + k)
     mask = (1 << k) - 1

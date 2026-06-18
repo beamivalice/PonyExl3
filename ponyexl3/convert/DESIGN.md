@@ -89,6 +89,17 @@ Current checkpoint-backed pilot:
   approximation (`--ldlq-feedback-rows 128`) did not materially improve speed
   and degraded the module output rel-RMS to `0.025153`, so exact
   `--ldlq-feedback-rows 16` remains the recommended heavy-job setting.
+- M5b LM-head speed fix:
+  K6 uses the non-divisor trellis pack path. The old tensor packer fell back
+  to a Python tile loop, leaving the GPU idle between large Metal search
+  bursts for `lm_head`. `pack_trellis`/`unpack_trellis` now have vectorized
+  general-K paths for K3/K5/K6/K7 while keeping the same public API and
+  bitstream convention. At one MiniCPM5 `lm_head` LDLQ row group
+  `(1, 8160, 256)`, K6 packing dropped from an estimated `~1.04 s` to
+  `0.0032 s` (`~328x`). Isolated MiniCPM5 `lm_head` exact LDLQ dropped from
+  the previous full-run phase time of `~2m17s` to `44.16 s`. Raising Metal
+  search scratch above `256 MB` did not improve the one-group K6 search
+  micro-benchmark, so the default scratch budget remains unchanged.
 
 ---
 
@@ -435,6 +446,7 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | MiniCPM5 `model.layers.0.mlp.down_proj` | direct, Metal, oracle-safe scales | `~1.8 s` | Representative small smoke module with live progress output. |
 | MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, Metal, `--skip-oracle-metrics` | `2.8 s` | Output rel-RMS `0.003690`; prior `56.8 s` included diagnostic oracle CPU dequantization. |
 | MiniCPM5 layer 0 (`7` modules) | exact LDLQ, Metal, `--skip-oracle-metrics` | `8.5 s` | Recommended heavy-job path; keep `--ldlq-feedback-rows 16`. |
+| MiniCPM5 `lm_head` | exact LDLQ, Metal, K6, `--skip-oracle-metrics` | `44.16 s` | After vectorized general-K trellis packing; previous full-run head phase was `~2m17s`. |
 | MiniCPM5-1B full model | direct, Metal, oracle-safe scales | `428 s` (`7.1 min`) | `169` EXL3 linears + `50` plain tensors; strict-loadable output. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |

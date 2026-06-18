@@ -15,7 +15,10 @@ from pathlib import Path
 import re
 import sys
 
-from ponyexl3.convert.calibration import load_calibration_activations
+from ponyexl3.convert.calibration import (
+    load_calibration_activations,
+    load_calibration_activations_map,
+)
 from ponyexl3.convert.fixtures import run_tile_pilot, tile_pilot_summary
 
 
@@ -244,6 +247,14 @@ def main() -> int:
         help="pre-captured 2D activations (.npy/.npz/.safetensors) for layer modes",
     )
     parser.add_argument(
+        "--calibration-activations-map",
+        type=Path,
+        help=(
+            "pre-captured per-module activations (.npz/.safetensors or directory of .npy files); "
+            "entries are keyed by module name and override --calibration-activations"
+        ),
+    )
+    parser.add_argument(
         "--search-backend",
         choices=("cpu", "metal"),
         default="cpu",
@@ -290,6 +301,11 @@ def main() -> int:
             None
             if args.calibration_activations is None
             else load_calibration_activations(args.calibration_activations)
+        )
+        calibration_activations_by_module = (
+            None
+            if args.calibration_activations_map is None
+            else load_calibration_activations_map(args.calibration_activations_map)
         )
         layer_modes = int(args.direct_window) + int(args.direct_layer) + int(args.ldlq_layer)
         if layer_modes > 1:
@@ -402,6 +418,7 @@ def main() -> int:
                     compare_oracle=not args.skip_oracle_metrics,
                     resume=bool(args.resume),
                     calibration_activations=calibration_activations,
+                    calibration_activations_by_module=calibration_activations_by_module,
                     skip_g_scale=bool(args.skip_g_scale),
                     regularization_seed=args.regularization_seed,
                     include_plain_tensors=bool(args.model_modules),
@@ -433,9 +450,15 @@ def main() -> int:
                     "calibration_activations": None
                     if args.calibration_activations is None
                     else str(args.calibration_activations),
+                    "calibration_activations_map": None
+                    if args.calibration_activations_map is None
+                    else str(args.calibration_activations_map),
                     "calibration_rows": 0
                     if calibration_activations is None
                     else int(calibration_activations.shape[0]),
+                    "calibration_module_count": 0
+                    if calibration_activations_by_module is None
+                    else len(calibration_activations_by_module),
                     "skip_g_scale": bool(args.skip_g_scale),
                     "regularization_seed": args.regularization_seed,
                 }

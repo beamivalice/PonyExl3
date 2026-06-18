@@ -18,6 +18,7 @@ from ponyexl3.convert.allocation import (
     allocation_summary,
     default_module_priority,
 )
+from ponyexl3.convert.calibration import activation_for_module
 from ponyexl3.convert.direct import (
     DirectLayerResult,
     ScaleMode,
@@ -249,11 +250,17 @@ def _convert_one(
     buf_size_rows: int,
     feedback_rows: int,
     calibration_activations: np.ndarray | None,
+    calibration_activations_by_module: dict[str, np.ndarray] | None,
     skip_g_scale: bool,
     regularization_seed: int,
     quant_bits: int | None,
     compare_oracle: bool,
 ) -> DirectLayerResult:
+    module_activations = activation_for_module(
+        calibration_activations,
+        calibration_activations_by_module,
+        module_key,
+    )
     if quantizer == "direct":
         return direct_quantize_layer(
             source_dir,
@@ -261,7 +268,7 @@ def _convert_one(
             module_key,
             search_backend=search_backend,
             scale_mode=scale_mode,
-            calibration_activations=calibration_activations,
+            calibration_activations=module_activations,
             skip_g_scale=skip_g_scale,
             regularization_seed=regularization_seed,
             quant_bits=quant_bits,
@@ -275,7 +282,7 @@ def _convert_one(
         sigma_reg=sigma_reg,
         buf_size_rows=buf_size_rows,
         feedback_rows=feedback_rows,
-        calibration_activations=calibration_activations,
+        calibration_activations=module_activations,
         skip_g_scale=skip_g_scale,
         regularization_seed=regularization_seed,
         quant_bits=quant_bits,
@@ -306,6 +313,7 @@ def convert_module_set(
     asset_dir: str | Path | None = None,
     resume: bool = False,
     calibration_activations: np.ndarray | None = None,
+    calibration_activations_by_module: dict[str, np.ndarray] | None = None,
     skip_g_scale: bool = False,
     regularization_seed: int = 0,
     include_plain_tensors: bool = False,
@@ -396,6 +404,7 @@ def convert_module_set(
                 buf_size_rows=buf_size_rows,
                 feedback_rows=feedback_rows,
                 calibration_activations=calibration_activations,
+                calibration_activations_by_module=calibration_activations_by_module,
                 skip_g_scale=skip_g_scale,
                 regularization_seed=regularization_seed,
                 quant_bits=planned_bits.get(key),
@@ -476,6 +485,9 @@ def convert_module_set(
             "calibration_rows": 0
             if calibration_activations is None
             else int(calibration_activations.shape[0]),
+            "calibration_module_count": 0
+            if calibration_activations_by_module is None
+            else len(calibration_activations_by_module),
             "skip_g_scale": skip_g_scale,
             "regularization_seed": regularization_seed,
             "include_plain_tensors": include_plain_tensors,
