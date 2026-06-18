@@ -60,6 +60,7 @@ ponyexl3-generate = "ponyexl3.cli.generate_model:main"
 ponyexl3-generate-bench = "ponyexl3.cli.generate_bench:main"
 ponyexl3-compare-layer = "ponyexl3.cli.compare_layer:main"
 ponyexl3-compare-engines = "ponyexl3.cli.compare_engines:main"
+ponyexl3-convert = "ponyexl3.cli.convert:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
