@@ -256,9 +256,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--search-backend",
-        choices=("cpu", "metal"),
-        default="cpu",
-        help="trellis search backend for the tile pilot",
+        choices=("auto", "cpu", "metal"),
+        default="auto",
+        help="trellis search backend: 'auto' (default) uses the Metal GPU search on "
+        "Apple Silicon and falls back to the CPU reference search only when Metal is "
+        "unavailable; the CPU search is ~10000x slower per tile and is a reference path",
     )
     parser.add_argument("--sigma-reg", type=float, default=0.025, help="Hessian diagonal damping")
     parser.add_argument(
@@ -322,6 +324,18 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true", help="print JSON only")
     args = parser.parse_args()
+
+    if args.search_backend == "auto":
+        try:
+            import mlx.core as mx
+
+            metal_ok = bool(mx.metal.is_available())
+        except Exception:
+            metal_ok = False
+        args.search_backend = "metal" if metal_ok else "cpu"
+        if not args.json:
+            detail = "Metal GPU" if metal_ok else "CPU reference (Metal unavailable)"
+            print(f"search-backend=auto -> {args.search_backend} ({detail})", file=sys.stderr)
 
     try:
         calibration_activations = (
