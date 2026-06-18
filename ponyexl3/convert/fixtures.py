@@ -29,6 +29,7 @@ from ponyexl3.ref.trellis import pack_trellis_tile, unpack_trellis_tile
 
 
 LayoutKind = Literal["linear_t", "qwen_gate", "qwen_up", "qwen_down"]
+SearchBackend = Literal["cpu", "metal"]
 
 _QWEN_EXPERT_RE = re.compile(
     r"^(?P<prefix>.*\.mlp)\.experts\.(?P<expert>\d+)\."
@@ -96,6 +97,7 @@ class TilePilotResult:
     """Result of one source -> reference-search -> oracle tile comparison."""
 
     module_key: str
+    search_backend: SearchBackend
     tile_k: int
     tile_n: int
     k: int
@@ -409,6 +411,7 @@ def run_tile_pilot(
     *,
     tile_k: int = 0,
     tile_n: int = 0,
+    search_backend: SearchBackend = "cpu",
     max_pins: int = 4,
 ) -> TilePilotResult:
     """Quantize one oracle-comparable tile from the source checkpoint."""
@@ -444,12 +447,25 @@ def run_tile_pilot(
     target_tile = inner_block[r0 : r0 + 16, c0 : c0 + 16]
     target_kernel = target_tile.reshape(256)[tensor_core_perm()]
 
-    states, decoded_kernel = quantize_tile_reference(
-        target_kernel.astype(np.float32),
-        k=layer.k,
-        cb=oracle.cb,
-        max_pins=max_pins,
-    )
+    if search_backend == "cpu":
+        states, decoded_kernel = quantize_tile_reference(
+            target_kernel.astype(np.float32),
+            k=layer.k,
+            cb=oracle.cb,
+            max_pins=max_pins,
+        )
+    elif search_backend == "metal":
+        from ponyexl3.convert.metal_search import quantize_tiles_mlx_np
+
+        decoded_tiles, state_tiles = quantize_tiles_mlx_np(
+            target_kernel.reshape(1, 256).astype(np.float32),
+            k=layer.k,
+            cb=oracle.cb,
+        )
+        decoded_kernel = decoded_tiles[0].astype(np.float32, copy=False)
+        states = state_tiles[0].astype(np.uint16, copy=False)
+    else:
+        raise ValueError(f"unknown search backend: {search_backend}")
     packed = pack_trellis_tile((states & ((1 << layer.k) - 1)).astype(np.uint16), layer.k)
     converted_tile = decode_packed_tile(packed, layer.k, oracle.cb).astype(np.float32)
     converted_direct = kernel_order_to_row_major(decoded_kernel).astype(np.float32)
@@ -478,6 +494,7 @@ def run_tile_pilot(
     }
     return TilePilotResult(
         module_key=module_key,
+        search_backend=search_backend,
         tile_k=tile_k,
         tile_n=tile_n,
         k=layer.k,
@@ -496,6 +513,7 @@ def tile_pilot_summary(result: TilePilotResult) -> dict[str, Any]:
 
     return {
         "module": result.module_key,
+        "search_backend": result.search_backend,
         "tile": [result.tile_k, result.tile_n],
         "k": result.k,
         "codebook": result.cb.name.lower(),

@@ -39,6 +39,12 @@ def main() -> int:
     )
     parser.add_argument("--tile-k", type=int, default=0, help="input tile index")
     parser.add_argument("--tile-n", type=int, default=0, help="output tile index")
+    parser.add_argument(
+        "--search-backend",
+        choices=("cpu", "metal"),
+        default="cpu",
+        help="trellis search backend for the tile pilot",
+    )
     parser.add_argument("--resume", action="store_true", help="reserved for full conversion")
     parser.add_argument("--json", action="store_true", help="print JSON only")
     args = parser.parse_args()
@@ -50,6 +56,7 @@ def main() -> int:
             args.only_module,
             tile_k=args.tile_k,
             tile_n=args.tile_n,
+            search_backend=args.search_backend,
         )
     except (FileNotFoundError, KeyError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -61,6 +68,7 @@ def main() -> int:
         "out_dir": None if args.out_dir is None else str(args.out_dir),
         "work_dir": None if args.work_dir is None else str(args.work_dir),
         "only_layer": args.only_layer,
+        "search_backend": args.search_backend,
         "resume": bool(args.resume),
     }
 
@@ -70,7 +78,10 @@ def main() -> int:
 
     stats = summary["stats"]
     print(f"module: {summary['module']}")
-    print(f"tile: {summary['tile']}  K={summary['k']}  codebook={summary['codebook']}")
+    print(
+        f"tile: {summary['tile']}  K={summary['k']}  "
+        f"codebook={summary['codebook']}  backend={summary['search_backend']}"
+    )
     print(
         "target MSE: "
         f"converted={stats['converted_target_mse']:.6e}  "

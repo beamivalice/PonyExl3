@@ -1,6 +1,7 @@
 # pony-quant: HF → EXL3 converter — engineering roadmap (handoff)
 
-Updated 2026-06-11. Status: **M1 complete and gated** (`tests/test_convert.py`).
+Updated 2026-06-18. Status: **M1 complete, M2a Metal tile pilot complete**
+(`tests/test_convert.py`, `tests/test_convert_metal.py`).
 
 Goal: accept a HuggingFace checkpoint (safetensors), emit an EXL3 checkpoint
 that `ponyexl3/mlx/model.py` loads unmodified, with per-layer bit
@@ -10,6 +11,23 @@ the exllamav3 source tree (https://github.com/turboderp-org/exllamav3),
 `conversion/{convert_model,measure_model,optimize_model,allocation,
 calibration_data,compile}.py`, `modules/quant/exl3_lib/quantize.py` (1151
 lines, the math core), `exllamav3_ext/quant/quantize.cu` (the search kernel).
+
+Current checkpoint-backed pilot:
+
+- Source BF16 model:
+  `/Users/beam/llm/models/Qwen/Qwen3.6-35B-A3B`
+- Oracle EXL3 model:
+  `/Users/beam/llm/models/Exl3/Qwen3.6-35B-A3B-exl3-4.00bpw`
+- Fast module/tile:
+  `model.language_model.layers.0.linear_attn.in_proj_qkv`, tile `[0, 0]`
+- Secondary MoE gate pilot:
+  `model.language_model.layers.0.mlp.experts.0.gate_proj`; current oracle
+  block has zero `svh` scales, so this remains an expected rejected fixture
+  until output-space validation replaces raw block inversion for routed paths.
+- Latest Metal pilot result on the fast tile:
+  converted target MSE `4.659796e-03`, oracle target MSE `8.931810e-03`,
+  converted rel-RMS `0.065796`, oracle rel-RMS `0.091093`, pack round-trip
+  `True`.
 
 ---
 
@@ -32,26 +50,75 @@ lines, the math core), `exllamav3_ext/quant/quantize.cu` (the search kernel).
    against each other. Real checkpoints are the only arbiter for format
    conventions.
 
-## What exists (M1)
+## What exists now (M1 + M2a)
 
 - `convert/reference_search.py` — exact numpy Viterbi, any K∈[1,8], any
   codebook mode; tail-biting via pinned re-passes; ~0.5-2 s/tile. This is
   the **parity oracle** for the Metal kernel, not a production path.
   Quality: MSE 0.075/0.021/0.005/0.0003 at K=2/3/4/6 on unit Gaussians
   (QTIP-class).
+- `convert/fixtures.py` — lightweight checkpoint-backed conversion fixture:
+  BF16 safetensors slice reader, Qwen dense/MoE source adapters, oracle EXL3
+  loading, source→EXL3 inner-block inversion, and one 16×16 tile comparison.
+  Data types are in place for `SourceLinear`, `OracleLinear`,
+  `QuantizedLinearTensors`, `LayerFixture`, and `TilePilotResult`.
+- `convert/metal_search.py` — MLX/Metal trellis search for kernel-order
+  16×16 tiles, one tile per threadgroup, K∈[4,8], all three codebooks.
+  It mirrors CUDA's compressed-edge DP shape and roll-128 warmup + pinned
+  tail-biting pass, then returns full 16-bit states plus reconstructed tiles.
+  K=2/3 intentionally raise until the global scratch path lands.
+- `cli/convert.py` / `ponyexl3-convert` — current CLI is the oracle-comparable
+  one-tile pilot. It accepts `--search-backend cpu|metal`; CPU remains the
+  stable default, Metal is the M2a backend.
 - `tests/test_convert.py` — transition invariant + bit round-trip +
-  MSE bounds, k∈{2,3}.
+  MSE bounds, k∈{2,3}, BF16 reader gate, Qwen source adapter gate, CPU
+  one-tile oracle gate, guarded Metal one-tile oracle gate, and expected
+  zero-scale rejection for the MoE gate block.
+- `tests/test_convert_metal.py` — Metal-only gates: random-tile quality
+  within `1.10×` CPU reference for all codebooks at K=4, exact recovery of
+  ideal tail-biting tiles for K∈{4,5,8}, pack/unpack round-trip, and explicit
+  K<4 rejection.
+- Verification as of 2026-06-18:
+  `python -m pytest tests/test_convert.py tests/test_convert_metal.py -q`
+  → 14 passed; `python -m pyright ponyexl3/convert ponyexl3/cli/convert.py
+  tests/test_convert.py tests/test_convert_metal.py` → clean.
 
 ---
 
-## M2 — Metal trellis-search kernel (the long pole, ~2-4 days)
+## M2 — Metal trellis-search kernel
 
-Port `quantize_tiles_kernel` (quantize.cu) to `mx.fast.metal_kernel`, one
-tile per threadgroup:
+Status: **M2a complete for the fast one-tile pilot**. The working primitive is
+`quantize_tiles_mlx(_np)` in `convert/metal_search.py`.
+
+Implemented:
+
+- One 16×16 tile per threadgroup through `mx.fast.metal_kernel`.
+- K∈[4,8] using threadgroup-resident `half costs[2][edges]`.
+- Inline decode for DEFAULT/MCG/MUL1 using the existing codebook formulas.
+- Backpointers in device scratch (`temp_edges`) and in-kernel backtracking.
+- CUDA-style `roll=128` warmup, then `roll=0` pinned tail-biting solve.
+- Returns reconstructed tiles plus full 16-bit states; existing
+  `pack_trellis_tile(states & ((1<<K)-1), K)` remains the only pack path.
+
+Remaining M2 work:
+
+- Add the global-cost scratch path for K=2/3 if sub-4-bit conversion is
+  needed; K=4 is enough for the current 4.00 bpw Qwen oracle pilot.
+- Batch many tiles per launch with bounded/reused scratch and benchmark
+  throughput on real 128×128 source blocks.
+- Decide the CUDA parity contract: bit-identical indices where no ties occur,
+  otherwise equal-MSE/tail-biting/pack-roundtrip. Current tests gate quality
+  rather than exact random-tile state identity because CPU and Metal use
+  different precision/tie behavior.
+- Keep optional A/B of a 128 KB device LUT of all 65536 decoded values vs
+  inline ALU decode for throughput only; correctness already comes from the
+  inline path.
+
+Original kernel constraints still apply:
 
 - Threadgroup ≤1024 threads (CUDA uses `MIN(1024, 65536>>K)`); cost arrays
-  `temp_costs[2][edges]`, edges = 65536>>K, in threadgroup memory when K≥2
-  (8 KB fp16 at K=4) — matches CUDA's shmem strategy.
+  `temp_costs[2][edges]`, edges = 65536>>K. In this Metal version, K≥4 stays
+  in threadgroup memory; K<4 needs global scratch.
 - Per step t∈[0,256): for each out-edge group, min over 2^K incoming
   branches; branch cost `(decode_3inst(state) − w[t])²` in **half** (CUDA
   uses half costs + `H_INF` sentinels — keep; it's part of parity).
@@ -76,7 +143,18 @@ tile per threadgroup:
   register cliffs near 32 simdgroup accumulators; `_decode_expr` declares
   `dq_val` in-scope (wrap call sites in braces).
 
-## M3 — Hessian capture + regularize + LDL(Q) (~2-3 days)
+## M3 — Regularize + direct one-linear conversion, then Hessian + LDLQ
+
+Next milestone should stay on the same lightweight pilot before expanding:
+
+1. Port the no-LDL direct path first for
+   `model.language_model.layers.0.linear_attn.in_proj_qkv`, using the existing
+   oracle `suh`/`svh` fixture path to validate storage and output-space error.
+2. Port upstream `regularize`, `block_rms`, Hadamard transforms, MCG/default
+   codebook flags, and global scale GSS. Gate with one converted EXL3 layer
+   loaded through the existing `EXL3Layer`/`EXL3Linear`.
+3. Only after direct one-linear emit is loading and comparing cleanly, add
+   Hessian capture and reverse 16-row LDLQ.
 
 - `hessian.py`: layer-sequential driver. Load the HF model with mlx_lm's
   classes (qwen3_5/qwen3_5_moe already mapped); stream calibration rows

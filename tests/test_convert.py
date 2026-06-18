@@ -21,6 +21,14 @@ PILOT_MODULE = "model.language_model.layers.0.linear_attn.in_proj_qkv"
 PILOT_EXPERT_GATE = "model.language_model.layers.0.mlp.experts.0.gate_proj"
 
 
+def _metal_available() -> bool:
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return False
+    return bool(mx.metal.is_available())
+
+
 @pytest.mark.parametrize("k", [2, 3])
 def test_search_pack_roundtrip(k):
     rng = np.random.default_rng(7)
@@ -76,12 +84,38 @@ def test_qwen_source_linear_adapters_are_lightweight():
 )
 def test_one_tile_pilot_compares_with_oracle():
     result = run_tile_pilot(SOURCE_35B, ORACLE_35B, PILOT_MODULE, tile_k=0, tile_n=0)
+    assert result.search_backend == "cpu"
     assert result.k == 4
     assert result.stats["converted_pack_roundtrip"] is True
     assert result.stats["oracle_pack_roundtrip"] is True
     assert np.isfinite(result.converted_tile).all()
     assert np.isfinite(result.oracle_tile).all()
     assert np.isfinite(result.target_tile).all()
+    assert result.stats["converted_target_mse"] < 0.05
+
+
+@pytest.mark.skipif(
+    not (
+        (SOURCE_35B / "model.safetensors.index.json").is_file()
+        and (ORACLE_35B / "quantization_config.json").is_file()
+        and _metal_available()
+    ),
+    reason="local Qwen3.6-35B-A3B checkpoints or Metal are not present",
+)
+def test_one_tile_pilot_metal_backend_compares_with_oracle():
+    result = run_tile_pilot(
+        SOURCE_35B,
+        ORACLE_35B,
+        PILOT_MODULE,
+        tile_k=0,
+        tile_n=0,
+        search_backend="metal",
+    )
+    assert result.search_backend == "metal"
+    assert result.k == 4
+    assert result.stats["converted_pack_roundtrip"] is True
+    assert result.stats["oracle_pack_roundtrip"] is True
+    assert np.isfinite(result.converted_tile).all()
     assert result.stats["converted_target_mse"] < 0.05
 
 
