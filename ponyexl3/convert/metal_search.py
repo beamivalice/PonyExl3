@@ -17,7 +17,12 @@ from ponyexl3.ref.codebook import CodebookMode
 
 
 _THREADS = 256
+_DEFAULT_MAX_SCRATCH_BYTES = 256 * 1024 * 1024
 _KERNELS: dict[tuple[int, int], Callable[..., Any]] = {}
+
+
+def _threads_for_k(k: int) -> int:
+    return min(_THREADS, 1 << (16 - k))
 
 
 def _decode_expr(cb: CodebookMode, *, cw_in: str = "cw", out: str = "dq_val") -> str:
@@ -52,8 +57,27 @@ def _source(k: int, cb: CodebookMode) -> str:
     edges = 1 << (16 - k)
     kk = 1 << k
     kr = 16 - k
+    threads = _threads_for_k(k)
+    global_costs = k < 4
     decode_cost = _decode_expr(cb, cw_in="cw", out="dq_val")
     decode_write = _decode_expr(cb, cw_in="state", out="dq_out")
+    costs_decl = (
+        "    device half* costs = temp_costs + ulong(tile) * 2u * EDGES;\n"
+        if global_costs
+        else "    threadgroup half costs[2][EDGES];\n"
+    )
+    barrier = (
+        "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);"
+        if global_costs
+        else "threadgroup_barrier(mem_flags::mem_threadgroup);"
+    )
+    cost_store = "costs[ulong(curr) * EDGES + e]" if global_costs else "costs[curr][e]"
+    prev_cost_load = (
+        "costs[ulong(prev_buf) * EDGES + pred]" if global_costs else "costs[prev_buf][pred]"
+    )
+    argmin_cost_load = (
+        "costs[ulong(curr) * EDGES + e]" if global_costs else "costs[curr][e]"
+    )
     return f"""
 #define K_BITS {k}u
 #define KR_BITS {kr}u
@@ -69,7 +93,7 @@ def _source(k: int, cb: CodebookMode) -> str:
     device ushort* out_idx = indices + tile * 256u;
     device ushort* edge_ptr = temp_edges + ulong(tile) * 256u * EDGES;
 
-    threadgroup half costs[2][EDGES];
+{costs_decl}
     threadgroup uint sh_pin;
 
     uint pin = 0u;
@@ -79,7 +103,7 @@ def _source(k: int, cb: CodebookMode) -> str:
         uint curr = 0u;
         uint roll = pass == 0u ? 128u : 0u;
 
-        for (uint e = tid; e < EDGES; e += {_THREADS}u) {{
+        for (uint e = tid; e < EDGES; e += {threads}u) {{
             float target = in_tile[roll];
             float best = H_INF_F;
             uint best_pred = 0u;
@@ -100,16 +124,18 @@ def _source(k: int, cb: CodebookMode) -> str:
                     best_pred = pred;
                 }}
             }}
-            costs[curr][e] = half(best);
-            edge_ptr[roll * EDGES + e] = ushort(best_pred);
+            {cost_store} = half(best);
+            if (pass == 1u || roll < 128u) {{
+                edge_ptr[roll * EDGES + e] = ushort(best_pred);
+            }}
         }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {barrier}
 
         for (uint step = 1u; step < 256u; step++) {{
             uint ri = (step + roll) & 255u;
             uint prev_buf = curr;
             curr = 1u - curr;
-            for (uint e = tid; e < EDGES; e += {_THREADS}u) {{
+            for (uint e = tid; e < EDGES; e += {threads}u) {{
                 float target = in_tile[ri];
                 float best = H_INF_F;
                 uint best_pred = 0u;
@@ -118,17 +144,19 @@ def _source(k: int, cb: CodebookMode) -> str:
                     uint pred = cw >> K_BITS;
 {decode_cost}
                     float dh = dq_val - target;
-                    float err = fma(dh, dh, float(costs[prev_buf][pred]));
+                    float err = fma(dh, dh, float({prev_cost_load}));
                     if (err > H_INF_F) err = H_INF_F;
                     if (err < best) {{
                         best = err;
                         best_pred = pred;
                     }}
                 }}
-                costs[curr][e] = half(best);
-                edge_ptr[ulong(ri) * EDGES + e] = ushort(best_pred);
+                {cost_store} = half(best);
+                if (pass == 1u || ri < 128u) {{
+                    edge_ptr[ulong(ri) * EDGES + e] = ushort(best_pred);
+                }}
             }}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            {barrier}
         }}
 
         if (tid == 0u) {{
@@ -137,7 +165,7 @@ def _source(k: int, cb: CodebookMode) -> str:
                 float best = H_INF_F;
                 edge = 0u;
                 for (uint e = 0u; e < EDGES; e++) {{
-                    float v = float(costs[curr][e]);
+                    float v = float({argmin_cost_load});
                     if (v < best) {{
                         best = v;
                         edge = e;
@@ -160,7 +188,7 @@ def _source(k: int, cb: CodebookMode) -> str:
             }}
             sh_pin = edge;
         }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {barrier}
         pin = sh_pin;
         pinned = true;
     }}
@@ -173,18 +201,54 @@ def _kernel(k: int, cb: CodebookMode) -> Callable[..., Any]:
     key = (k, int(cb))
     if key not in _KERNELS:
         _KERNELS[key] = mx.fast.metal_kernel(
-            name=f"exl3_quantize_tiles_k{k}_cb{int(cb)}_v3",
+            name=f"exl3_quantize_tiles_k{k}_cb{int(cb)}_v8",
             input_names=["tiles"],
-            output_names=["q_tiles", "indices", "temp_edges"],
+            output_names=["q_tiles", "indices", "temp_edges", "temp_costs"],
             source=_source(k, cb),
         )
     return _KERNELS[key]
+
+
+def _scratch_bytes_per_tile(k: int) -> int:
+    edges = 1 << (16 - k)
+    return (256 * edges * np.dtype(np.uint16).itemsize) + (
+        2 * edges * np.dtype(np.float16).itemsize
+    )
+
+
+def _quantize_tiles_mlx_launch(
+    arr: Any,
+    k: int,
+    cb: CodebookMode,
+) -> tuple[Any, Any]:
+    import mlx.core as mx
+
+    n_tiles = int(arr.shape[0])
+    edges = 1 << (16 - k)
+    threads = _threads_for_k(k)
+    kernel = _kernel(k, cb)
+    q_tiles, indices, _temp_edges, _temp_costs = kernel(
+        inputs=[arr],
+        template=[("T", mx.float32)],
+        grid=(n_tiles * threads, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[
+            (n_tiles, 256),
+            (n_tiles, 256),
+            (n_tiles, 256 * edges),
+            (n_tiles, 2, edges),
+        ],
+        output_dtypes=[mx.float32, mx.uint16, mx.uint16, mx.float16],
+    )
+    return q_tiles, indices
 
 
 def quantize_tiles_mlx(
     tiles: Any,
     k: int,
     cb: CodebookMode | int = CodebookMode.DEFAULT,
+    *,
+    max_scratch_bytes: int = _DEFAULT_MAX_SCRATCH_BYTES,
 ) -> tuple[Any, Any]:
     """Quantize kernel-order tiles with the Metal trellis search.
 
@@ -192,12 +256,15 @@ def quantize_tiles_mlx(
     input ``(num_tiles, 256)``.  ``indices`` are full 16-bit codewords; callers
     should pass ``indices & ((1 << k) - 1)`` to the existing trellis packer.
 
-    The first implementation supports K>=4 to stay within threadgroup memory
-    limits.  K=2/3 need the planned global-cost scratch path.
+    ``max_scratch_bytes`` bounds per-launch temporary backpointer/cost scratch;
+    larger batches are split and concatenated.
+
+    The implementation supports K>=2, which is the practical range needed by
+    upstream EXL3 conversion. K=1 needs a separate low-K scratch strategy.
     """
 
-    if not 4 <= k <= 8:
-        raise ValueError("Metal trellis search currently supports K in [4, 8]")
+    if not 2 <= k <= 8:
+        raise ValueError("Metal trellis search currently supports K in [2, 8]")
     cb = CodebookMode(cb)
 
     import mlx.core as mx
@@ -208,16 +275,23 @@ def quantize_tiles_mlx(
     if arr.ndim != 2 or arr.shape[1] != 256:
         raise ValueError(f"expected tiles shape (N, 256), got {arr.shape}")
     n_tiles = int(arr.shape[0])
-    edges = 1 << (16 - k)
-    kernel = _kernel(k, cb)
-    q_tiles, indices, _temp_edges = kernel(
-        inputs=[arr],
-        template=[("T", mx.float32)],
-        grid=(n_tiles * _THREADS, 1, 1),
-        threadgroup=(_THREADS, 1, 1),
-        output_shapes=[(n_tiles, 256), (n_tiles, 256), (n_tiles, 256 * edges)],
-        output_dtypes=[mx.float32, mx.uint16, mx.uint16],
-    )
+    if n_tiles == 0:
+        raise ValueError("expected at least one tile")
+    if max_scratch_bytes <= 0:
+        raise ValueError("max_scratch_bytes must be positive")
+
+    launch_tiles = max(1, max_scratch_bytes // _scratch_bytes_per_tile(k))
+    if n_tiles <= launch_tiles:
+        q_tiles, indices = _quantize_tiles_mlx_launch(arr, k, cb)
+    else:
+        q_parts = []
+        idx_parts = []
+        for start in range(0, n_tiles, launch_tiles):
+            q_part, idx_part = _quantize_tiles_mlx_launch(arr[start : start + launch_tiles], k, cb)
+            q_parts.append(q_part)
+            idx_parts.append(idx_part)
+        q_tiles = mx.concatenate(q_parts, axis=0)
+        indices = mx.concatenate(idx_parts, axis=0)
     mx.eval(q_tiles, indices)
     return q_tiles, indices
 
@@ -226,8 +300,10 @@ def quantize_tiles_mlx_np(
     tiles: np.ndarray,
     k: int,
     cb: CodebookMode | int = CodebookMode.DEFAULT,
+    *,
+    max_scratch_bytes: int = _DEFAULT_MAX_SCRATCH_BYTES,
 ) -> tuple[np.ndarray, np.ndarray]:
     """NumPy wrapper around :func:`quantize_tiles_mlx` for tests/CLI glue."""
 
-    q_tiles, indices = quantize_tiles_mlx(tiles, k, cb)
+    q_tiles, indices = quantize_tiles_mlx(tiles, k, cb, max_scratch_bytes=max_scratch_bytes)
     return np.array(q_tiles), np.array(indices).astype(np.uint16, copy=False)

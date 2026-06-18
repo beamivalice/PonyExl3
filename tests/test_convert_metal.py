@@ -9,7 +9,7 @@ import pytest
 
 mlx = pytest.importorskip("mlx.core")
 
-from ponyexl3.convert.metal_search import quantize_tiles_mlx_np
+from ponyexl3.convert.metal_search import _scratch_bytes_per_tile, quantize_tiles_mlx_np
 from ponyexl3.convert.reference_search import quantize_tile_reference
 from ponyexl3.ref.codebook import CodebookMode, decode_3inst
 from ponyexl3.ref.trellis import pack_trellis_tile, unpack_trellis_tile
@@ -40,25 +40,36 @@ def _valid_tail_biting_indices(k: int, seed: int) -> np.ndarray:
     return encoded.astype(np.uint16)
 
 
-@pytest.mark.parametrize("cb", [CodebookMode.DEFAULT, CodebookMode.MCG, CodebookMode.MUL1])
-def test_quantize_tiles_mlx_random_tile_matches_reference_quality(cb: CodebookMode) -> None:
+@pytest.mark.parametrize(
+    ("k", "cb"),
+    [
+        (2, CodebookMode.MCG),
+        (3, CodebookMode.MCG),
+        (4, CodebookMode.DEFAULT),
+        (4, CodebookMode.MCG),
+        (4, CodebookMode.MUL1),
+    ],
+)
+def test_quantize_tiles_mlx_random_tile_matches_reference_quality(
+    k: int, cb: CodebookMode
+) -> None:
     scale = 1.0 if cb == CodebookMode.MUL1 else 1.24371088
-    rng = np.random.default_rng(100 + int(cb))
+    rng = np.random.default_rng(100 + 10 * k + int(cb))
     tile = (rng.standard_normal((1, 256)) * scale).astype(np.float32)
 
-    q_tiles, states = quantize_tiles_mlx_np(tile, 4, cb)
-    _ref_states, ref_tile = quantize_tile_reference(tile[0], 4, cb)
+    q_tiles, states = quantize_tiles_mlx_np(tile, k, cb)
+    _ref_states, ref_tile = quantize_tile_reference(tile[0], k, cb)
 
-    _assert_tail_biting(states[0], 4)
-    packed = pack_trellis_tile((states[0] & 0xF).astype(np.uint16), 4)
-    assert np.array_equal(unpack_trellis_tile(packed, 4), states[0])
+    _assert_tail_biting(states[0], k)
+    packed = pack_trellis_tile((states[0] & ((1 << k) - 1)).astype(np.uint16), k)
+    assert np.array_equal(unpack_trellis_tile(packed, k), states[0])
 
     metal_mse = float(np.mean((q_tiles[0] - tile[0]) ** 2))
     ref_mse = float(np.mean((ref_tile - tile[0]) ** 2))
     assert metal_mse <= ref_mse * 1.10
 
 
-@pytest.mark.parametrize("k", [4, 5, 8])
+@pytest.mark.parametrize("k", [2, 3, 4, 5, 8])
 def test_quantize_tiles_mlx_recovers_ideal_tail_biting_tile(k: int) -> None:
     encoded = _valid_tail_biting_indices(k, seed=k)
     decoded = np.array(
@@ -73,7 +84,24 @@ def test_quantize_tiles_mlx_recovers_ideal_tail_biting_tile(k: int) -> None:
     assert np.array_equal(q_tiles[0], decoded[0])
 
 
-def test_quantize_tiles_mlx_rejects_low_k_until_global_scratch_exists() -> None:
+def test_quantize_tiles_mlx_chunks_large_batches_by_scratch_budget() -> None:
+    rng = np.random.default_rng(333)
+    tiles = rng.standard_normal((13, 256)).astype(np.float32)
+    q_tiles, states = quantize_tiles_mlx_np(
+        tiles,
+        2,
+        CodebookMode.MCG,
+        max_scratch_bytes=3 * _scratch_bytes_per_tile(2),
+    )
+
+    assert q_tiles.shape == tiles.shape
+    assert states.shape == tiles.shape
+    assert np.isfinite(q_tiles).all()
+    for row in states:
+        _assert_tail_biting(row, 2)
+
+
+def test_quantize_tiles_mlx_rejects_k1_until_low_k_strategy_exists() -> None:
     tile = np.zeros((1, 256), dtype=np.float32)
-    with pytest.raises(ValueError, match=r"supports K in \[4, 8\]"):
-        quantize_tiles_mlx_np(tile, 3, CodebookMode.MCG)
+    with pytest.raises(ValueError, match=r"supports K in \[2, 8\]"):
+        quantize_tiles_mlx_np(tile, 1, CodebookMode.MCG)
