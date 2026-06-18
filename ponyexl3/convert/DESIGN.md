@@ -1,6 +1,6 @@
 # pony-quant: HF → EXL3 converter — engineering roadmap (handoff)
 
-Updated 2026-06-18. Status: **M1 complete, M2 complete, M3a direct-window
+Updated 2026-06-18. Status: **M1 complete, M2 complete, M3b direct full-layer
 emit/load gate complete**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`).
 
@@ -33,6 +33,12 @@ Current checkpoint-backed pilot:
   public rel-RMS `0.067390`, output rel-RMS `0.070094`, inner MSE
   `5.283837e-03`, public MSE `1.360480e-06`, output MSE `1.704962e-04`,
   mini bundle reloads through `load_exl3_layer`.
+- Latest M3 direct full-layer result on `in_proj_qkv`:
+  shape `(2048, 8192)`, trellis `(128, 512, 64)`, output rel-RMS
+  `0.069103`, public rel-RMS `0.069056`, inner MSE `5.498035e-03`, output
+  MSE `2.255773e-03`; `oracle_safe` scale mode replaced `112` zero `svh`
+  entries with `1.0`; full local run took `147 s`, so normal pytest uses a
+  synthetic full-layer gate.
 
 ---
 
@@ -55,7 +61,7 @@ Current checkpoint-backed pilot:
    against each other. Real checkpoints are the only arbiter for format
    conventions.
 
-## What exists now (M1 + M2 + M3a)
+## What exists now (M1 + M2 + M3b)
 
 - `convert/reference_search.py` — exact numpy Viterbi, any K∈[1,8], any
   codebook mode; tail-biting via pinned re-passes; ~0.5-2 s/tile. This is
@@ -77,10 +83,12 @@ Current checkpoint-backed pilot:
   one-tile pilot by default. It accepts `--search-backend cpu|metal`; CPU
   remains the stable default. `--direct-window` runs the M3 direct 128×128
   block quantizer and writes a minimal loadable EXL3 bundle when `--out-dir`
-  is provided.
+  is provided. `--direct-layer` quantizes the whole selected linear module;
+  `--scale-mode oracle_safe` keeps oracle scales but replaces zero entries
+  with `1.0`.
 - `convert/direct.py` — no-LDL direct conversion for one 128×128 Hadamard
-  block: source BF16 public block → oracle-scale inner block → M2 tile
-  quantization → mini `EXL3Layer` → optional safetensors bundle +
+  block and for a full linear module: source BF16 public blocks → scaled inner
+  blocks → M2 tile quantization → `EXL3Layer` → optional safetensors bundle +
   `quantization_config.json`/`model.safetensors.index.json` reload gate.
 - `tests/test_convert.py` — transition invariant + bit round-trip +
   MSE bounds, k∈{2,3}, BF16 reader gate, Qwen source adapter gate, CPU
@@ -93,7 +101,7 @@ Current checkpoint-backed pilot:
   rejection.
 - Verification as of 2026-06-18:
   `python -m pytest tests/test_convert.py tests/test_convert_metal.py -q`
-  → 20 passed; `python -m pyright ponyexl3/convert ponyexl3/cli/convert.py
+  → 21 passed; `python -m pyright ponyexl3/convert ponyexl3/cli/convert.py
   tests/test_convert.py tests/test_convert_metal.py` → clean.
 
 ---
@@ -161,19 +169,20 @@ Original kernel constraints still apply:
 
 ## M3 — Regularize + direct one-linear conversion, then Hessian + LDLQ
 
-Status: **M3a complete for one 128×128 window**. The current direct path
-does not yet regularize or choose scales; it borrows oracle `suh`/`svh` for
-the selected Hadamard block so storage, reconstruction, output-space metrics,
-and loader compatibility are gated before adding scale search.
+Status: **M3b complete for direct no-LDL full-layer conversion**. The current
+direct path does not yet regularize or choose scales from scratch; it can use
+identity scales for synthetic tests or `oracle_safe` scales for the Qwen pilot.
+`oracle_safe` borrows oracle `suh`/`svh` but replaces zero scale entries with
+`1.0`, because real `in_proj_qkv` oracle metadata contains non-source-zero
+output channels with zero `svh`.
 
 Next milestone should stay on the same lightweight pilot before expanding:
 
-1. Expand direct conversion from one 128×128 window to the whole
-   `model.language_model.layers.0.linear_attn.in_proj_qkv` module, still
-   no-LDL and still using oracle or freshly computed scales for comparison.
-2. Port upstream `regularize`, `block_rms`, Hadamard transforms, MCG/default
+1. Port upstream `regularize`, `block_rms`, Hadamard transforms, MCG/default
    codebook flags, and global scale GSS. Gate with one converted EXL3 layer
    loaded through the existing `EXL3Layer`/`EXL3Linear`.
+2. Replace `oracle_safe` with freshly computed `suh`/`svh` from regularize
+   and compare against the current oracle-safe baseline.
 3. Only after direct one-linear emit is loading and comparing cleanly, add
    Hessian capture and reverse 16-row LDLQ.
 

@@ -1,8 +1,8 @@
 """HF -> EXL3 converter bring-up CLI.
 
-The default mode is the fast oracle-comparable tile pilot.  `--direct-window`
-quantizes one 128x128 Hadamard block and can emit a minimal loadable EXL3
-bundle for the current M3 direct-conversion sprint.
+The default mode is the fast oracle-comparable tile pilot. `--direct-window`
+quantizes one 128x128 Hadamard block, and `--direct-layer` quantizes a whole
+linear module. Both direct modes can emit a minimal loadable EXL3 bundle.
 """
 
 from __future__ import annotations
@@ -47,6 +47,17 @@ def main() -> int:
         help="directly quantize one 128x128 block instead of one 16x16 tile",
     )
     parser.add_argument(
+        "--direct-layer",
+        action="store_true",
+        help="directly quantize the whole selected linear module",
+    )
+    parser.add_argument(
+        "--scale-mode",
+        choices=("oracle", "oracle_safe", "identity"),
+        default="oracle_safe",
+        help="scale source for --direct-layer; oracle_safe replaces zero oracle scales with 1",
+    )
+    parser.add_argument(
         "--search-backend",
         choices=("cpu", "metal"),
         default="cpu",
@@ -57,6 +68,71 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        if args.direct_window and args.direct_layer:
+            raise ValueError("--direct-window and --direct-layer are mutually exclusive")
+        if args.direct_layer:
+            from ponyexl3.convert.direct import (
+                direct_layer_summary,
+                direct_quantize_layer,
+                write_direct_layer_bundle,
+            )
+
+            result = direct_quantize_layer(
+                args.in_dir,
+                args.oracle_dir,
+                args.only_module,
+                search_backend=args.search_backend,
+                scale_mode=args.scale_mode,
+            )
+            summary = direct_layer_summary(result)
+            summary["requested"] = {
+                "bits": args.bits,
+                "head_bits": args.head_bits,
+                "codebook": args.codebook,
+                "out_dir": None if args.out_dir is None else str(args.out_dir),
+                "work_dir": None if args.work_dir is None else str(args.work_dir),
+                "only_layer": args.only_layer,
+                "search_backend": args.search_backend,
+                "scale_mode": args.scale_mode,
+                "resume": bool(args.resume),
+            }
+            if args.out_dir is not None:
+                loaded = write_direct_layer_bundle(result, args.out_dir)
+                summary["emitted"] = {
+                    "out_dir": str(args.out_dir),
+                    "loaded_shape": [loaded.in_features, loaded.out_features],
+                    "trellis_shape": [int(x) for x in loaded.trellis.shape],
+                }
+            if args.json:
+                print(json.dumps(summary, indent=2, sort_keys=True))
+                return 0
+            stats = summary["stats"]
+            print(f"module: {summary['module']}")
+            print(
+                f"layer: shape={summary['shape']}  K={summary['k']}  "
+                f"codebook={summary['codebook']}  backend={summary['search_backend']}  "
+                f"scale_mode={summary['scale_mode']}"
+            )
+            print(
+                "public rel RMS: "
+                f"{stats['public_rel_rms']:.6f}  output rel RMS: {stats['output_rel_rms']:.6f}"
+            )
+            print(
+                "MSE: "
+                f"inner={stats['inner_mse']:.6e}  "
+                f"public={stats['public_mse']:.6e}  "
+                f"output={stats['output_mse']:.6e}"
+            )
+            print(
+                "scale replacements: "
+                f"suh={stats.get('suh_zero_replacements', 0):.0f}  "
+                f"svh={stats.get('svh_zero_replacements', 0):.0f}"
+            )
+            print(f"pack roundtrip: {stats['pack_roundtrip']}")
+            if "emitted" in summary:
+                print(f"emitted: {summary['emitted']['out_dir']}")
+            return 0
+
         if args.direct_window:
             from ponyexl3.convert.direct import (
                 direct_quantize_window,

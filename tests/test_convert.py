@@ -1,9 +1,11 @@
 """Converter M1 gates: reference trellis search + pack round-trip."""
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
+from safetensors.numpy import save_file
 
 from ponyexl3.convert.fixtures import (
     bf16_to_float32,
@@ -11,7 +13,12 @@ from ponyexl3.convert.fixtures import (
     resolve_source_linear,
     run_tile_pilot,
 )
-from ponyexl3.convert.direct import direct_quantize_window, write_direct_window_bundle
+from ponyexl3.convert.direct import (
+    direct_quantize_layer,
+    direct_quantize_window,
+    write_direct_layer_bundle,
+    write_direct_window_bundle,
+)
 from ponyexl3.convert.reference_search import quantize_tile_reference
 from ponyexl3.ref.reconstruct import reconstruct_public_weights
 from ponyexl3.ref.trellis import pack_trellis_tile, unpack_trellis_tile
@@ -52,6 +59,96 @@ def test_bf16_to_float32_known_values():
     words = np.array([0x3F80, 0xC000, 0x0000, 0x3F00], dtype=np.uint16)
     got = bf16_to_float32(words)
     np.testing.assert_array_equal(got, np.array([1.0, -2.0, 0.0, 0.5], dtype=np.float32))
+
+
+def _write_synthetic_source(model_dir: Path, module_key: str, public_weight: np.ndarray) -> None:
+    shard = "model.safetensors"
+    tensor_key = f"{module_key}.weight"
+    weight = public_weight.T.astype(np.float16)
+    save_file({tensor_key: weight}, str(model_dir / shard))
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": int((model_dir / shard).stat().st_size)},
+                "weight_map": {tensor_key: shard},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_synthetic_oracle(model_dir: Path, module_key: str, k: int = 4) -> None:
+    shard = "model.safetensors"
+    trellis_key = f"{module_key}.trellis"
+    trellis = np.zeros((8, 8, 256 * k // 16), dtype=np.uint16)
+    save_file({trellis_key: trellis}, str(model_dir / shard))
+    stored = {
+        trellis_key: {
+            "dtype": "uint16",
+            "shape": [int(x) for x in trellis.shape],
+            "n_bytes": int(trellis.nbytes),
+        }
+    }
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": int((model_dir / shard).stat().st_size)},
+                "weight_map": {trellis_key: shard},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (model_dir / "quantization_config.json").write_text(
+        json.dumps(
+            {
+                "quant_method": "exl3",
+                "tensor_storage": {
+                    module_key: {
+                        "quant_format": "exl3",
+                        "bits_per_weight": float(k),
+                        "mcg_multiplier": True,
+                        "mul1_multiplier": False,
+                        "stored_tensors": stored,
+                    }
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_direct_layer_identity_synthetic_emits_loadable_layer(tmp_path: Path):
+    module_key = PILOT_MODULE
+    source_dir = tmp_path / "source"
+    oracle_dir = tmp_path / "oracle"
+    out_dir = tmp_path / "out"
+    source_dir.mkdir()
+    oracle_dir.mkdir()
+    rng = np.random.default_rng(123)
+    public_weight = (rng.standard_normal((128, 128)) * 0.05).astype(np.float32)
+    _write_synthetic_source(source_dir, module_key, public_weight)
+    _write_synthetic_oracle(oracle_dir, module_key)
+
+    result = direct_quantize_layer(
+        source_dir,
+        oracle_dir,
+        module_key,
+        search_backend="metal" if _metal_available() else "cpu",
+        scale_mode="identity",
+    )
+    assert result.layer.in_features == 128
+    assert result.layer.out_features == 128
+    assert result.layer.trellis.shape == (8, 8, 64)
+    assert result.stats["pack_roundtrip"] is True
+    assert np.isfinite(result.converted_output).all()
+
+    loaded = write_direct_layer_bundle(result, out_dir)
+    assert loaded.in_features == 128
+    assert loaded.out_features == 128
+    assert loaded.trellis.shape == result.layer.trellis.shape
 
 
 @pytest.mark.skipif(
