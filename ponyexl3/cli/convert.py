@@ -162,8 +162,16 @@ def main() -> int:
                 print(
                     "Hessian proxy: "
                     f"rel RMS={stats['hessian_proxy_rel_rms']:.6f}  "
+                    f"oracle={stats.get('oracle_hessian_proxy_rel_rms', float('nan')):.6f}  "
+                    f"ratio={stats.get('hessian_proxy_rel_rms_over_oracle', float('nan')):.6f}  "
                     f"diag_mean={stats['hessian_diag_mean']:.6e}  "
                     f"ldl_retries={stats['ldl_retries']:.0f}"
+                )
+            if "oracle_output_rel_rms" in stats:
+                print(
+                    "Oracle output: "
+                    f"rel RMS={stats['oracle_output_rel_rms']:.6f}  "
+                    f"converted/oracle={stats['output_rel_rms_over_oracle']:.6f}"
                 )
             print(f"pack roundtrip: {stats['pack_roundtrip']}")
             if "emitted" in summary:

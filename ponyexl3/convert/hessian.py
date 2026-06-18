@@ -196,6 +196,57 @@ def public_activations_to_inner(activations: np.ndarray, suh: np.ndarray | None)
     return had_r_128(x, pre_scale=suh).astype(np.float32, copy=False)
 
 
+def public_matrix_to_inner(
+    public_weight: np.ndarray,
+    *,
+    suh: np.ndarray | None,
+    svh: np.ndarray | None,
+) -> np.ndarray:
+    """Transform a public weight matrix into the comparable EXL3 inner domain."""
+
+    if public_weight.ndim != 2:
+        raise ValueError(f"expected 2D public weight matrix, got {public_weight.shape}")
+    rows, cols = public_weight.shape
+    if rows % HAD_DIM != 0 or cols % HAD_DIM != 0:
+        raise ValueError(f"public weight shape must be 128-multiple, got {public_weight.shape}")
+    out = np.empty((rows, cols), dtype=np.float32)
+    for in_start in range(0, rows, HAD_DIM):
+        su_slice = None if suh is None else suh[in_start : in_start + HAD_DIM]
+        for out_start in range(0, cols, HAD_DIM):
+            sv_slice = None if svh is None else svh[out_start : out_start + HAD_DIM]
+            out[in_start : in_start + HAD_DIM, out_start : out_start + HAD_DIM] = (
+                public_block_to_inner_with_scale_slices(
+                    public_weight[
+                        in_start : in_start + HAD_DIM,
+                        out_start : out_start + HAD_DIM,
+                    ],
+                    su=su_slice,
+                    sv=sv_slice,
+                )
+            )
+    return out
+
+
+def oracle_comparison_weights(
+    layer: EXL3Layer,
+    *,
+    suh: np.ndarray | None,
+    svh: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return oracle weights in both public and comparable inner domains."""
+
+    oracle_public = reconstruct_public_weights(
+        layer.trellis,
+        layer.suh,
+        layer.svh,
+        layer.k,
+        mcg=layer.mcg,
+        mul1=layer.mul1,
+    ).astype(np.float32)
+    oracle_inner = public_matrix_to_inner(oracle_public, suh=suh, svh=svh)
+    return oracle_inner, oracle_public
+
+
 def ldlq_inner_matrix(
     inner: np.ndarray,
     l_factor: np.ndarray,
@@ -346,6 +397,7 @@ def ldlq_quantize_layer(
 
     inner_acts = public_activations_to_inner(fixture.activations, suh)
     prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
+    oracle_inner, oracle_public = oracle_comparison_weights(ref_layer, suh=suh, svh=svh)
     ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
     quantized = ldlq_inner_matrix(
         target_inner,
@@ -383,12 +435,24 @@ def ldlq_quantize_layer(
     x = fixture.activations.astype(np.float32)
     source_y = x @ source_public
     converted_y = x @ reconstructed_public
+    oracle_y = x @ oracle_public
     public_delta = reconstructed_public - source_public
     output_delta = converted_y - source_y
+    oracle_public_delta = oracle_public - source_public
+    oracle_output_delta = oracle_y - source_y
     public_sse = float(np.sum(public_delta * public_delta))
     public_ref_ss = float(np.sum(source_public * source_public))
     output_sse = float(np.sum(output_delta * output_delta))
     output_ref_ss = float(np.sum(source_y * source_y))
+    oracle_public_sse = float(np.sum(oracle_public_delta * oracle_public_delta))
+    oracle_output_sse = float(np.sum(oracle_output_delta * oracle_output_delta))
+    oracle_proxy = hessian_proxy_stats(
+        oracle_inner - target_inner,
+        prepared.hessian,
+        reference=target_inner,
+    )
+    converted_proxy_rel = float(quantized.stats.get("hessian_proxy_rel_rms", float("nan")))
+    oracle_proxy_rel = oracle_proxy.proxy_rel_rms
 
     stats = dict(quantized.stats)
     stats.update(
@@ -401,6 +465,28 @@ def ldlq_quantize_layer(
             ),
             "output_mse": mse_from_sse(output_sse, int(source_y.size)),
             "output_rel_rms": rel_rms_from_sse(output_sse, output_ref_ss, int(source_y.size)),
+            "oracle_public_mse": mse_from_sse(oracle_public_sse, int(source_public.size)),
+            "oracle_public_rel_rms": rel_rms_from_sse(
+                oracle_public_sse,
+                public_ref_ss,
+                int(source_public.size),
+            ),
+            "oracle_output_mse": mse_from_sse(oracle_output_sse, int(source_y.size)),
+            "oracle_output_rel_rms": rel_rms_from_sse(
+                oracle_output_sse,
+                output_ref_ss,
+                int(source_y.size),
+            ),
+            "oracle_hessian_proxy_sse": oracle_proxy.proxy_sse,
+            "oracle_hessian_proxy_mse": oracle_proxy.proxy_mse,
+            "oracle_hessian_proxy_rel_rms": oracle_proxy_rel,
+            "hessian_proxy_rel_rms_over_oracle": float(
+                converted_proxy_rel / (oracle_proxy_rel + 1e-20)
+            ),
+            "output_rel_rms_over_oracle": float(
+                np.sqrt(mse_from_sse(output_sse, int(source_y.size)))
+                / (np.sqrt(mse_from_sse(oracle_output_sse, int(source_y.size))) + 1e-20)
+            ),
             "suh_zero_replacements": float(suh_zero_count),
             "svh_zero_replacements": float(svh_zero_count),
             "hessian_diag_mean": prepared.diag_mean,

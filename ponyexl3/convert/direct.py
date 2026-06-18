@@ -121,10 +121,10 @@ def public_block_to_inner_with_scale_slices(
     block = public_block.astype(np.float32)
     if sv is not None:
         block = block / sv.reshape(1, HAD_DIM).astype(np.float32)
-    block = preapply_had_right(block.astype(np.float32)).astype(np.float32)
+        block = preapply_had_right(block.astype(np.float32)).astype(np.float32)
     if su is not None:
         block = block / su.reshape(HAD_DIM, 1).astype(np.float32)
-    block = preapply_had_left(block.astype(np.float32)).astype(np.float32)
+        block = preapply_had_left(block.astype(np.float32)).astype(np.float32)
     return block
 
 

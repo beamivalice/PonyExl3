@@ -17,6 +17,7 @@ from ponyexl3.convert.hessian import (
     ldlq_quantize_layer,
     ldlq_inner_matrix,
     prepare_hessian_for_ldl,
+    public_matrix_to_inner,
 )
 from ponyexl3.ref.codebook import CodebookMode
 from ponyexl3.ref.trellis import unpack_trellis
@@ -132,6 +133,13 @@ def test_ldlq_identity_hessian_matches_direct_quantization():
     assert result.stats["pack_roundtrip"] is True
 
 
+def test_public_matrix_to_inner_identity_mode_is_noop():
+    rng = np.random.default_rng(105)
+    public = rng.standard_normal((128, 128)).astype(np.float32)
+    inner = public_matrix_to_inner(public, suh=None, svh=None)
+    np.testing.assert_allclose(inner, public, rtol=0.0, atol=2e-6)
+
+
 def test_ldlq_correlated_hessian_emits_roundtrippable_proxy_stats():
     rng = np.random.default_rng(103)
     activations = rng.standard_normal((128, 32)).astype(np.float32)
@@ -194,6 +202,11 @@ def test_ldlq_layer_identity_synthetic_emits_loadable_layer(tmp_path: Path):
     assert result.stats["pack_roundtrip"] is True
     assert np.isfinite(result.converted_output).all()
     assert np.isfinite(float(result.stats["hessian_proxy_rel_rms"]))
+    assert np.isfinite(float(result.stats["oracle_hessian_proxy_rel_rms"]))
+    assert np.isfinite(float(result.stats["hessian_proxy_rel_rms_over_oracle"]))
+    assert np.isfinite(float(result.stats["oracle_output_rel_rms"]))
+    assert float(result.stats["hessian_proxy_rel_rms_over_oracle"]) < 1.0
+    assert float(result.stats["output_rel_rms_over_oracle"]) < 1.0
 
     loaded = write_direct_layer_bundle(result, out_dir)
     assert loaded.in_features == 128
