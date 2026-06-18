@@ -2,6 +2,25 @@
 
 All notable changes to PonyExl3 are documented here.
 
+## [0.2.0] — 2026-06-18
+
+### Inference
+
+- MiniCPM5-1B EXL3 support (`model_type` `llama` / LlamaForCausalLM layout)
+- ~152 tok/s greedy decode on M5 Max (8k prefill, 128 gen); ~0.9 GB resident
+
+### Converter (`ponyexl3-convert`)
+
+- HF → EXL3 conversion on Metal: trellis search, Hessian/LDLQ, regularization, calibration, allocation
+- Full-model conversion validated on MiniCPM5-1B (~7 min direct path on M5 Max)
+- Module/layer/model scope; manifest output (`ponyexl3_convert_manifest.json`)
+- Metal search speedups: vectorized trellis packing, oracle-metrics fast path
+
+### Tests
+
+- Converter gate suite (`tests/test_convert*.py`, 59+ tests)
+- MiniCPM5 load integration (`tests/test_minicpm5_model.py`)
+
 ## [0.1.7] — 2026-06-13
 
 - Gemma4-26B-A4B EXL3 support (`model_type` `gemma4` / `gemma4_text`)

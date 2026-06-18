@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -139,8 +140,18 @@ def test_module_set_bit_plan_overrides_emitted_k(tmp_path: Path, monkeypatch: py
     assert manifest["bit_plan"] == {key: 5}
 
 
-MINICPM_SOURCE = Path("/Users/beam/llm/models/MiniCPM5-1B")
-MINICPM_ORACLE = Path("/Users/beam/llm/models/Exl3/MiniCPM5-1B-exl3-4.00bpw")
+_EXL3_DIR = Path(
+    os.environ.get("PONYEXL3_MODELS_DIR", Path.home() / "llm/models/exl3")
+)
+MINICPM_SOURCE = Path(
+    os.environ.get("PONYEXL3_MODEL_MINICPM5_SOURCE", Path.home() / "llm/models/MiniCPM5-1B")
+)
+MINICPM_ORACLE = Path(
+    os.environ.get(
+        "PONYEXL3_MODEL_MINICPM5",
+        _EXL3_DIR / "MiniCPM5-1B-exl3-4.00bpw",
+    )
+)
 
 
 @pytest.mark.skipif(

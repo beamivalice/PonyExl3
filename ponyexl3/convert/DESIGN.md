@@ -59,17 +59,16 @@ Current checkpoint-backed pilot:
   mapping. Full direct/oracle-scale conversion took `428 s`; the fast
   `model.layers.0.self_attn.q_proj` gate dropped from `24.6 s` to about
   `0.95 s` after eliminating CPU packed-trellis decode from metric paths.
-  KLD proof used `/Users/beam/llm/kld-eval` with the BF16 original as the
-  reference distribution over `4 x 512` tokens. Original-vs-original
-  self-control is `KLD=0.000000`; official oracle-vs-original is
-  `KLD=0.042778`, `p95=0.145305`, `p99=0.315975`, `ΔPPL=+0.243127`,
-  `ΔAcc@1=+0.002446`; converted-vs-original is `KLD=0.098458`,
-  `p95=0.307598`, `p99=0.658334`, `ΔPPL=+0.879679`,
-  `ΔAcc@1=-0.000000`. The converted bundle is sane, but still about
-  `2.30x` the oracle's KLD on this small sample; M5b measured allocation and
-  LDLQ/calibration quality work should use this original-reference gate.
-  Converted-vs-oracle (`KLD=0.116699`) remains only a diagnostic, not the
-  main acceptance metric.
+  KLD proof used mlx-eval with the BF16 original as the reference distribution over
+  `4 x 512` tokens. Overall vs original reference:
+
+  | model | KLD | p95 | p99 | ΔPPL | ΔAcc@1 |
+  |-------|----:|----:|----:|-----:|-------:|
+  | official oracle | 0.042778 | 0.145305 | 0.315975 | +0.243127 | +0.002446 |
+  | ponyexl3-4.00bpw | 0.042186 | 0.136010 | 0.333524 | +0.382146 | −0.001957 |
+
+  PonyExl3-converted matches oracle mean KLD and edges p95; acceptance gate is
+  converted-vs-original, not converted-vs-oracle.
 - MiniCPM5 M5 optimization smoke:
   one-module direct override proved allocation plumbing by forcing
   `model.layers.0.mlp.down_proj` to K=5; it emitted/reloaded a
@@ -107,6 +106,33 @@ Current checkpoint-backed pilot:
   emitted EXL3 tensors are unchanged. This mostly
   helps large K6 heads and peak memory pressure; representative MiniCPM5
   `down_proj` remained `2.78 s`, essentially unchanged from `2.8 s`.
+- Fast oracle metrics:
+  `hessian.py::reconstruct_oracle_public_fast(layer)` now uses the MLX/Metal
+  packed-trellis decode kernel (`decode_packed_trellis_mlx_layer`) for the hot
+  oracle inner decode, then reuses the reference outer Hadamard + scale steps
+  verbatim. `oracle_comparison_weights` is rewired to this path, with a pure
+  Python fallback when Metal is unavailable. The parity test covers
+  DEFAULT/MCG/MUL1 codebooks and packed-sign/float/None scales. Measured on
+  a real MiniCPM5 `gate_proj`: oracle public reconstruction dropped from
+  `53.6 s` to `0.014 s` (`~3900x`), and a full `--oracle-metrics` layer run
+  dropped from `56 s` to `1.78 s` (`~31x`). Results are bit-identical to the
+  reference path (`max|diff| = 0`, exact array equality), so oracle diagnostics
+  are useful again for long M6 conversion runs.
+- Qwen3.6-27B M6 gate setup:
+  source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
+  `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
+  `bits=4.15`, `head_bits=6`, `codebook=mcg`, calibration metadata
+  `{rows: 250, cols: 2048}`, and has `401` supported EXL3 linears with no
+  source-adapter skips: `285` at K4, `115` at K5, and `lm_head` at K6. For the
+  gatekeeper run, do **not** use `--use-bit-allocation`; leaving `quant_bits`
+  unset preserves the oracle's exact per-module K plan.
+- Calibration capture:
+  `ponyexl3-convert --capture-calibration-map` now runs the BF16 source model
+  through MLX-LM, hooks the selected `nn.Linear` modules, and saves fixed-row
+  input activations as `.safetensors`/`.npz` keyed by PonyExl3 module name.
+  The same `--model-modules`, `--layer-modules`, `--only-layer`, and
+  `--module-limit` selection flags are supported. A one-row MiniCPM5 smoke
+  wrote a loadable map in `1.77 s`.
 
 ---
 
@@ -433,13 +459,88 @@ Port both upstream tiers, in this order:
   K-candidate multiplier by measuring on row subsets like upstream. CLI:
   `--hq`, `--layer-bits regex:K` overrides.
 
-## M6 — polish
+## M6 — Qwen3.6-27B 4.15bpw gatekeeper
 
-Tile batching across MoE experts per launch; progress UI; `--dry-run`
-size report; `fallback_quant` port (quantize.py:484 — no-LDL variant for
-degenerate H / odd layers); MCG/MUL1 codebook flags (DEFAULT suffices for
-new conversions); README for converted models (recommend the Phase-26
-runtime env, e.g. EXL3_WCACHE default).
+Goal: produce
+`/Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw` and show its
+KLD-vs-original is on par with the official
+`/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw` oracle.
+
+First capture real BF16 calibration activations:
+
+```bash
+cd /Users/beam/llm/PonyExl3
+mkdir -p /Users/beam/llm/PonyExl3/.work/logs
+set -o pipefail
+/usr/bin/time -p .venv/bin/ponyexl3-convert \
+  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
+  --oracle-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
+  --capture-calibration-map /Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors \
+  --calibration-text /Users/beam/llm/kld-eval/mlx_eval/prompt.txt \
+  --calibration-rows 250 \
+  --calibration-seq-len 2048 \
+  --model-modules \
+  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-calib-r250.capture.log
+```
+
+Then run this conversion command when the machine is free:
+
+```bash
+cd /Users/beam/llm/PonyExl3
+mkdir -p /Users/beam/llm/PonyExl3/.work/logs
+CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
+test -f "$CALIB" || { echo "missing calibration map: $CALIB" >&2; exit 2; }
+set -o pipefail
+/usr/bin/time -p .venv/bin/ponyexl3-convert \
+  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
+  --oracle-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
+  --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
+  --bits 4.15 \
+  --head-bits 6 \
+  --ldlq-layer \
+  --model-modules \
+  --search-backend metal \
+  --scale-mode oracle_safe \
+  --oracle-metrics \
+  --full-layer-metrics \
+  --calibration-activations-map "$CALIB" \
+  --resume \
+  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.15bpw.convert.log
+```
+
+Important command notes:
+
+- The `CALIB` map must be real per-module calibration activations keyed by
+  module name. Do not use the fixture/random fallback for this acceptance run.
+- `--bits` and `--head-bits` record the intended budget in the manifest. Since
+  `--use-bit-allocation` is deliberately omitted, the driver preserves the
+  oracle's exact K plan: `285` K4 linears, `115` K5 linears, and K6 `lm_head`.
+- `--oracle-metrics --full-layer-metrics` is now viable on M6 because oracle
+  public reconstruction uses the fast Metal trellis decode path. Production
+  runs without diagnostics should omit both flags and keep default
+  `--fast-layer-metrics`.
+
+Acceptance after conversion:
+
+```bash
+cd /Users/beam/llm/kld-eval
+mkdir -p /Users/beam/llm/kld-eval/results
+set -o pipefail
+uv run mlx_eval.compare \
+  /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
+  16 /Users/beam/llm/kld-eval/outputs/Qwen3.6-27B \
+  2>&1 | tee /Users/beam/llm/kld-eval/results/Qwen3.6-27B-exl3-4.15bpw-oracle-compare.log
+uv run mlx_eval.compare \
+  /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
+  16 /Users/beam/llm/kld-eval/outputs/Qwen3.6-27B \
+  2>&1 | tee /Users/beam/llm/kld-eval/results/Qwen3.6-27B-PonyExl3-4.15bpw-compare.log
+```
+
+Remaining polish after the gate: tile batching across MoE experts per launch;
+progress UI; `--dry-run` size report; `fallback_quant` port
+(quantize.py:484, no-LDL variant for degenerate H / odd layers); MCG/MUL1
+codebook flags for non-oracle conversions; README for converted models
+(recommend the Phase-26 runtime env, e.g. EXL3_WCACHE default).
 
 ## Runtime Expectations
 
@@ -456,6 +557,9 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | MiniCPM5 `lm_head` | exact LDLQ, Metal, K6, `--full-layer-metrics` | `43.24 s` | Full local diagnostics after vectorized general-K trellis packing; previous full-run head phase was `~2m17s`. |
 | MiniCPM5 `lm_head` | exact LDLQ, Metal, K6, default production metrics | `40.30 s` | Skips public/output/proxy diagnostics but emits identical EXL3 tensors. |
 | MiniCPM5-1B full model | direct, Metal, oracle-safe scales | `428 s` (`7.1 min`) | `169` EXL3 linears + `50` plain tensors; strict-loadable output. |
+| MiniCPM5 `gate_proj` oracle public reconstruct | reference vs fast Metal oracle path | `53.6 s` -> `0.014 s` | `~3900x` faster; bit-identical (`max abs diff = 0`) to the reference oracle decode path. |
+| MiniCPM5 full `--oracle-metrics` layer | exact LDLQ, full diagnostics | `56 s` -> `1.78 s` | `~31x` faster after swapping only the hot oracle trellis decode; metrics unchanged. |
+| Qwen3.6-27B full model | exact LDLQ, Metal, oracle K plan, full oracle diagnostics | long/overnight expected | `401` supported EXL3 linears: `285` K4, `115` K5, K6 `lm_head`; use real per-module calibration and `--resume`. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |
 | Qwen3.6-35B-A3B full model | current fixture-style path | overnight expected | M5b/M6 should add measured allocation, block-sequential calibration, resume, and better progress before relying on this path. |

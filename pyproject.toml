@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ponyexl3"
-version = "0.1.7"
-description = "EXL3 quantized LLM inference on Apple Silicon via MLX"
+version = "0.2.0"
+description = "EXL3 quantized LLM inference and conversion on Apple Silicon via MLX"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "Apache-2.0"
 authors = [{name = "Theinruj Toranavikrai", email = "my.beam@gmail.com"}]
 keywords = ["mlx", "quantization", "llm", "apple-silicon", "exl3"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",

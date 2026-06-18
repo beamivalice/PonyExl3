@@ -10,6 +10,7 @@ driver and emits one multi-layer EXL3 bundle plus a manifest.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 from pathlib import Path
 import re
@@ -159,6 +160,19 @@ def _module_set_progress(scope: str):
     return emit
 
 
+def _calibration_capture_progress(event: str, data: dict[str, object]) -> None:
+    if event != "calibration_seq":
+        return
+    print(
+        "calibration "
+        f"seqs={_as_int(data.get('seqs_run'))} "
+        f"captured={_as_int(data.get('captured_modules'))}/"
+        f"{_as_int(data.get('module_count'))}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in-dir", required=True, type=Path, help="source HF checkpoint")
@@ -217,6 +231,43 @@ def main() -> int:
         "--module-limit",
         type=int,
         help="limit selected modules for bounded layer-driver smoke runs",
+    )
+    parser.add_argument(
+        "--capture-calibration-map",
+        type=Path,
+        help=(
+            "capture real BF16 source activations for selected modules and exit; "
+            "output may be .safetensors or .npz and is consumable by "
+            "--calibration-activations-map"
+        ),
+    )
+    parser.add_argument(
+        "--calibration-text",
+        type=Path,
+        help="text file used by --capture-calibration-map",
+    )
+    parser.add_argument(
+        "--calibration-rows",
+        type=int,
+        default=250,
+        help="activation rows per module captured by --capture-calibration-map",
+    )
+    parser.add_argument(
+        "--calibration-seq-len",
+        type=int,
+        default=2048,
+        help="token sequence length per forward for --capture-calibration-map",
+    )
+    parser.add_argument(
+        "--calibration-max-seqs",
+        type=int,
+        help="maximum forwards for --capture-calibration-map; default is enough to fill rows",
+    )
+    parser.add_argument(
+        "--calibration-capture-dtype",
+        choices=("float16", "float32"),
+        default="float16",
+        help="stored activation dtype for --capture-calibration-map",
     )
     parser.add_argument(
         "--use-bit-allocation",
@@ -338,6 +389,69 @@ def main() -> int:
             print(f"search-backend=auto -> {args.search_backend} ({detail})", file=sys.stderr)
 
     try:
+        if args.capture_calibration_map is not None:
+            if args.calibration_text is None:
+                raise ValueError("--capture-calibration-map requires --calibration-text")
+            from ponyexl3.convert.capture import capture_calibration_activations
+            from ponyexl3.convert.driver import (
+                supported_model_module_keys,
+                supported_module_keys,
+            )
+
+            if args.model_modules:
+                module_keys, pre_skipped = supported_model_module_keys(
+                    args.in_dir,
+                    args.oracle_dir,
+                    include_routed_experts=args.include_routed_experts,
+                    module_limit=args.module_limit,
+                )
+            elif args.layer_modules:
+                if args.only_layer is None:
+                    raise ValueError("--layer-modules requires --only-layer")
+                module_keys, pre_skipped = supported_module_keys(
+                    args.in_dir,
+                    args.oracle_dir,
+                    args.only_layer,
+                    include_routed_experts=args.include_routed_experts,
+                    module_limit=args.module_limit,
+                )
+            else:
+                module_keys = [args.only_module]
+                pre_skipped = []
+
+            if not module_keys:
+                raise ValueError("no supported modules selected for calibration capture")
+            if pre_skipped and not args.json:
+                print(
+                    f"calibration capture: skipped {len(pre_skipped)} unsupported modules",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            summary = capture_calibration_activations(
+                args.in_dir,
+                module_keys,
+                args.capture_calibration_map,
+                text_path=args.calibration_text,
+                rows=args.calibration_rows,
+                seq_len=args.calibration_seq_len,
+                max_seqs=args.calibration_max_seqs,
+                dtype=args.calibration_capture_dtype,
+                progress=None if args.json else _calibration_capture_progress,
+            )
+            out = asdict(summary)
+            out["pre_skipped"] = pre_skipped
+            if args.json:
+                print(json.dumps(out, indent=2, sort_keys=True))
+            else:
+                print(
+                    f"calibration map: output={summary.output} "
+                    f"captured={summary.captured_count}/{summary.module_count} "
+                    f"rows={summary.rows} seqs={summary.seqs_run}"
+                )
+                if summary.missing:
+                    print(f"missing={summary.missing[:10]}")
+            return 0
+
         calibration_activations = (
             None
             if args.calibration_activations is None
