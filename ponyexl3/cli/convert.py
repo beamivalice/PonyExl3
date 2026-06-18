@@ -1,8 +1,9 @@
 """HF -> EXL3 converter bring-up CLI.
 
 The default mode is the fast oracle-comparable tile pilot. `--direct-window`
-quantizes one 128x128 Hadamard block, and `--direct-layer` quantizes a whole
-linear module. Both direct modes can emit a minimal loadable EXL3 bundle.
+quantizes one 128x128 Hadamard block, `--direct-layer` quantizes a whole
+linear module without error feedback, and `--ldlq-layer` adds Hessian/LDLQ
+error feedback. Layer modes can emit a minimal loadable EXL3 bundle.
 """
 
 from __future__ import annotations
@@ -52,10 +53,15 @@ def main() -> int:
         help="directly quantize the whole selected linear module",
     )
     parser.add_argument(
+        "--ldlq-layer",
+        action="store_true",
+        help="quantize the whole selected linear module with Hessian/LDLQ",
+    )
+    parser.add_argument(
         "--scale-mode",
         choices=("oracle", "oracle_safe", "identity"),
         default="oracle_safe",
-        help="scale source for --direct-layer; oracle_safe replaces zero oracle scales with 1",
+        help="scale source for layer modes; oracle_safe replaces zero oracle scales with 1",
     )
     parser.add_argument(
         "--search-backend",
@@ -63,28 +69,50 @@ def main() -> int:
         default="cpu",
         help="trellis search backend for the tile pilot",
     )
+    parser.add_argument("--sigma-reg", type=float, default=0.025, help="Hessian diagonal damping")
+    parser.add_argument(
+        "--buf-size-rows",
+        type=int,
+        default=128,
+        help="LDLQ row buffer size; must be a 16-multiple",
+    )
     parser.add_argument("--resume", action="store_true", help="reserved for full conversion")
     parser.add_argument("--json", action="store_true", help="print JSON only")
     args = parser.parse_args()
 
     try:
-        if args.direct_window and args.direct_layer:
-            raise ValueError("--direct-window and --direct-layer are mutually exclusive")
-        if args.direct_layer:
+        layer_modes = int(args.direct_window) + int(args.direct_layer) + int(args.ldlq_layer)
+        if layer_modes > 1:
+            raise ValueError("--direct-window, --direct-layer, and --ldlq-layer are mutually exclusive")
+        if args.direct_layer or args.ldlq_layer:
             from ponyexl3.convert.direct import (
                 direct_layer_summary,
                 direct_quantize_layer,
                 write_direct_layer_bundle,
             )
 
-            result = direct_quantize_layer(
-                args.in_dir,
-                args.oracle_dir,
-                args.only_module,
-                search_backend=args.search_backend,
-                scale_mode=args.scale_mode,
-            )
-            summary = direct_layer_summary(result)
+            if args.ldlq_layer:
+                from ponyexl3.convert.hessian import ldlq_layer_summary, ldlq_quantize_layer
+
+                result = ldlq_quantize_layer(
+                    args.in_dir,
+                    args.oracle_dir,
+                    args.only_module,
+                    search_backend=args.search_backend,
+                    scale_mode=args.scale_mode,
+                    sigma_reg=args.sigma_reg,
+                    buf_size_rows=args.buf_size_rows,
+                )
+                summary = ldlq_layer_summary(result)
+            else:
+                result = direct_quantize_layer(
+                    args.in_dir,
+                    args.oracle_dir,
+                    args.only_module,
+                    search_backend=args.search_backend,
+                    scale_mode=args.scale_mode,
+                )
+                summary = direct_layer_summary(result)
             summary["requested"] = {
                 "bits": args.bits,
                 "head_bits": args.head_bits,
@@ -94,6 +122,8 @@ def main() -> int:
                 "only_layer": args.only_layer,
                 "search_backend": args.search_backend,
                 "scale_mode": args.scale_mode,
+                "sigma_reg": args.sigma_reg,
+                "buf_size_rows": args.buf_size_rows,
                 "resume": bool(args.resume),
             }
             if args.out_dir is not None:
@@ -111,7 +141,7 @@ def main() -> int:
             print(
                 f"layer: shape={summary['shape']}  K={summary['k']}  "
                 f"codebook={summary['codebook']}  backend={summary['search_backend']}  "
-                f"scale_mode={summary['scale_mode']}"
+                f"scale_mode={summary['scale_mode']}  quantizer={summary.get('quantizer', 'direct')}"
             )
             print(
                 "public rel RMS: "
@@ -128,6 +158,13 @@ def main() -> int:
                 f"suh={stats.get('suh_zero_replacements', 0):.0f}  "
                 f"svh={stats.get('svh_zero_replacements', 0):.0f}"
             )
+            if "hessian_proxy_rel_rms" in stats:
+                print(
+                    "Hessian proxy: "
+                    f"rel RMS={stats['hessian_proxy_rel_rms']:.6f}  "
+                    f"diag_mean={stats['hessian_diag_mean']:.6e}  "
+                    f"ldl_retries={stats['ldl_retries']:.0f}"
+                )
             print(f"pack roundtrip: {stats['pack_roundtrip']}")
             if "emitted" in summary:
                 print(f"emitted: {summary['emitted']['out_dir']}")

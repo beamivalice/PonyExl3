@@ -1,8 +1,9 @@
 # pony-quant: HF → EXL3 converter — engineering roadmap (handoff)
 
 Updated 2026-06-18. Status: **M1 complete, M2 complete, M3b direct full-layer
-emit/load gate complete**
-(`tests/test_convert.py`, `tests/test_convert_metal.py`).
+emit/load gate complete, M4a Hessian/LDLQ one-linear pilot started**
+(`tests/test_convert.py`, `tests/test_convert_metal.py`,
+`tests/test_convert_hessian.py`).
 
 Goal: accept a HuggingFace checkpoint (safetensors), emit an EXL3 checkpoint
 that `ponyexl3/mlx/model.py` loads unmodified, with per-layer bit
@@ -61,7 +62,7 @@ Current checkpoint-backed pilot:
    against each other. Real checkpoints are the only arbiter for format
    conventions.
 
-## What exists now (M1 + M2 + M3b)
+## What exists now (M1 + M2 + M3b + M4a)
 
 - `convert/reference_search.py` — exact numpy Viterbi, any K∈[1,8], any
   codebook mode; tail-biting via pinned re-passes; ~0.5-2 s/tile. This is
@@ -84,12 +85,17 @@ Current checkpoint-backed pilot:
   remains the stable default. `--direct-window` runs the M3 direct 128×128
   block quantizer and writes a minimal loadable EXL3 bundle when `--out-dir`
   is provided. `--direct-layer` quantizes the whole selected linear module;
-  `--scale-mode oracle_safe` keeps oracle scales but replaces zero entries
-  with `1.0`.
+  `--ldlq-layer` runs the M4a Hessian/LDLQ one-linear pilot. `--scale-mode
+  oracle_safe` keeps oracle scales but replaces zero entries with `1.0`.
 - `convert/direct.py` — no-LDL direct conversion for one 128×128 Hadamard
   block and for a full linear module: source BF16 public blocks → scaled inner
   blocks → M2 tile quantization → `EXL3Layer` → optional safetensors bundle +
   `quantization_config.json`/`model.safetensors.index.json` reload gate.
+- `convert/hessian.py` — M4a Hessian/LDLQ primitives: activation Hessian
+  capture, upstream-style diagonal damping, NumPy/Accelerate block-LDL,
+  reverse 16-row LDLQ over inner-domain weights, Hessian proxy metrics, and a
+  fixture-backed one-linear `ldlq_quantize_layer` path that emits the same
+  minimal loadable bundle as direct conversion.
 - `tests/test_convert.py` — transition invariant + bit round-trip +
   MSE bounds, k∈{2,3}, BF16 reader gate, Qwen source adapter gate, CPU
   one-tile oracle gate, guarded Metal one-tile oracle gate, and expected
@@ -99,10 +105,16 @@ Current checkpoint-backed pilot:
   recovery of ideal tail-biting tiles for K∈{2,3,4,5,8}, pack/unpack
   round-trip, forced chunked-batch scratch coverage, and explicit K=1
   rejection.
+- `tests/test_convert_hessian.py` — M4a gates: Hessian capture/regularize +
+  block-LDL identity-block checks, identity-Hessian LDLQ equals direct
+  quantization exactly, correlated-Hessian proxy stats stay bounded against
+  direct quantization, and a guarded Metal synthetic 128×128 LDLQ layer emits
+  and reloads through the existing bundle writer.
 - Verification as of 2026-06-18:
-  `python -m pytest tests/test_convert.py tests/test_convert_metal.py -q`
-  → 21 passed; `python -m pyright ponyexl3/convert ponyexl3/cli/convert.py
-  tests/test_convert.py tests/test_convert_metal.py` → clean.
+  `python -m pytest tests/test_convert.py tests/test_convert_metal.py
+  tests/test_convert_hessian.py -q` → 25 passed; `python -m pyright
+  ponyexl3/convert ponyexl3/cli/convert.py tests/test_convert.py
+  tests/test_convert_metal.py tests/test_convert_hessian.py` → clean.
 
 ---
 
@@ -167,7 +179,7 @@ Original kernel constraints still apply:
   register cliffs near 32 simdgroup accumulators; `_decode_expr` declares
   `dq_val` in-scope (wrap call sites in braces).
 
-## M3 — Regularize + direct one-linear conversion, then Hessian + LDLQ
+## M3 — Regularize + direct one-linear conversion
 
 Status: **M3b complete for direct no-LDL full-layer conversion**. The current
 direct path does not yet regularize or choose scales from scratch; it can use
@@ -176,15 +188,43 @@ identity scales for synthetic tests or `oracle_safe` scales for the Qwen pilot.
 `1.0`, because real `in_proj_qkv` oracle metadata contains non-source-zero
 output channels with zero `svh`.
 
-Next milestone should stay on the same lightweight pilot before expanding:
+Remaining direct-path work should stay on the same lightweight pilot before
+expanding:
 
 1. Port upstream `regularize`, `block_rms`, Hadamard transforms, MCG/default
    codebook flags, and global scale GSS. Gate with one converted EXL3 layer
    loaded through the existing `EXL3Layer`/`EXL3Linear`.
 2. Replace `oracle_safe` with freshly computed `suh`/`svh` from regularize
    and compare against the current oracle-safe baseline.
-3. Only after direct one-linear emit is loading and comparing cleanly, add
-   Hessian capture and reverse 16-row LDLQ.
+
+## M4 — Hessian/LDLQ, driver + emit
+
+Status: **M4a started**. The first implemented slice is converter-local and
+fixture-backed, not yet a layer-sequential model driver:
+
+- `capture_hessian`: `X.T @ X` accumulation with optional normalization.
+- `prepare_hessian_for_ldl`: dead-channel handling and `sigma_reg` diagonal
+  damping.
+- `block_ldl`: NumPy Cholesky with the upstream retry ladder; diagonal 16×16
+  blocks are normalized to identity.
+- `ldlq_inner_matrix`: reverse 16-row LDLQ with tensor-core tile order handled
+  by the M2 quantizer and packed with the existing trellis packer only.
+- `ldlq_quantize_layer`: one full selected linear module through
+  source→inner assembly, fixture activation Hessian, LDLQ, `EXL3Layer`, output
+  metrics, and optional minimal bundle reload through the existing writer.
+- CLI: `--ldlq-layer`, `--sigma-reg`, and `--buf-size-rows`.
+
+Next M4 steps:
+
+1. Run `--ldlq-layer` on the Qwen `in_proj_qkv` pilot with Metal and compare
+   output/proxy error against the direct `oracle_safe` baseline.
+2. Add an oracle proxy comparator: dequantize the oracle layer, transform it
+   into the same inner domain, and compute
+   `tr(E.T @ H @ E) / tr(W.T @ H @ W)` for converted vs oracle.
+3. Port regularized/GSS scale selection so LDLQ no longer depends on oracle
+   scale metadata.
+4. Promote the one-linear path into a layer-0 driver that quantizes all
+   quantizable linears sharing each input Hessian group.
 
 - `hessian.py`: layer-sequential driver. Load the HF model with mlx_lm's
   classes (qwen3_5/qwen3_5_moe already mapped); stream calibration rows
@@ -209,8 +249,6 @@ Next milestone should stay on the same lightweight pilot before expanding:
 - **Gate**: quantize ONE Qwen3.5-2B layer; proxy error
   tr(EHEᵀ)/tr(WHWᵀ) within ~10% of the corresponding layer in the
   upstream-made 4.00bpw checkpoint (dequantize theirs and recompute).
-
-## M4 — driver + emit (~2 days)
 
 - Walk blocks in order; MoE experts are independent Linears — emit
   per-expert tensors exactly like upstream (the stacked layout is an

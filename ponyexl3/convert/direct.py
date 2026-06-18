@@ -75,12 +75,12 @@ def _rel_rms(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sqrt(np.mean(d * d)) / denom)
 
 
-def _mse_from_sse(sse: float, count: int) -> float:
+def mse_from_sse(sse: float, count: int) -> float:
     return float(sse / max(1, count))
 
 
-def _rel_rms_from_sse(sse: float, ref_ss: float, count: int) -> float:
-    return float(np.sqrt(_mse_from_sse(sse, count)) / (np.sqrt(ref_ss / max(1, count)) + 1e-20))
+def rel_rms_from_sse(sse: float, ref_ss: float, count: int) -> float:
+    return float(np.sqrt(mse_from_sse(sse, count)) / (np.sqrt(ref_ss / max(1, count)) + 1e-20))
 
 
 def _scale_window(scale: np.ndarray | None, start: int, size: int) -> np.ndarray | None:
@@ -90,7 +90,7 @@ def _scale_window(scale: np.ndarray | None, start: int, size: int) -> np.ndarray
     return unpacked[start : start + size].astype(np.float16, copy=True)
 
 
-def _scale_full_for_mode(
+def scale_full_for_mode(
     scale: np.ndarray | None,
     size: int,
     mode: ScaleMode,
@@ -110,7 +110,7 @@ def _scale_full_for_mode(
     return out, zero_count
 
 
-def _public_block_to_inner_with_scale_slices(
+def public_block_to_inner_with_scale_slices(
     public_block: np.ndarray,
     *,
     su: np.ndarray | None,
@@ -229,7 +229,7 @@ def direct_quantize_window(
         raise ValueError("direct window oracle suh contains zero scales")
     if sv is not None and np.any(np.abs(sv.astype(np.float32)) < 1e-30):
         raise ValueError("direct window oracle svh contains zero scales")
-    target_inner = _public_block_to_inner_with_scale_slices(
+    target_inner = public_block_to_inner_with_scale_slices(
         source_public,
         su=su,
         sv=sv,
@@ -314,8 +314,8 @@ def direct_quantize_layer(
     out_tiles = ref_layer.out_features // 16
     packed_size = ref_layer.packed_tile_size
     trellis = np.empty((in_tiles, out_tiles, packed_size), dtype=np.uint16)
-    suh, suh_zero_count = _scale_full_for_mode(ref_layer.suh, ref_layer.in_features, scale_mode)
-    svh, svh_zero_count = _scale_full_for_mode(ref_layer.svh, ref_layer.out_features, scale_mode)
+    suh, suh_zero_count = scale_full_for_mode(ref_layer.suh, ref_layer.in_features, scale_mode)
+    svh, svh_zero_count = scale_full_for_mode(ref_layer.svh, ref_layer.out_features, scale_mode)
 
     x = fixture.activations.astype(np.float32)
     source_y = np.zeros((x.shape[0], ref_layer.out_features), dtype=np.float32)
@@ -344,7 +344,7 @@ def direct_quantize_layer(
             source_public_row[:, c0:c1] = public_block
             su_slice = None if suh is None else suh[in_start : in_start + HAD_DIM]
             sv_slice = None if svh is None else svh[out_start : out_start + HAD_DIM]
-            target_inner_row[:, c0:c1] = _public_block_to_inner_with_scale_slices(
+            target_inner_row[:, c0:c1] = public_block_to_inner_with_scale_slices(
                 public_block,
                 su=su_slice,
                 sv=sv_slice,
@@ -411,12 +411,12 @@ def direct_quantize_layer(
     output_ref_ss = float(np.sum(source_y * source_y))
     output_count = int(source_y.size)
     stats: dict[str, float | bool] = {
-        "inner_mse": _mse_from_sse(inner_sse, inner_count),
-        "inner_rel_rms": _rel_rms_from_sse(inner_sse, inner_ref_ss, inner_count),
-        "public_mse": _mse_from_sse(public_sse, public_count),
-        "public_rel_rms": _rel_rms_from_sse(public_sse, public_ref_ss, public_count),
-        "output_mse": _mse_from_sse(output_sse, output_count),
-        "output_rel_rms": _rel_rms_from_sse(output_sse, output_ref_ss, output_count),
+        "inner_mse": mse_from_sse(inner_sse, inner_count),
+        "inner_rel_rms": rel_rms_from_sse(inner_sse, inner_ref_ss, inner_count),
+        "public_mse": mse_from_sse(public_sse, public_count),
+        "public_rel_rms": rel_rms_from_sse(public_sse, public_ref_ss, public_count),
+        "output_mse": mse_from_sse(output_sse, output_count),
+        "output_rel_rms": rel_rms_from_sse(output_sse, output_ref_ss, output_count),
         "pack_roundtrip": True,
         "suh_zero_replacements": float(suh_zero_count),
         "svh_zero_replacements": float(svh_zero_count),
