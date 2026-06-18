@@ -21,9 +21,10 @@ from ponyexl3.convert.direct import (
 )
 from ponyexl3.convert.fixtures import SearchBackend, build_layer_fixture
 from ponyexl3.ref.codebook import CodebookMode
-from ponyexl3.ref.hadamard import HAD_DIM, had_r_128
+from ponyexl3.ref.hadamard import HAD_DIM, had_r_128, preapply_had_left, preapply_had_right
 from ponyexl3.ref.layer import EXL3Layer
 from ponyexl3.ref.reconstruct import reconstruct_public_weights
+from ponyexl3.ref.signs import unpack_signs_or_pass
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,45 @@ def public_matrix_to_inner(
     return out
 
 
+def reconstruct_oracle_public_fast(layer: EXL3Layer) -> np.ndarray:
+    """Metal-decoded twin of ``ref.reconstruct.reconstruct_public_weights``.
+
+    The reference reconstruct decodes the trellis one codeword at a time in
+    Python (``lop3_b32`` runs once per weight element: ~54s for a 7M-param
+    matrix, and it dominates ``--oracle-metrics``). Only the inner trellis decode
+    is hot; the outer Hadamard + per-channel scales are cheap NumPy. This swaps
+    the inner decode for the Metal trellis kernel — validated against the Python
+    reference in ``tests/test_mlx_decode.py`` and bit-identical in practice — and
+    reuses the reference outer steps verbatim, so the public weights are identical
+    at ~4000x the speed. Falls back to the pure-Python reference if Metal is
+    unavailable.
+    """
+
+    try:
+        from ponyexl3.mlx.decode import decode_packed_trellis_mlx_layer
+
+        inner = np.array(decode_packed_trellis_mlx_layer(layer)).astype(np.float16)
+    except Exception:
+        return reconstruct_public_weights(
+            layer.trellis,
+            layer.suh,
+            layer.svh,
+            layer.k,
+            mcg=layer.mcg,
+            mul1=layer.mul1,
+        )
+    w = inner.astype(np.float32)
+    suh_u = unpack_signs_or_pass(layer.suh)
+    svh_u = unpack_signs_or_pass(layer.svh)
+    if suh_u is not None:
+        w = preapply_had_left(w)
+        w *= suh_u.reshape(-1, 1).astype(np.float32)
+    if svh_u is not None:
+        w = preapply_had_right(w)
+        w *= svh_u.reshape(1, -1).astype(np.float32)
+    return w.astype(np.float16)
+
+
 def oracle_comparison_weights(
     layer: EXL3Layer,
     *,
@@ -236,14 +276,7 @@ def oracle_comparison_weights(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return oracle weights in both public and comparable inner domains."""
 
-    oracle_public = reconstruct_public_weights(
-        layer.trellis,
-        layer.suh,
-        layer.svh,
-        layer.k,
-        mcg=layer.mcg,
-        mul1=layer.mul1,
-    ).astype(np.float32)
+    oracle_public = reconstruct_oracle_public_fast(layer).astype(np.float32)
     oracle_inner = public_matrix_to_inner(oracle_public, suh=suh, svh=svh)
     return oracle_inner, oracle_public
 

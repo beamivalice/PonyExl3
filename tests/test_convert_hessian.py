@@ -18,8 +18,11 @@ from ponyexl3.convert.hessian import (
     ldlq_inner_matrix,
     prepare_hessian_for_ldl,
     public_matrix_to_inner,
+    reconstruct_oracle_public_fast,
 )
 from ponyexl3.ref.codebook import CodebookMode
+from ponyexl3.ref.layer import EXL3Layer
+from ponyexl3.ref.reconstruct import reconstruct_public_weights
 from ponyexl3.ref.trellis import unpack_trellis
 
 
@@ -320,3 +323,50 @@ def test_ldlq_layer_computed_scales_with_calibration_rows(tmp_path: Path):
     assert result.stats["regularize_g_scale_skipped"] is True
     np.testing.assert_allclose(result.activations, activations, rtol=0.0, atol=0.0)
     assert np.isfinite(result.converted_output).all()
+
+
+def test_reconstruct_oracle_public_fast_matches_reference():
+    """The Metal-decoded oracle reconstruct must match the Python reference.
+
+    Guards the ~4000x ``--oracle-metrics`` speedup: only the inner trellis decode
+    is swapped (Metal vs per-element Python), so the public weights must be
+    identical across codebook modes and packed-sign / float scales.
+    """
+
+    if not _metal_available():
+        pytest.skip("Metal required")
+
+    rng = np.random.default_rng(7)
+    k = 4
+    in_features = out_features = 128
+    in_tiles, out_tiles = in_features // 16, out_features // 16
+    trellis = rng.integers(
+        0, 1 << 16, size=(in_tiles, out_tiles, 256 * k // 16), dtype=np.uint16
+    )
+    suh_packed = rng.integers(-(1 << 15), 1 << 15, size=in_features // 16, dtype=np.int16)
+    svh_packed = rng.integers(-(1 << 15), 1 << 15, size=out_features // 16, dtype=np.int16)
+    suh_float = (rng.standard_normal(in_features) * 0.1).astype(np.float16)
+    svh_float = (rng.standard_normal(out_features) * 0.1).astype(np.float16)
+
+    cases = [
+        (False, False, suh_packed, svh_packed),
+        (True, False, suh_packed, svh_packed),
+        (False, True, suh_float, svh_float),
+        (False, False, None, None),
+    ]
+    for mcg, mul1, suh, svh in cases:
+        layer = EXL3Layer(
+            key="m",
+            in_features=in_features,
+            out_features=out_features,
+            k=k,
+            trellis=trellis,
+            suh=suh,
+            svh=svh,
+            mcg=mcg,
+            mul1=mul1,
+        )
+        layer.validate()
+        fast = reconstruct_oracle_public_fast(layer)
+        ref = reconstruct_public_weights(trellis, suh, svh, k, mcg=mcg, mul1=mul1)
+        np.testing.assert_array_equal(fast, ref)
