@@ -7,7 +7,9 @@
 
 # PonyExl3
 
-v0.2.1 — Converter can build a quantization plan from BF16 source alone (`--init-quant-config`); bit budget via `--bits` / `--head-bits` / `--layer-bits`. Still beta; Qwen and MiniCPM quality matches turboderp-class oracles.
+v0.2.1 — Now converter can build a quantization plan from BF16 source alone (`--init-quant-config`); bit budget via `--bits` / `--head-bits` / `--layer-bits`. Still beta and need a redesign, our conversion quality is matching the oracles.
+
+Known Issue: The converter design could be much faster, that will be coming soon since it's quite a big change.
 
 ---
 
