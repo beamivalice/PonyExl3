@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
 from typing import Any
 
+from ponyexl3.convert import reuse
 from ponyexl3.convert.calibration import load_calibration_activations_map
 from ponyexl3.convert.capture import capture_calibration_activations
 from ponyexl3.convert.discovery import write_quantization_plan
@@ -398,6 +400,12 @@ def main() -> int:
             },
         )
 
+        # Reuse the measurement's quantized layers in the convert/emit pass: the
+        # winning (K, shrinkage) candidate is bit-identical to what convert would
+        # re-quantize, so this skips the redundant second pass (~2x on the
+        # measure+convert span). Opt out with PONYEXL3_E2E_NO_REUSE=1.
+        if os.environ.get("PONYEXL3_E2E_NO_REUSE", "") in ("", "0", "false", "no"):
+            reuse.enable()
         activations = load_calibration_activations_map(calibration_path)
         measurement = measure_ldlq_candidates(
             args.in_dir,
@@ -478,7 +486,9 @@ def main() -> int:
             incremental_output=True,
             progress=None if args.json else _convert_progress,
         )
+        reuse_stats = reuse.disable()
         conversion_summary = module_set_summary(result)
+        conversion_summary["layer_reuse"] = reuse_stats
         conversion_summary["pre_skipped"] = pre_skipped
         conversion_summary["measurement_plan"] = str(measurement_plan_path)
         conversion_summary["requested"] = {
@@ -509,16 +519,20 @@ def main() -> int:
         _write_json_atomic(work_dir / "pipeline_summary.json", final)
         _stage(state_path, "done", {"summary": str(work_dir / "pipeline_summary.json")})
     except (OSError, KeyError, TypeError, ValueError) as exc:
+        reuse.disable()
         print(str(exc), file=sys.stderr)
         return 1
 
     if args.json:
         print(json.dumps(final, indent=2, sort_keys=True))
     else:
+        reuse_hits = reuse_stats["hits"] if reuse_stats else 0
+        reuse_total = (reuse_stats["hits"] + reuse_stats["misses"]) if reuse_stats else 0
         print(
             "e2e conversion complete: "
             f"out={args.out_dir} modules={len(conversion_summary['completed'])} "
-            f"plan_avg_bits={float(measurement_plan['average_bits']):.6f}"
+            f"plan_avg_bits={float(measurement_plan['average_bits']):.6f} "
+            f"layer_reuse={reuse_hits}/{reuse_total}"
         )
     return 0
 

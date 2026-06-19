@@ -22,6 +22,7 @@ from ponyexl3.convert.direct import (
     quantize_inner_matrix_direct_mlx,
     rel_rms_from_sse,
 )
+from ponyexl3.convert import reuse, timing
 from ponyexl3.convert.fixtures import SearchBackend, build_layer_fixture
 from ponyexl3.ref.codebook import CodebookMode
 from ponyexl3.ref.hadamard import HAD_DIM, had_r_128, preapply_had_left, preapply_had_right
@@ -669,12 +670,35 @@ def ldlq_quantize_layer(
     if fast_metrics and compare_oracle:
         raise ValueError("fast_metrics requires compare_oracle=False")
 
-    fixture = build_layer_fixture(
-        source_dir,
-        oracle_dir,
-        module_key,
-        activations=calibration_activations,
-    )
+    reuse_key = None
+    if reuse.active() and calibration_activations is not None:
+        reuse_key = reuse.make_key(
+            source_dir=source_dir,
+            oracle_dir=oracle_dir,
+            module_key=module_key,
+            scale_mode=scale_mode,
+            sigma_reg=sigma_reg,
+            hessian_shrinkage=hessian_shrinkage,
+            buf_size_rows=buf_size_rows,
+            feedback_rows=feedback_rows,
+            max_pins=max_pins,
+            skip_g_scale=skip_g_scale,
+            regularization_seed=regularization_seed,
+            quant_bits=quant_bits,
+            search_backend=search_backend,
+            acts_fp=reuse.activations_fingerprint(calibration_activations),
+        )
+        cached = reuse.lookup(reuse_key)
+        if cached is not None:
+            return cached
+
+    with timing.phase("fixture"):
+        fixture = build_layer_fixture(
+            source_dir,
+            oracle_dir,
+            module_key,
+            activations=calibration_activations,
+        )
     source = fixture.source
     oracle = fixture.oracle
     ref_layer = oracle.layer
@@ -684,47 +708,52 @@ def ldlq_quantize_layer(
     if k < 1 or k > 8:
         raise ValueError(f"EXL3 trellis K must be in [1, 8], got {k}")
 
-    basis = prepare_layer_quantization_basis(
-        source_dir,
-        source,
-        ref_layer,
-        oracle.cb,
-        scale_mode=scale_mode,
-        search_backend=search_backend,
-        max_pins=max_pins,
-        skip_g_scale=skip_g_scale,
-        regularization_seed=regularization_seed,
-        quant_bits=k,
-    )
+    with timing.phase("basis"):
+        basis = prepare_layer_quantization_basis(
+            source_dir,
+            source,
+            ref_layer,
+            oracle.cb,
+            scale_mode=scale_mode,
+            search_backend=search_backend,
+            max_pins=max_pins,
+            skip_g_scale=skip_g_scale,
+            regularization_seed=regularization_seed,
+            quant_bits=k,
+        )
     target_inner = basis.target_inner
     source_public = basis.source_public
     suh = basis.suh
     svh = basis.svh
 
-    inner_acts, activations_mlx_hadamard = _public_activations_to_inner_for_backend(
-        fixture.activations,
-        suh,
-        search_backend=search_backend,
-    )
-    prepared, hessian_stats = _prepare_activation_hessian(
-        inner_acts,
-        sigma_reg=sigma_reg,
-        hessian_shrinkage=hessian_shrinkage,
-    )
-    ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
-    quantized = ldlq_inner_matrix(
-        target_inner,
-        ldl.l,
-        k=k,
-        cb=oracle.cb,
-        hessian=prepared.hessian,
-        search_backend=search_backend,
-        buf_size_rows=buf_size_rows,
-        feedback_rows=feedback_rows,
-        max_pins=max_pins,
-        collect_states=False,
-        compute_proxy=not fast_metrics,
-    )
+    with timing.phase("act_hadamard"):
+        inner_acts, activations_mlx_hadamard = _public_activations_to_inner_for_backend(
+            fixture.activations,
+            suh,
+            search_backend=search_backend,
+        )
+    with timing.phase("hessian"):
+        prepared, hessian_stats = _prepare_activation_hessian(
+            inner_acts,
+            sigma_reg=sigma_reg,
+            hessian_shrinkage=hessian_shrinkage,
+        )
+    with timing.phase("ldl"):
+        ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
+    with timing.phase("ldlq_loop"):
+        quantized = ldlq_inner_matrix(
+            target_inner,
+            ldl.l,
+            k=k,
+            cb=oracle.cb,
+            hessian=prepared.hessian,
+            search_backend=search_backend,
+            buf_size_rows=buf_size_rows,
+            feedback_rows=feedback_rows,
+            max_pins=max_pins,
+            collect_states=False,
+            compute_proxy=not fast_metrics,
+        )
 
     out_layer = EXL3Layer(
         key=module_key,
@@ -739,6 +768,7 @@ def ldlq_quantize_layer(
     )
     out_layer.validate()
 
+    timing.begin("metrics")
     x = fixture.activations.astype(np.float32)
     public_ref_ss = float(np.sum(source_public * source_public))
 
@@ -833,8 +863,9 @@ def ldlq_quantize_layer(
                     ),
                 }
             )
+    timing.end("metrics")
     stats.update(basis.stats)
-    return DirectLayerResult(
+    result = DirectLayerResult(
         module_key=module_key,
         search_backend=search_backend,
         scale_mode=scale_mode,
@@ -844,6 +875,9 @@ def ldlq_quantize_layer(
         converted_output=converted_y.astype(np.float32),
         stats=stats,
     )
+    if reuse_key is not None:
+        reuse.store(reuse_key, result)
+    return result
 
 
 def _group_prep_worker_count(
@@ -966,6 +1000,33 @@ def ldlq_quantize_group(
         raise ValueError(f"feedback_rows must be a positive 16-multiple, got {feedback_rows}")
     if feedback_rows > buf_size_rows:
         raise ValueError("feedback_rows must be <= buf_size_rows")
+
+    reuse_keys: list[tuple[Any, ...] | None] = [None] * len(keys)
+    if reuse.active():
+        for idx, key in enumerate(keys):
+            acts = calibration_activations
+            if calibration_activations_by_module is not None and key in calibration_activations_by_module:
+                acts = calibration_activations_by_module[key]
+            planned_k = None if quant_bits_by_module is None else quant_bits_by_module.get(key)
+            reuse_keys[idx] = reuse.make_key(
+                source_dir=source_dir,
+                oracle_dir=oracle_dir,
+                module_key=key,
+                scale_mode=scale_mode,
+                sigma_reg=sigma_reg,
+                hessian_shrinkage=hessian_shrinkage,
+                buf_size_rows=buf_size_rows,
+                feedback_rows=feedback_rows,
+                max_pins=max_pins,
+                skip_g_scale=skip_g_scale,
+                regularization_seed=regularization_seed,
+                quant_bits=planned_k,
+                search_backend=search_backend,
+                acts_fp=reuse.activations_fingerprint(acts),
+            )
+        cached_results = [reuse.lookup(rkey) for rkey in reuse_keys]
+        if cached_results and all(item is not None for item in cached_results):
+            return [item for item in cached_results if item is not None]
 
     import mlx.core as mx
 
@@ -1207,6 +1268,9 @@ def ldlq_quantize_group(
                 stats=stats,
             )
         )
+    for result, rkey in zip(out, reuse_keys):
+        if rkey is not None:
+            reuse.store(rkey, result)
     return out
 
 

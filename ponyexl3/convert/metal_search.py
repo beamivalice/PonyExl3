@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 
+from ponyexl3.convert import timing
 from ponyexl3.ref.codebook import CodebookMode
 
 
@@ -281,18 +282,19 @@ def quantize_tiles_mlx(
         raise ValueError("max_scratch_bytes must be positive")
 
     launch_tiles = max(1, max_scratch_bytes // _scratch_bytes_per_tile(k))
-    if n_tiles <= launch_tiles:
-        q_tiles, indices = _quantize_tiles_mlx_launch(arr, k, cb)
-    else:
-        q_parts = []
-        idx_parts = []
-        for start in range(0, n_tiles, launch_tiles):
-            q_part, idx_part = _quantize_tiles_mlx_launch(arr[start : start + launch_tiles], k, cb)
-            q_parts.append(q_part)
-            idx_parts.append(idx_part)
-        q_tiles = mx.concatenate(q_parts, axis=0)
-        indices = mx.concatenate(idx_parts, axis=0)
-    mx.eval(q_tiles, indices)
+    with timing.gpu("search"):
+        if n_tiles <= launch_tiles:
+            q_tiles, indices = _quantize_tiles_mlx_launch(arr, k, cb)
+        else:
+            q_parts = []
+            idx_parts = []
+            for start in range(0, n_tiles, launch_tiles):
+                q_part, idx_part = _quantize_tiles_mlx_launch(arr[start : start + launch_tiles], k, cb)
+                q_parts.append(q_part)
+                idx_parts.append(idx_part)
+            q_tiles = mx.concatenate(q_parts, axis=0)
+            indices = mx.concatenate(idx_parts, axis=0)
+        mx.eval(q_tiles, indices)
     return q_tiles, indices
 
 
