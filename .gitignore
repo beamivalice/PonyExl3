@@ -14,6 +14,7 @@ build/
 venv/
 .work
 .codegraph
+.pytest_cache/
 
 # Local datasets / caches (not shipped)
 data/wikitext/
