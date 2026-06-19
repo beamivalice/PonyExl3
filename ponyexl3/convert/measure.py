@@ -342,8 +342,14 @@ def _candidate_bits_for_module(
     module_key: str,
     *,
     candidate_bits: Sequence[int] | None,
+    candidate_bits_by_module: Mapping[str, Sequence[int]] | None = None,
     bit_plan: Mapping[str, int] | None,
 ) -> list[int | None]:
+    if candidate_bits_by_module is not None and module_key in candidate_bits_by_module:
+        bits: list[int | None] = [int(item) for item in candidate_bits_by_module[module_key]]
+        if not bits:
+            raise ValueError(f"candidate bits for {module_key} must contain at least one value")
+        return bits
     if candidate_bits:
         return [int(bits) for bits in candidate_bits]
     if bit_plan is not None and module_key in bit_plan:
@@ -363,6 +369,7 @@ def _measurement_summary(
     score_metric: str,
     records: Sequence[dict[str, Any]],
     elapsed_s: float,
+    candidate_bits_by_module: Mapping[str, Sequence[int]] | None = None,
 ) -> dict[str, Any]:
     best_by_module: list[dict[str, Any]] = []
     for key in modules:
@@ -393,6 +400,12 @@ def _measurement_summary(
         "module_count": len(modules),
         "candidate_count": len(records),
         "candidate_bits": None if candidate_bits is None else [int(bits) for bits in candidate_bits],
+        "candidate_bits_by_module": None
+        if candidate_bits_by_module is None
+        else {
+            str(module): [int(bits) for bits in bits_list]
+            for module, bits_list in candidate_bits_by_module.items()
+        },
         "hessian_shrinkages": [float(item) for item in shrinkages],
         "score_metric": score_metric,
         "records": list(records),
@@ -431,6 +444,7 @@ def measure_ldlq_candidates(
     module_keys: Sequence[str],
     *,
     candidate_bits: Sequence[int] | None = None,
+    candidate_bits_by_module: Mapping[str, Sequence[int]] | None = None,
     hessian_shrinkages: Sequence[float] = (0.0,),
     bit_plan: Mapping[str, int] | None = None,
     search_backend: SearchBackend = "metal",
@@ -461,13 +475,25 @@ def measure_ldlq_candidates(
             raise ValueError(f"hessian shrinkage candidates must be in [0, 1], got {shrinkage}")
 
     total = sum(
-        len(_candidate_bits_for_module(key, candidate_bits=candidate_bits, bit_plan=bit_plan))
+        len(
+            _candidate_bits_for_module(
+                key,
+                candidate_bits=candidate_bits,
+                candidate_bits_by_module=candidate_bits_by_module,
+                bit_plan=bit_plan,
+            )
+        )
         * len(shrinkages)
         for key in modules
     )
     planned: set[tuple[str, int | None, str]] = set()
     for key in modules:
-        for bits in _candidate_bits_for_module(key, candidate_bits=candidate_bits, bit_plan=bit_plan):
+        for bits in _candidate_bits_for_module(
+            key,
+            candidate_bits=candidate_bits,
+            candidate_bits_by_module=candidate_bits_by_module,
+            bit_plan=bit_plan,
+        ):
             for shrinkage in shrinkages:
                 planned.add(_candidate_identity(key, bits, shrinkage))
 
@@ -496,6 +522,7 @@ def measure_ldlq_candidates(
         for bits in _candidate_bits_for_module(
             key,
             candidate_bits=candidate_bits,
+            candidate_bits_by_module=candidate_bits_by_module,
             bit_plan=bit_plan,
         ):
             if bits is not None and not 1 <= int(bits) <= 8:
@@ -572,6 +599,7 @@ def measure_ldlq_candidates(
                             score_metric=score_metric,
                             records=records,
                             elapsed_s=time.perf_counter() - start,
+                            candidate_bits_by_module=candidate_bits_by_module,
                         ),
                     )
                 if progress is not None:
@@ -598,6 +626,7 @@ def measure_ldlq_candidates(
         score_metric=score_metric,
         records=records,
         elapsed_s=time.perf_counter() - start,
+        candidate_bits_by_module=candidate_bits_by_module,
     )
     if checkpoint is not None:
         _write_json_atomic(checkpoint, summary)

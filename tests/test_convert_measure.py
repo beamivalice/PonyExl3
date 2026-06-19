@@ -148,6 +148,42 @@ def test_measure_ldlq_candidates_uses_bit_plan_when_no_candidate_bits(
     assert [item["k"] for item in summary["best_by_module"]] == [4, 5]
 
 
+def test_measure_ldlq_candidates_supports_per_module_candidate_bits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    seen: list[tuple[str, int | None]] = []
+
+    def fake_ldlq(source_dir, oracle_dir, module_key, **kwargs):  # noqa: ARG001
+        seen.append((module_key, kwargs["quant_bits"]))
+        k = int(kwargs["quant_bits"])
+        layer = _fake_layer(module_key, k)
+        return DirectLayerResult(
+            module_key=module_key,
+            search_backend="metal",
+            scale_mode="computed",
+            layer=layer,
+            activations=np.zeros((1, 128), dtype=np.float32),
+            source_output=np.zeros((1, 128), dtype=np.float32),
+            converted_output=np.zeros((1, 128), dtype=np.float32),
+            stats={"output_rel_rms": 0.0, "pack_roundtrip": True},
+        )
+
+    monkeypatch.setattr(measure, "ldlq_quantize_layer", fake_ldlq)
+
+    summary = measure.measure_ldlq_candidates(
+        tmp_path / "source",
+        tmp_path / "oracle",
+        ["body", "lm_head"],
+        candidate_bits=[4, 5],
+        candidate_bits_by_module={"lm_head": [6]},
+    )
+
+    assert seen == [("body", 4), ("body", 5), ("lm_head", 6)]
+    assert summary["candidate_count"] == 3
+    assert summary["candidate_bits_by_module"] == {"lm_head": [6]}
+
+
 def test_measure_ldlq_candidates_resumes_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

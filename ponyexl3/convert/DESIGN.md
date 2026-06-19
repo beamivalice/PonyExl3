@@ -650,9 +650,10 @@ Resume behavior:
   this is intentional for resume safety and is compatible with the existing
   indexed loader path.
 
-Default measured candidates are `floor(--bits)`, `floor(--bits)+1`, and
-`--head-bits` (default K6), so the Qwen 4.15 command measures K4/K5/K6 and
-forces `lm_head` to K6 during optimization.
+Default measured candidates are `floor(--bits)` and `ceil(--bits)` for normal
+modules, plus a per-module `lm_head` candidate at `--head-bits` (default K6).
+The Qwen 4.15 command therefore measures K4/K5 for the body and K6 only for
+`lm_head`, then forces `lm_head` to K6 during optimization.
 
 For a source-only exact 4.00bpw run, set the head to K4 as well:
 
@@ -800,7 +801,7 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | Measurement-plan handoff | `ponyexl3-convert --measurement-plan plan.json` | sub-second setup | Loads optimized `bit_plan` and global shrinkage before normal conversion; no manual hundreds-of-flags step. |
 | Measurement checkpoint resume | `--measurement-output` / e2e measurement stage | per candidate | Writes atomic partial JSON after every candidate; resume skips completed module/K/shrinkage triples. |
 | Incremental conversion resume | `ponyexl3-convert --resume` module sets / e2e convert stage | per module/group | Writes stable per-layer shards and updates index/config after each completed module; avoids losing hours on `^C`. |
-| Qwen3.6-27B full model | `python -m ponyexl3.cli.convert_e2e --bits 4.15` | long/overnight expected | Source-only plan, BF16 calibration, measured K4/K5/K6 allocation, K6 `lm_head`, incremental multi-shard output. |
+| Qwen3.6-27B full model | `python -m ponyexl3.cli.convert_e2e --bits 4.15` | long/overnight expected | Source-only plan, BF16 calibration, measured K4/K5 body allocation, K6-only `lm_head`, incremental multi-shard output. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |
 | Qwen3.6-35B-A3B full model | current fixture-style path | overnight expected | M5b/M6 should add measured allocation, block-sequential calibration, resume, and better progress before relying on this path. |

@@ -60,6 +60,10 @@ def _natural_key(key: str) -> tuple[Any, ...]:
     return tuple(int(part) if part.isdigit() else part for part in parts)
 
 
+def _model_module_key(key: str) -> tuple[bool, tuple[Any, ...]]:
+    return key == "lm_head", _natural_key(key)
+
+
 def layer_module_keys(
     oracle_dir: str | Path,
     layer_index: int,
@@ -101,7 +105,7 @@ def model_module_keys(
         if not include_routed_experts and ".experts." in key:
             continue
         out.append(key)
-    out = sorted(out, key=_natural_key)
+    out = sorted(out, key=_model_module_key)
     if module_limit is not None:
         out = out[:module_limit]
     return out
@@ -414,7 +418,14 @@ def convert_module_set(
             available = {info["key"] for info in list_exl3_layers(str(out_dir))}
             for key in requested:
                 if key in available:
-                    existing[key] = load_exl3_layer(str(out_dir), key)
+                    try:
+                        layer = load_exl3_layer(str(out_dir), key)
+                    except (FileNotFoundError, KeyError, ValueError):
+                        continue
+                    planned_k = planned_bits.get(key)
+                    if planned_k is not None and int(layer.k) != int(planned_k):
+                        continue
+                    existing[key] = layer
 
     def build_manifest() -> dict[str, Any]:
         return {

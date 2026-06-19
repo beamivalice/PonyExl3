@@ -46,13 +46,23 @@ def _write_json_atomic(path: Path, data: object) -> None:
     tmp.replace(path)
 
 
+def _load_json_object(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} JSON root must be an object")
+    return data
+
+
 def _default_work_dir(out_dir: Path) -> Path:
     return out_dir.with_name(f".{out_dir.name}.ponyexl3-work")
 
 
 def _default_candidate_bits(bits: float, head_bits: int) -> list[int]:
+    _ = head_bits
     base = max(1, min(8, int(math.floor(bits))))
-    out = {base, max(1, min(8, base + 1)), max(1, min(8, int(math.ceil(bits)))), int(head_bits)}
+    out = {base}
+    if not math.isclose(float(bits), float(base), rel_tol=0.0, abs_tol=1e-9):
+        out.add(max(1, min(8, int(math.ceil(bits)))))
     return sorted(bits for bits in out if 1 <= bits <= 8)
 
 
@@ -108,6 +118,14 @@ def _stage(state_path: Path, name: str, data: dict[str, Any]) -> None:
         **data,
     }
     _write_json_atomic(state_path, payload)
+
+
+def _request_mismatches(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    return [
+        key
+        for key, value in current.items()
+        if previous.get(key) != value
+    ]
 
 
 def _calibration_progress(event: str, data: dict[str, object]) -> None:
@@ -215,7 +233,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--candidate-bits",
-        help="comma-separated K candidates; default is floor(bits), floor(bits)+1, head-bits",
+        help=(
+            "comma-separated global non-head K candidates; default is floor(bits) "
+            "and ceil(bits), while lm_head is measured only at --head-bits"
+        ),
     )
     parser.add_argument(
         "--candidate-hessian-shrinkages",
@@ -264,8 +285,14 @@ def main() -> int:
         if not 1 <= args.head_bits <= 8:
             raise ValueError("--head-bits must be in [1, 8]")
         work_dir = args.work_dir or _default_work_dir(args.out_dir)
+        if not args.resume:
+            if args.out_dir.exists() and any(args.out_dir.iterdir()):
+                raise ValueError("--no-resume requires an empty --out-dir; remove it or choose a new output path")
+            if work_dir.exists() and any(work_dir.iterdir()):
+                raise ValueError("--no-resume requires an empty --work-dir; remove it or choose a new work path")
         work_dir.mkdir(parents=True, exist_ok=True)
         state_path = work_dir / "pipeline_state.json"
+        request_path = work_dir / "pipeline_request.json"
         plan_dir = work_dir / "source_quant_plan"
         calibration_path = work_dir / "calibration.safetensors"
         measurement_path = work_dir / "measurements.json"
@@ -275,9 +302,42 @@ def main() -> int:
             args.candidate_bits,
             default=_default_candidate_bits(args.bits, args.head_bits),
         )
-        if args.head_bits not in candidate_bits:
-            candidate_bits = sorted(set(candidate_bits + [args.head_bits]))
         shrinkages = _parse_csv_floats(args.candidate_hessian_shrinkages)
+        candidate_bits_by_module = {"lm_head": [args.head_bits]}
+        request = {
+            "in_dir": str(args.in_dir),
+            "out_dir": str(args.out_dir),
+            "bits": float(args.bits),
+            "head_bits": int(args.head_bits),
+            "codebook": args.codebook,
+            "calibration_text": str(args.calibration_text),
+            "calibration_rows": int(args.calibration_rows),
+            "calibration_seq_len": int(args.calibration_seq_len),
+            "calibration_max_seqs": args.calibration_max_seqs,
+            "calibration_capture_dtype": args.calibration_capture_dtype,
+            "candidate_bits": candidate_bits,
+            "candidate_bits_by_module": candidate_bits_by_module,
+            "candidate_hessian_shrinkages": shrinkages,
+            "measure_score": args.measure_score,
+            "search_backend": search_backend,
+            "sigma_reg": float(args.sigma_reg),
+            "buf_size_rows": int(args.buf_size_rows),
+            "ldlq_feedback_rows": int(args.ldlq_feedback_rows),
+            "module_limit": args.module_limit,
+            "include_routed_experts": bool(args.include_routed_experts),
+        }
+        if args.resume and request_path.is_file():
+            previous_request = _load_json_object(request_path)
+            mismatches = _request_mismatches(previous_request, request)
+            if mismatches:
+                preview = ", ".join(mismatches[:8])
+                suffix = "" if len(mismatches) <= 8 else f", ... +{len(mismatches) - 8}"
+                raise ValueError(
+                    f"work-dir request mismatch on resume: {preview}{suffix}; "
+                    "use the original command or choose a new --work-dir/--out-dir"
+                )
+        else:
+            _write_json_atomic(request_path, request)
 
         if not args.json:
             print(
@@ -344,6 +404,7 @@ def main() -> int:
             plan_dir,
             module_keys,
             candidate_bits=candidate_bits,
+            candidate_bits_by_module=candidate_bits_by_module,
             hessian_shrinkages=shrinkages,
             search_backend=search_backend,  # type: ignore[arg-type]
             scale_mode="computed",
@@ -364,6 +425,7 @@ def main() -> int:
             "bits": args.bits,
             "head_bits": args.head_bits,
             "candidate_bits": candidate_bits,
+            "candidate_bits_by_module": candidate_bits_by_module,
             "candidate_hessian_shrinkages": shrinkages,
             "measure_score": args.measure_score,
             "search_backend": search_backend,

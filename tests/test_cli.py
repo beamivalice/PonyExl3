@@ -203,9 +203,9 @@ def test_convert_measurement_plan_conflicts_with_measure_mode():
     assert "--measurement-plan consumes optimized output" in proc.stderr
 
 
-def test_convert_e2e_default_candidate_bits_include_head_bits():
-    assert _default_candidate_bits(4.15, 6) == [4, 5, 6]
-    assert _default_candidate_bits(4.0, 6) == [4, 5, 6]
+def test_convert_e2e_default_candidate_bits_are_global_body_bits():
+    assert _default_candidate_bits(4.15, 6) == [4, 5]
+    assert _default_candidate_bits(4.0, 6) == [4]
 
 
 def test_convert_e2e_rejects_bad_bits():

@@ -83,6 +83,23 @@ def test_layer_module_keys_excludes_routed_experts_by_default(tmp_path: Path):
     ]
 
 
+def test_model_module_keys_puts_lm_head_last(tmp_path: Path):
+    oracle_dir = tmp_path / "oracle"
+    oracle_dir.mkdir()
+    layers = [
+        _layer("lm_head"),
+        _layer("model.layers.0.self_attn.q_proj"),
+        _layer("model.layers.0.self_attn.k_proj"),
+    ]
+    write_exl3_layers_bundle(layers, oracle_dir)
+
+    assert model_module_keys(oracle_dir) == [
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.q_proj",
+        "lm_head",
+    ]
+
+
 def test_module_set_resume_loads_existing_layer(tmp_path: Path):
     out_dir = tmp_path / "out"
     layer = _layer("model.language_model.layers.0.linear_attn.in_proj_qkv")
@@ -201,6 +218,50 @@ def test_module_set_incremental_output_resumes_missing_layers(
     manifest = json.loads((out_dir / "ponyexl3_convert_manifest.json").read_text(encoding="utf-8"))
     assert manifest["incremental_output"] is True
     assert manifest["layer_count"] == 2
+
+
+def test_module_set_resume_recomputes_existing_layer_when_planned_k_differs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    key = "model.language_model.layers.0.linear_attn.in_proj_qkv"
+    out_dir = tmp_path / "out"
+    write_exl3_layers_bundle([_layer(key, k=4)], out_dir)
+    calls: list[str] = []
+
+    def fake_convert_one(*args, **kwargs):  # noqa: ARG001
+        calls.append(str(args[3]))
+        layer = _layer(key, k=kwargs["quant_bits"])
+        return DirectLayerResult(
+            module_key=key,
+            search_backend="cpu",
+            scale_mode="identity",
+            layer=layer,
+            activations=np.zeros((1, layer.in_features), dtype=np.float32),
+            source_output=np.zeros((1, layer.out_features), dtype=np.float32),
+            converted_output=np.zeros((1, layer.out_features), dtype=np.float32),
+            stats={"output_rel_rms": 0.0, "public_rel_rms": 0.0},
+        )
+
+    monkeypatch.setattr(convert_driver, "_convert_one", fake_convert_one)
+
+    result = convert_driver.convert_module_set(
+        tmp_path / "source",
+        tmp_path / "oracle",
+        [key],
+        quantizer="direct",
+        out_dir=out_dir,
+        search_backend="cpu",
+        scale_mode="identity",
+        resume=True,
+        incremental_output=True,
+        bit_plan={key: 5},
+    )
+
+    assert calls == [key]
+    assert result.completed[0].get("resumed") is not True
+    assert result.completed[0]["k"] == 5
+    assert convert_driver.load_exl3_layer(str(out_dir), key).k == 5
 
 
 def test_module_set_batches_fast_ldlq_siblings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

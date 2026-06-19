@@ -819,6 +819,12 @@ def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _save_safetensors_atomic(tensors: dict[str, np.ndarray], path: Path) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    save_file(tensors, str(tmp))
+    tmp.replace(path)
+
+
 def _load_json_object(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     if not path.is_file():
         return dict(default)
@@ -876,7 +882,7 @@ def write_exl3_incremental_bundle(
 
     if plain_tensors:
         shard = "ponyexl3-plain.safetensors"
-        save_file(plain_tensors, str(out / shard))
+        _save_safetensors_atomic(plain_tensors, out / shard)
         for name, arr in plain_tensors.items():
             weight_map[name] = shard
             storage_key = name[: -len(".weight")] if name.endswith(".weight") else name
@@ -888,7 +894,7 @@ def write_exl3_incremental_bundle(
         layer.validate()
         shard = _layer_shard_name(layer.key)
         tensors = _layer_tensors(layer)
-        save_file(tensors, str(out / shard))
+        _save_safetensors_atomic(tensors, out / shard)
         for name in tensors:
             weight_map[name] = shard
         tensor_storage[layer.key] = {
