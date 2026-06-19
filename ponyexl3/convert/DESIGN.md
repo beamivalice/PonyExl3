@@ -71,6 +71,23 @@ Current checkpoint-backed pilot:
 
   PonyExl3-converted matches oracle mean KLD and edges p95; acceptance gate is
   converted-vs-original, not converted-vs-oracle.
+- MiniCPM5 re-conversion gate (2026-06-19, after the measure+convert speedups):
+  re-ran the reference's full-model path — `--ldlq-layer --model-modules
+  --scale-mode oracle_safe`, oracle K preserved, calibration captured from
+  `kld-eval/mlx_eval/prompt.txt` (250 rows / 2048 seq). Convert wall **198.4 s**
+  for 169 modules (＋`2.0 s` capture) vs the previously recorded **428 s** —
+  **~2.16x faster**, from the grouped batched-search + fast-metrics default convert
+  path. (Note: this `oracle_safe` driver path does *not* exercise the e2e
+  measure/reuse/parallel speedups, which target `--scale-mode computed`; the 3.45x
+  there is a separate measurement.) Fresh bundle `load_model(warm=False)` reports
+  `169 exact EXL3 linears (1 huge/GEMV)` under the llama mapping.
+  Parity vs `MiniCPM5-1B-PonyExl3-4.00bpw`: `suh`/`svh` are **bit-identical**
+  (oracle scales reproduced exactly); the LDLQ trellis is **not** bit-identical —
+  it depends on the calibration Hessian and the reference's exact map is not
+  shipped, so the two conversions differ ~`11%` inter-RMS (the expected √2x of a
+  single 4-bit quant error). **Quality is on par / marginally better**: public
+  rel-RMS vs the BF16 source (12-module sample) is mine **0.0778**, reference
+  **0.0796**, official oracle **0.0770**.
 - MiniCPM5 M5 optimization smoke:
   one-module direct override proved allocation plumbing by forcing
   `model.layers.0.mlp.down_proj` to K=5; it emitted/reloaded a

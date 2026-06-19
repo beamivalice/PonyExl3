@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from ponyexl3.convert import timing
+from ponyexl3.convert import cancel, timing
 from ponyexl3.ref.codebook import CodebookMode
 
 
@@ -267,6 +267,10 @@ def quantize_tiles_mlx(
     if not 2 <= k <= 8:
         raise ValueError("Metal trellis search currently supports K in [2, 8]")
     cb = CodebookMode(cb)
+
+    # Cooperative cancellation point: an in-flight worker aborts here at its next
+    # launch (~one feedback group) when the parallel driver requests a stop.
+    cancel.raise_if_requested()
 
     import mlx.core as mx
 

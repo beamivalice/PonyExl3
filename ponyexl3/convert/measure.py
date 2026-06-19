@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from ponyexl3.convert import cancel
 from ponyexl3.convert.calibration import activation_for_module
 from ponyexl3.convert.direct import ScaleMode
 from ponyexl3.convert.fixtures import SearchBackend
@@ -548,6 +549,7 @@ def measure_ldlq_candidates(
     identical regardless of worker count (records sorted deterministically).
     """
 
+    cancel.clear()
     modules = list(module_keys)
     shrinkages = [float(item) for item in hessian_shrinkages]
     if not modules:
@@ -621,10 +623,16 @@ def measure_ldlq_candidates(
             calibration_activations_by_module,
             key,
         )
-        meta = layer_meta_from_config(str(oracle_dir), key)
-        est_bytes = _estimate_candidate_bytes(
-            int(meta["in_features"]), int(meta["out_features"])
-        )
+        try:
+            meta = layer_meta_from_config(str(oracle_dir), key)
+            in_f, out_f = int(meta["in_features"]), int(meta["out_features"])
+        except Exception:
+            # Rough fallback (stub oracle in tests, or a missing config): the
+            # memory gate only needs an order-of-magnitude bound, and the
+            # activation width gives in_features directly.
+            in_f = int(module_acts.shape[1]) if module_acts is not None else 4096
+            out_f = in_f
+        est_bytes = _estimate_candidate_bytes(in_f, out_f)
         for bits in _candidate_bits_for_module(
             key,
             candidate_bits=candidate_bits,
@@ -694,20 +702,25 @@ def measure_ldlq_candidates(
             "summary": item_summary,
         }
 
-    def _accept(record: dict[str, Any]) -> None:
-        idx = record.pop("index")
-        records.append(record)
+    def _store(record: dict[str, Any]) -> None:
+        # Persist a finished candidate (called in completion order); the
+        # transient "index" is for ordered emission only, not the saved record.
+        records.append({k: v for k, v in record.items() if k != "index"})
         seen.add(
             _candidate_identity(
                 record["module"], record["candidate_bits"], record["hessian_shrinkage"]
             )
         )
         _checkpoint()
+
+    def _emit(record: dict[str, Any]) -> None:
+        # Progress, emitted strictly in submission order so the live log reads
+        # monotonically even though workers finish out of order.
         if progress is not None:
             progress(
                 "measure_done",
                 {
-                    "index": idx,
+                    "index": record["index"],
                     "total": total,
                     "module": record["module"],
                     "candidate_bits": record["candidate_bits"],
@@ -723,26 +736,66 @@ def measure_ldlq_candidates(
     workers = _resolve_measure_workers(max_workers, len(pending))
     if workers <= 1:
         for item in pending:
-            _accept(_measure_candidate(item))
+            record = _measure_candidate(item)
+            _store(record)
+            _emit(record)
     else:
         # Threads share the model; the gate caps concurrent transient working
         # sets (Hessian/scratch/etc.) to a fraction of free RAM, so a wide layer
         # or a tight machine throttles toward sequential instead of OOMing.
         gate = _MemoryGate(int(_available_memory_bytes() * 0.4))
 
-        def _gated(item: dict[str, Any]) -> dict[str, Any]:
+        stop = threading.Event()
+
+        def _gated(item: dict[str, Any]) -> dict[str, Any] | None:
+            if stop.is_set():
+                return None
             gate.acquire(item["est_bytes"])
             try:
+                if stop.is_set():
+                    return None
                 return _measure_candidate(item)
             finally:
                 gate.release(item["est_bytes"])
 
-        with ThreadPoolExecutor(
+        # Manual lifecycle (not ``with``): on Ctrl-C / error, signal workers and
+        # cancel queued candidates so the GPU drains only the in-flight ones
+        # (<= workers) instead of grinding through the whole remaining batch. The
+        # default ``with``-exit calls shutdown(wait=True) and would block until
+        # every already-submitted future finished — i.e. Ctrl-C wouldn't stop it.
+        executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="ponyexl3-measure"
-        ) as executor:
-            futures = [executor.submit(_gated, item) for item in pending]
+        )
+        # Map each future to its submission position. Records are stored as they
+        # finish (any order), but progress is held in a small reorder buffer and
+        # emitted in submission order so the live log stays monotonic.
+        futures = {executor.submit(_gated, item): pos for pos, item in enumerate(pending)}
+        emit_buffer: dict[int, dict[str, Any] | None] = {}
+        next_pos = 0
+        try:
             for future in as_completed(futures):
-                _accept(future.result())
+                pos = futures[future]
+                record = future.result()
+                if record is not None:
+                    _store(record)
+                emit_buffer[pos] = record
+                while next_pos in emit_buffer:
+                    ready = emit_buffer.pop(next_pos)
+                    if ready is not None:
+                        _emit(ready)
+                    next_pos += 1
+        except BaseException:
+            # Stop new candidates (stop flag), cancel the queue, and ask in-flight
+            # GPU work to abort at its next launch so Ctrl-C is near-instant rather
+            # than draining the running candidates to completion.
+            stop.set()
+            cancel.request()
+            for future in futures:
+                future.cancel()
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            cancel.clear()
 
     # Deterministic order regardless of worker count / completion order.
     records.sort(
