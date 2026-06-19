@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import math
 import re
+import threading
 import time
 from typing import Any
 
@@ -17,6 +20,7 @@ from ponyexl3.convert.calibration import activation_for_module
 from ponyexl3.convert.direct import ScaleMode
 from ponyexl3.convert.fixtures import SearchBackend
 from ponyexl3.convert.hessian import ldlq_layer_summary, ldlq_quantize_layer
+from ponyexl3.ref.loader import layer_meta_from_config
 
 ProgressCallback = Callable[[str, dict[str, object]], None]
 
@@ -438,6 +442,76 @@ def _load_measurement_checkpoint(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+def _available_memory_bytes() -> int:
+    """Best-effort free system memory (bytes). Conservative if unknown."""
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    try:
+        import subprocess
+
+        total = int(
+            subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+        )
+        return total // 2  # unknown free fraction -> assume half
+    except Exception:
+        return 4 << 30  # 4 GiB conservative floor
+
+
+def _estimate_candidate_bytes(in_features: int, out_features: int) -> int:
+    """Conservatively estimate one module's peak transient working set.
+
+    Dominant terms: the Hessian + its damped copy + the float64 Cholesky + the
+    L factor (all ``in_features**2``), the public/inner/weight/reconstructed/
+    prod_cache matrices (``in_features*out_features``), plus the Metal search
+    scratch and metric outputs. Over-estimates so we under-parallelize rather
+    than OOM.
+    """
+    in_sq = in_features * in_features
+    in_out = in_features * out_features
+    return in_sq * 16 + in_out * 20 + (384 << 20)
+
+
+def _resolve_measure_workers(max_workers: int, n_items: int) -> int:
+    """Clamp the user-requested worker count to the available work."""
+    if n_items <= 1:
+        return 1
+    return max(1, min(int(max_workers), n_items, 32))
+
+
+class _MemoryGate:
+    """Byte-weighted semaphore bounding concurrent transient working sets.
+
+    A task acquires its estimated footprint before running and releases it
+    after. Concurrency self-adjusts to layer width (many narrow modules at once,
+    few wide ones), and an oversized task runs alone rather than deadlocking, so
+    the effect is automatic fall-back toward sequential under tight budgets.
+    """
+
+    def __init__(self, budget_bytes: int) -> None:
+        self.budget = max(1, int(budget_bytes))
+        self.used = 0
+        self._cv = threading.Condition()
+
+    def acquire(self, nbytes: int) -> None:
+        need = max(0, int(nbytes))
+        with self._cv:
+            while self.used > 0 and self.used + need > self.budget:
+                self._cv.wait()
+            self.used += need
+
+    def release(self, nbytes: int) -> None:
+        need = max(0, int(nbytes))
+        with self._cv:
+            self.used = max(0, self.used - need)
+            self._cv.notify_all()
+
+
 def measure_ldlq_candidates(
     source_dir: str | Path,
     oracle_dir: str | Path,
@@ -460,9 +534,19 @@ def measure_ldlq_candidates(
     score_metric: str = _DEFAULT_SCORE_METRIC,
     checkpoint_path: str | Path | None = None,
     resume: bool = False,
+    max_workers: int = 2,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Quantize selected modules over candidate K/shrinkage grids and rank them."""
+    """Quantize selected modules over candidate K/shrinkage grids and rank them.
+
+    ``max_workers`` (default 2) sets how many per-candidate quantizations run at
+    once on a thread pool, so each module's CPU-bound basis/Hessian work overlaps
+    another module's GPU search and fills GPU idle time. Threads share the model
+    (no duplication); a byte-weighted memory gate bounds the concurrent transient
+    working sets to a fraction of free RAM and throttles toward sequential when
+    memory is tight. ``max_workers=1`` is the plain sequential path. Results are
+    identical regardless of worker count (records sorted deterministically).
+    """
 
     modules = list(module_keys)
     shrinkages = [float(item) for item in hessian_shrinkages]
@@ -512,12 +596,34 @@ def measure_ldlq_candidates(
         records.append(record)
         seen.add(ident)
     start = time.perf_counter()
+
+    def _checkpoint() -> None:
+        if checkpoint is not None:
+            _write_json_atomic(
+                checkpoint,
+                _measurement_summary(
+                    modules=modules,
+                    candidate_bits=candidate_bits,
+                    shrinkages=shrinkages,
+                    score_metric=score_metric,
+                    records=records,
+                    elapsed_s=time.perf_counter() - start,
+                    candidate_bits_by_module=candidate_bits_by_module,
+                ),
+            )
+
+    # Collect the pending (module, bits, shrinkage) candidates, skipping resumed.
+    pending: list[dict[str, Any]] = []
     index = 0
     for key in modules:
         module_acts = activation_for_module(
             calibration_activations,
             calibration_activations_by_module,
             key,
+        )
+        meta = layer_meta_from_config(str(oracle_dir), key)
+        est_bytes = _estimate_candidate_bytes(
+            int(meta["in_features"]), int(meta["out_features"])
         )
         for bits in _candidate_bits_for_module(
             key,
@@ -529,7 +635,6 @@ def measure_ldlq_candidates(
                 raise ValueError(f"candidate bits for {key} must be in [1, 8], got {bits}")
             for shrinkage in shrinkages:
                 index += 1
-                candidate_start = time.perf_counter()
                 ident = _candidate_identity(key, bits, shrinkage)
                 if ident in seen:
                     if progress is not None:
@@ -541,83 +646,112 @@ def measure_ldlq_candidates(
                                 "module": key,
                                 "candidate_bits": bits,
                                 "hessian_shrinkage": shrinkage,
-                                "elapsed_s": candidate_start - start,
+                                "elapsed_s": time.perf_counter() - start,
                             },
                         )
                     continue
-                if progress is not None:
-                    progress(
-                        "measure_start",
-                        {
-                            "index": index,
-                            "total": total,
-                            "module": key,
-                            "candidate_bits": bits,
-                            "hessian_shrinkage": shrinkage,
-                            "elapsed_s": candidate_start - start,
-                        },
-                    )
-                result = ldlq_quantize_layer(
-                    source_dir,
-                    oracle_dir,
-                    key,
-                    search_backend=search_backend,
-                    scale_mode=scale_mode,
-                    sigma_reg=sigma_reg,
-                    hessian_shrinkage=shrinkage,
-                    buf_size_rows=buf_size_rows,
-                    feedback_rows=feedback_rows,
-                    calibration_activations=module_acts,
-                    skip_g_scale=skip_g_scale,
-                    regularization_seed=regularization_seed,
-                    quant_bits=bits,
-                    compare_oracle=compare_oracle,
-                    fast_metrics=False,
+                pending.append(
+                    {
+                        "index": index,
+                        "key": key,
+                        "bits": bits,
+                        "shrinkage": shrinkage,
+                        "acts": module_acts,
+                        "est_bytes": est_bytes,
+                    }
                 )
-                item = ldlq_layer_summary(result)
-                stats = item["stats"]
-                score = candidate_score(stats, score_metric)
-                record = {
-                    "module": key,
-                    "candidate_bits": bits,
-                    "k": item["k"],
-                    "hessian_shrinkage": shrinkage,
+
+    def _measure_candidate(item: dict[str, Any]) -> dict[str, Any]:
+        candidate_start = time.perf_counter()
+        result = ldlq_quantize_layer(
+            source_dir,
+            oracle_dir,
+            item["key"],
+            search_backend=search_backend,
+            scale_mode=scale_mode,
+            sigma_reg=sigma_reg,
+            hessian_shrinkage=item["shrinkage"],
+            buf_size_rows=buf_size_rows,
+            feedback_rows=feedback_rows,
+            calibration_activations=item["acts"],
+            skip_g_scale=skip_g_scale,
+            regularization_seed=regularization_seed,
+            quant_bits=item["bits"],
+            compare_oracle=compare_oracle,
+            fast_metrics=False,
+        )
+        item_summary = ldlq_layer_summary(result)
+        score = candidate_score(item_summary["stats"], score_metric)
+        return {
+            "index": item["index"],
+            "module": item["key"],
+            "candidate_bits": item["bits"],
+            "k": item_summary["k"],
+            "hessian_shrinkage": item["shrinkage"],
+            "score_metric": score_metric,
+            "score": score,
+            "elapsed_s": time.perf_counter() - candidate_start,
+            "summary": item_summary,
+        }
+
+    def _accept(record: dict[str, Any]) -> None:
+        idx = record.pop("index")
+        records.append(record)
+        seen.add(
+            _candidate_identity(
+                record["module"], record["candidate_bits"], record["hessian_shrinkage"]
+            )
+        )
+        _checkpoint()
+        if progress is not None:
+            progress(
+                "measure_done",
+                {
+                    "index": idx,
+                    "total": total,
+                    "module": record["module"],
+                    "candidate_bits": record["candidate_bits"],
+                    "k": record["k"],
+                    "hessian_shrinkage": record["hessian_shrinkage"],
                     "score_metric": score_metric,
-                    "score": score,
-                    "elapsed_s": time.perf_counter() - candidate_start,
-                    "summary": item,
-                }
-                records.append(record)
-                seen.add(ident)
-                if checkpoint is not None:
-                    _write_json_atomic(
-                        checkpoint,
-                        _measurement_summary(
-                            modules=modules,
-                            candidate_bits=candidate_bits,
-                            shrinkages=shrinkages,
-                            score_metric=score_metric,
-                            records=records,
-                            elapsed_s=time.perf_counter() - start,
-                            candidate_bits_by_module=candidate_bits_by_module,
-                        ),
-                    )
-                if progress is not None:
-                    progress(
-                        "measure_done",
-                        {
-                            "index": index,
-                            "total": total,
-                            "module": key,
-                            "candidate_bits": bits,
-                            "k": item["k"],
-                            "hessian_shrinkage": shrinkage,
-                            "score_metric": score_metric,
-                            "score": score,
-                            "elapsed_s": time.perf_counter() - start,
-                            "candidate_s": record["elapsed_s"],
-                        },
-                    )
+                    "score": record["score"],
+                    "elapsed_s": time.perf_counter() - start,
+                    "candidate_s": record["elapsed_s"],
+                },
+            )
+
+    workers = _resolve_measure_workers(max_workers, len(pending))
+    if workers <= 1:
+        for item in pending:
+            _accept(_measure_candidate(item))
+    else:
+        # Threads share the model; the gate caps concurrent transient working
+        # sets (Hessian/scratch/etc.) to a fraction of free RAM, so a wide layer
+        # or a tight machine throttles toward sequential instead of OOMing.
+        gate = _MemoryGate(int(_available_memory_bytes() * 0.4))
+
+        def _gated(item: dict[str, Any]) -> dict[str, Any]:
+            gate.acquire(item["est_bytes"])
+            try:
+                return _measure_candidate(item)
+            finally:
+                gate.release(item["est_bytes"])
+
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="ponyexl3-measure"
+        ) as executor:
+            futures = [executor.submit(_gated, item) for item in pending]
+            for future in as_completed(futures):
+                _accept(future.result())
+
+    # Deterministic order regardless of worker count / completion order.
+    records.sort(
+        key=lambda r: (
+            str(r.get("module")),
+            -1 if r.get("candidate_bits") is None else int(r["candidate_bits"]),
+            float(r.get("hessian_shrinkage", 0.0)),
+        )
+    )
 
     summary = _measurement_summary(
         modules=modules,

@@ -263,6 +263,18 @@ def main() -> int:
     parser.add_argument("--sigma-reg", type=float, default=0.025)
     parser.add_argument("--buf-size-rows", type=int, default=128)
     parser.add_argument("--ldlq-feedback-rows", type=int, default=16)
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=2,
+        help=(
+            "measurement threads (default 2). >1 overlaps CPU-bound prep with the "
+            "GPU search to fill GPU idle time, but uses up to ~N x the per-module "
+            "transient memory (Hessian/scratch — the model itself stays shared); "
+            "automatically throttled toward sequential when free memory is tight. "
+            "Use 1 for the plain sequential path."
+        ),
+    )
     parser.add_argument("--module-limit", type=int, help="limit selected modules for smoke runs")
     parser.add_argument("--include-routed-experts", action="store_true")
     parser.add_argument(
@@ -424,6 +436,7 @@ def main() -> int:
             score_metric=args.measure_score,
             checkpoint_path=measurement_path,
             resume=bool(args.resume),
+            max_workers=args.max_workers,
             progress=None if args.json else _measurement_progress,
         )
         measurement["scope"] = "e2e"
