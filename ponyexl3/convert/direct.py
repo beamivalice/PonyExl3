@@ -308,6 +308,7 @@ def prepare_layer_quantization_basis(
                 cb=cb,
                 search_backend=search_backend,
                 max_pins=max_pins,
+                return_states=False,
             )
             delta = reconstructed / np.float32(scale) - sample
             return float(np.mean(delta * delta, dtype=np.float64))

@@ -159,6 +159,20 @@ Current checkpoint-backed pilot:
   `--only-layer 0 --module-limit 3` batched `gate/up` and wrote `3` layers in
   `5.44 s` wall (`0.85 s` user); full layer-0 smoke batched `gate/up` plus
   `k/q/v`, wrote `7` layers in `7.61 s` wall (`1.16 s` user).
+- New converter GPU-residency step 4:
+  grouped LDLQ now prepares sibling fixtures, source/basis matrices, Hessians,
+  and LDL factors in a bounded thread pool before allocating MLX buffers. This
+  overlaps CPU/IO work inside `gate/up`, `q/k/v`, and linear-attention groups
+  while preserving each module's independent math. The pool is intentionally
+  disabled for computed-scale GSS unless `--skip-g-scale` is used, because GSS
+  itself launches Metal search kernels during prep. Group summaries now report
+  `batched_prep_workers`. The computed-scale GSS path also switched its sample
+  quantization calls to `return_states=False`, avoiding debug state materialization
+  during source-only conversion. Real MiniCPM5 smoke after this step: full
+  layer 0 wrote `7` layers in `7.32 s` wall with `batched_prep_workers=2`
+  for `gate/up` and `3` for `k/q/v`; source-only computed-scale LDLQ for
+  `model.layers.0.mlp.down_proj` ran `13` GSS evaluations and wrote a K4 layer
+  in `4.49 s` wall.
 - Qwen3.6-27B M6 gate setup:
   source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
   `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
@@ -260,6 +274,7 @@ Current checkpoint-backed pilot:
   Full source linears are read in one safetensors slice, K∈{1,2,4,8}
   trellis pack/unpack is vectorized, and metric paths reuse Metal-returned
   reconstructed inner weights instead of decoding the packed trellis on CPU.
+  Computed-scale GSS sample scoring also uses the no-state quantizer path.
 - `convert/hessian.py` — M4b Hessian/LDLQ primitives: activation Hessian
   capture, upstream-style diagonal damping, NumPy/Accelerate block-LDL,
   reverse 16-row LDLQ over inner-domain weights, Hessian proxy metrics, and a

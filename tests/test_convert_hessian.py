@@ -438,6 +438,7 @@ def test_ldlq_group_batched_search_matches_individual_with_distinct_scales(tmp_p
         np.testing.assert_allclose(batched.layer.suh, single.layer.suh, rtol=0.0, atol=0.0)
         np.testing.assert_allclose(batched.layer.svh, single.layer.svh, rtol=0.0, atol=0.0)
         assert batched.stats["batched_search_group_size"] == 2.0
+        assert batched.stats["batched_prep_workers"] == 2.0
         assert batched.stats["mlx_ldlq"] is True
 
 

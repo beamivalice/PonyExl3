@@ -16,11 +16,15 @@ from ponyexl3.convert.fixtures import (
 from ponyexl3.convert.direct import (
     direct_quantize_layer,
     direct_quantize_window,
+    prepare_layer_quantization_basis,
     read_source_public_matrix,
     write_direct_layer_bundle,
     write_direct_window_bundle,
 )
+import ponyexl3.convert.direct as direct_module
 from ponyexl3.convert.reference_search import quantize_tile_reference
+from ponyexl3.ref.codebook import CodebookMode
+from ponyexl3.ref.layer import EXL3Layer
 from ponyexl3.ref.reconstruct import reconstruct_public_weights
 from ponyexl3.ref.trellis import pack_trellis_tile, unpack_trellis_tile
 
@@ -172,6 +176,46 @@ def test_read_source_public_matrix_matches_block_reader(tmp_path: Path):
     )
 
     np.testing.assert_allclose(block, full[:, 128:256])
+
+
+def test_computed_scale_gss_uses_no_state_quantizer_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_key = "model.layers.0.self_attn.q_proj"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    rng = np.random.default_rng(125)
+    public_weight = (rng.standard_normal((128, 128)) * 0.05).astype(np.float32)
+    _write_synthetic_source(source_dir, module_key, public_weight)
+    source = resolve_source_linear(source_dir, module_key)
+    ref_layer = EXL3Layer(
+        key=module_key,
+        in_features=128,
+        out_features=128,
+        k=4,
+        trellis=np.zeros((8, 8, 64), dtype=np.uint16),
+    )
+    calls: list[bool | None] = []
+
+    def fake_quantize(inner, **kwargs):  # noqa: ANN001, ANN202
+        calls.append(kwargs.get("return_states"))
+        return np.zeros((inner.shape[0] // 16, inner.shape[1] // 16, 64), dtype=np.uint16), None, inner
+
+    monkeypatch.setattr(direct_module, "quantize_inner_matrix_direct", fake_quantize)
+    basis = prepare_layer_quantization_basis(
+        source_dir,
+        source,
+        ref_layer,
+        CodebookMode.DEFAULT,
+        scale_mode="computed",
+        search_backend="metal",
+        g_scale_width=1,
+    )
+
+    assert calls
+    assert set(calls) == {False}
+    assert basis.stats["regularize_g_scale_skipped"] is False
 
 
 @pytest.mark.skipif(

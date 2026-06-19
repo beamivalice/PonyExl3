@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,21 @@ class LDLQResult:
 
 class LDLQGroupIncompatible(ValueError):
     """Raised when candidate sibling linears cannot share batched search."""
+
+
+@dataclass(frozen=True)
+class _LDLQGroupPrepared:
+    """CPU-prepared state for one member before MLX buffers are allocated."""
+
+    key: str
+    fixture: Any
+    basis: Any
+    prepared: PreparedHessian
+    ldl: BlockLDLResult
+    ref_layer: EXL3Layer
+    k: int
+    cb: CodebookMode
+    l_factor: np.ndarray
 
 
 @dataclass
@@ -726,6 +742,73 @@ def ldlq_quantize_layer(
     )
 
 
+def _group_prep_worker_count(
+    group_size: int,
+    *,
+    scale_mode: ScaleMode,
+    skip_g_scale: bool,
+) -> int:
+    if group_size <= 1:
+        return 1
+    # Computed-scale GSS launches trellis search kernels during prep. Keep that
+    # path serial so several worker threads do not compete for the Metal queue.
+    if scale_mode == "computed" and not skip_g_scale:
+        return 1
+    return min(group_size, 4)
+
+
+def _prepare_ldlq_group_member(
+    source_dir: str | Path,
+    oracle_dir: str | Path,
+    key: str,
+    *,
+    activations: np.ndarray | None,
+    scale_mode: ScaleMode,
+    search_backend: SearchBackend,
+    sigma_reg: float,
+    max_pins: int,
+    skip_g_scale: bool,
+    regularization_seed: int,
+    quant_bits: int | None,
+) -> _LDLQGroupPrepared:
+    fixture = build_layer_fixture(source_dir, oracle_dir, key, activations=activations)
+    oracle = fixture.oracle
+    ref_layer = oracle.layer
+    if ref_layer.in_features % HAD_DIM != 0 or ref_layer.out_features % HAD_DIM != 0:
+        raise LDLQGroupIncompatible(f"{key}: dimensions must be 128-multiple")
+    k = ref_layer.k if quant_bits is None else int(quant_bits)
+    if k < 1 or k > 8:
+        raise LDLQGroupIncompatible(f"{key}: EXL3 trellis K must be in [1, 8], got {k}")
+    basis = prepare_layer_quantization_basis(
+        source_dir,
+        fixture.source,
+        ref_layer,
+        oracle.cb,
+        scale_mode=scale_mode,
+        search_backend=search_backend,
+        max_pins=max_pins,
+        skip_g_scale=skip_g_scale,
+        regularization_seed=regularization_seed,
+        quant_bits=k,
+    )
+    inner_acts = public_activations_to_inner(fixture.activations, basis.suh)
+    prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
+    ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
+    l_factor = ldl.l.astype(np.float32, copy=True)
+    l_factor[np.diag_indices_from(l_factor)] = np.float32(0.0)
+    return _LDLQGroupPrepared(
+        key=key,
+        fixture=fixture,
+        basis=basis,
+        prepared=prepared,
+        ldl=ldl,
+        ref_layer=ref_layer,
+        k=k,
+        cb=oracle.cb,
+        l_factor=l_factor,
+    )
+
+
 def ldlq_quantize_group(
     source_dir: str | Path,
     oracle_dir: str | Path,
@@ -767,64 +850,91 @@ def ldlq_quantize_group(
 
     import mlx.core as mx
 
-    states: list[_LDLQGroupState] = []
-    ks: list[int] = []
-    first_cb: CodebookMode | None = None
-    first_rows: int | None = None
+    prep_inputs: list[tuple[str, np.ndarray | None, int | None]] = []
     for key in keys:
         acts = calibration_activations
         if calibration_activations_by_module is not None and key in calibration_activations_by_module:
             acts = calibration_activations_by_module[key]
-        fixture = build_layer_fixture(source_dir, oracle_dir, key, activations=acts)
-        oracle = fixture.oracle
-        ref_layer = oracle.layer
-        if ref_layer.in_features % HAD_DIM != 0 or ref_layer.out_features % HAD_DIM != 0:
-            raise LDLQGroupIncompatible(f"{key}: dimensions must be 128-multiple")
-        k = ref_layer.k
         planned_k = None if quant_bits_by_module is None else quant_bits_by_module.get(key)
-        if planned_k is not None:
-            k = int(planned_k)
-        if k < 1 or k > 8:
-            raise LDLQGroupIncompatible(f"{key}: EXL3 trellis K must be in [1, 8], got {k}")
-        basis = prepare_layer_quantization_basis(
-            source_dir,
-            fixture.source,
-            ref_layer,
-            oracle.cb,
-            scale_mode=scale_mode,
-            search_backend=search_backend,
-            max_pins=max_pins,
-            skip_g_scale=skip_g_scale,
-            regularization_seed=regularization_seed,
-            quant_bits=k,
-        )
-        ks.append(k)
+        prep_inputs.append((key, acts, planned_k))
+
+    prep_workers = _group_prep_worker_count(
+        len(keys),
+        scale_mode=scale_mode,
+        skip_g_scale=skip_g_scale,
+    )
+    if prep_workers <= 1:
+        prepared_members = [
+            _prepare_ldlq_group_member(
+                source_dir,
+                oracle_dir,
+                key,
+                activations=acts,
+                scale_mode=scale_mode,
+                search_backend=search_backend,
+                sigma_reg=sigma_reg,
+                max_pins=max_pins,
+                skip_g_scale=skip_g_scale,
+                regularization_seed=regularization_seed,
+                quant_bits=planned_k,
+            )
+            for key, acts, planned_k in prep_inputs
+        ]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=prep_workers,
+            thread_name_prefix="ponyexl3-ldlq-prep",
+        ) as executor:
+            futures = [
+                executor.submit(
+                    _prepare_ldlq_group_member,
+                    source_dir,
+                    oracle_dir,
+                    key,
+                    activations=acts,
+                    scale_mode=scale_mode,
+                    search_backend=search_backend,
+                    sigma_reg=sigma_reg,
+                    max_pins=max_pins,
+                    skip_g_scale=skip_g_scale,
+                    regularization_seed=regularization_seed,
+                    quant_bits=planned_k,
+                )
+                for key, acts, planned_k in prep_inputs
+            ]
+            prepared_members = [future.result() for future in futures]
+
+    states: list[_LDLQGroupState] = []
+    first_cb: CodebookMode | None = None
+    first_rows: int | None = None
+    first_k: int | None = None
+    for member in prepared_members:
+        ref_layer = member.ref_layer
         if first_cb is None:
-            first_cb = oracle.cb
-        elif oracle.cb != first_cb:
-            raise LDLQGroupIncompatible(f"{key}: codebook differs from group")
+            first_cb = member.cb
+        elif member.cb != first_cb:
+            raise LDLQGroupIncompatible(f"{member.key}: codebook differs from group")
+        if first_k is None:
+            first_k = member.k
+        elif member.k != first_k:
+            raise LDLQGroupIncompatible(f"{member.key}: K differs from group")
         if first_rows is None:
             first_rows = int(ref_layer.in_features)
         elif int(ref_layer.in_features) != first_rows:
-            raise LDLQGroupIncompatible(f"{key}: in_features differs from group")
-        inner_acts = public_activations_to_inner(fixture.activations, basis.suh)
-        prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
-        ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
-        l_np = ldl.l.astype(np.float32, copy=True)
-        l_np[np.diag_indices_from(l_np)] = np.float32(0.0)
+            raise LDLQGroupIncompatible(f"{member.key}: in_features differs from group")
         rows = int(ref_layer.in_features)
         out_features = int(ref_layer.out_features)
-        packed_size = 256 * k // 16
+        packed_size = 256 * member.k // 16
         states.append(
             _LDLQGroupState(
-                key=key,
-                fixture=fixture,
-                basis=basis,
-                prepared=prepared,
-                ldl=ldl,
+                key=member.key,
+                fixture=member.fixture,
+                basis=member.basis,
+                prepared=member.prepared,
+                ldl=member.ldl,
                 ref_layer=ref_layer,
-                weight=mx.array(basis.target_inner.astype(np.float32, copy=False), dtype=mx.float32),
-                l_factor=mx.array(l_np, dtype=mx.float32),
+                weight=mx.array(member.basis.target_inner.astype(np.float32, copy=False), dtype=mx.float32),
+                l_factor=mx.array(member.l_factor, dtype=mx.float32),
                 reconstructed=mx.zeros((rows, out_features), dtype=mx.float32),
                 prod_cache=mx.zeros((rows, out_features), dtype=mx.float32),
                 packed=np.empty(
@@ -836,11 +946,7 @@ def ldlq_quantize_group(
 
     if not states:
         raise LDLQGroupIncompatible("empty grouped LDLQ request")
-    first_k = ks[0]
-    for key, k in zip(keys, ks, strict=True):
-        if k != first_k:
-            raise LDLQGroupIncompatible(f"{key}: K differs from group")
-    if first_cb is None or first_rows is None:
+    if first_cb is None or first_rows is None or first_k is None:
         raise LDLQGroupIncompatible("invalid grouped LDLQ request")
 
     rows = first_rows
@@ -939,6 +1045,7 @@ def ldlq_quantize_group(
                 "batched_group_out_features": float(total_out),
                 "batched_search_group_size": float(len(keys)),
                 "batched_search_group_out_features": float(total_out),
+                "batched_prep_workers": float(prep_workers),
                 "public_mse": float("nan"),
                 "public_rel_rms": float("nan"),
                 "output_mse": float("nan"),
