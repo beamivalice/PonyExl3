@@ -9,10 +9,12 @@ import pytest
 
 mlx = pytest.importorskip("mlx.core")
 
+from ponyexl3.convert.direct import quantize_inner_matrix_direct
 from ponyexl3.convert.metal_search import _scratch_bytes_per_tile, quantize_tiles_mlx_np
+from ponyexl3.convert.mlx_trellis import pack_trellis_mlx
 from ponyexl3.convert.reference_search import quantize_tile_reference
 from ponyexl3.ref.codebook import CodebookMode, decode_3inst
-from ponyexl3.ref.trellis import pack_trellis_tile, unpack_trellis_tile
+from ponyexl3.ref.trellis import pack_trellis, pack_trellis_tile, unpack_trellis_tile
 
 pytestmark = [
     pytest.mark.ponyexl3,
@@ -105,3 +107,39 @@ def test_quantize_tiles_mlx_rejects_k1_until_low_k_strategy_exists() -> None:
     tile = np.zeros((1, 256), dtype=np.float32)
     with pytest.raises(ValueError, match=r"supports K in \[2, 8\]"):
         quantize_tiles_mlx_np(tile, 1, CodebookMode.MCG)
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_pack_trellis_mlx_matches_numpy_reference(k: int) -> None:
+    rng = np.random.default_rng(800 + k)
+    encoded = rng.integers(0, 1 << k, size=(3, 5, 256), dtype=np.uint16)
+
+    packed = pack_trellis_mlx(mlx.array(encoded), k)
+    mlx.eval(packed)
+
+    np.testing.assert_array_equal(np.array(packed), pack_trellis(encoded, k))
+
+
+def test_quantize_inner_matrix_direct_metal_no_states_matches_debug_path() -> None:
+    rng = np.random.default_rng(909)
+    inner = rng.standard_normal((32, 48)).astype(np.float32)
+
+    packed_debug, states_debug, reconstructed_debug = quantize_inner_matrix_direct(
+        inner,
+        k=4,
+        cb=CodebookMode.MCG,
+        search_backend="metal",
+        return_states=True,
+    )
+    packed_fast, states_fast, reconstructed_fast = quantize_inner_matrix_direct(
+        inner,
+        k=4,
+        cb=CodebookMode.MCG,
+        search_backend="metal",
+        return_states=False,
+    )
+
+    assert states_debug is not None
+    assert states_fast is None
+    np.testing.assert_array_equal(packed_fast, packed_debug)
+    np.testing.assert_array_equal(reconstructed_fast, reconstructed_debug)

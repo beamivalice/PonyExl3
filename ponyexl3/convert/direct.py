@@ -396,9 +396,32 @@ def quantize_inner_matrix_direct(
         states_flat = np.stack(state_rows, axis=0).astype(np.uint16, copy=False)
         decoded_tiles = np.stack(decoded_rows, axis=0).astype(np.float32, copy=False)
     elif search_backend == "metal":
-        from ponyexl3.convert.metal_search import quantize_tiles_mlx_np
+        if return_states or verify_roundtrip:
+            from ponyexl3.convert.metal_search import quantize_tiles_mlx_np
 
-        decoded_tiles, states_flat = quantize_tiles_mlx_np(kernel_tiles, k=k, cb=cb)
+            decoded_tiles, states_flat = quantize_tiles_mlx_np(kernel_tiles, k=k, cb=cb)
+        else:
+            import mlx.core as mx
+
+            from ponyexl3.convert.metal_search import quantize_tiles_mlx
+            from ponyexl3.convert.mlx_trellis import pack_trellis_mlx
+
+            decoded_mx, states_mx = quantize_tiles_mlx(kernel_tiles, k=k, cb=cb)
+            in_tiles = inner.shape[0] // 16
+            out_tiles = inner.shape[1] // 16
+            packed_mx = pack_trellis_mlx(
+                (states_mx & ((1 << k) - 1)).reshape(in_tiles, out_tiles, 256),
+                k,
+            )
+            mx.eval(decoded_mx, packed_mx)
+            decoded_tiles = np.array(decoded_mx).astype(np.float32, copy=False)
+            packed = np.array(packed_mx).astype(np.uint16, copy=False)
+            reconstructed_inner = _kernel_tiles_to_inner(
+                decoded_tiles,
+                inner.shape[0],
+                inner.shape[1],
+            )
+            return packed, None, reconstructed_inner
     else:
         raise ValueError(f"unknown search backend: {search_backend}")
 
@@ -574,6 +597,7 @@ def direct_quantize_layer(
             cb=oracle.cb,
             search_backend=search_backend,
             max_pins=max_pins,
+            return_states=False,
         )
         tk0 = in_start // 16
         trellis[tk0 : tk0 + HAD_DIM // 16, :, :] = packed_row

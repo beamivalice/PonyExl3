@@ -118,6 +118,18 @@ Current checkpoint-backed pilot:
   dropped from `56 s` to `1.78 s` (`~31x`). Results are bit-identical to the
   reference path (`max|diff| = 0`, exact array equality), so oracle diagnostics
   are useful again for long M6 conversion runs.
+- New converter GPU-residency step 1:
+  production quantization now packs trellis indices on MLX/GPU via
+  `convert/mlx_trellis.py::pack_trellis_mlx`. `quantize_inner_matrix_direct`
+  still returns full 256-state arrays for parity/debug calls, but when
+  `return_states=False` it no longer materializes the state matrix on CPU and
+  no longer calls the NumPy packer. Full direct-layer conversion and LDLQ
+  conversion use this no-state path. The output is bit-identical to the debug
+  path on Metal parity tests; a bounded MiniCPM5 LDLQ smoke for
+  `model.layers.0.mlp.down_proj` wrote/reloaded a K4 layer in `3.55 s` wall
+  time. This is the first slice of the larger GPU-resident converter design;
+  remaining work is to move LDLQ compensation/prod-cache and sibling batching
+  onto MLX instead of NumPy.
 - Qwen3.6-27B M6 gate setup:
   source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
   `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
@@ -602,6 +614,7 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | MiniCPM5-1B full model | direct, Metal, oracle-safe scales | `428 s` (`7.1 min`) | `169` EXL3 linears + `50` plain tensors; strict-loadable output. |
 | MiniCPM5 `gate_proj` oracle public reconstruct | reference vs fast Metal oracle path | `53.6 s` -> `0.014 s` | `~3900x` faster; bit-identical (`max abs diff = 0`) to the reference oracle decode path. |
 | MiniCPM5 full `--oracle-metrics` layer | exact LDLQ, full diagnostics | `56 s` -> `1.78 s` | `~31x` faster after swapping only the hot oracle trellis decode; metrics unchanged. |
+| MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, Metal, GPU trellis pack, no state materialization | `3.55 s` | Bounded smoke after adding `pack_trellis_mlx`; wrote/reloaded K4 layer. |
 | Qwen3.6-27B full model | exact LDLQ, Metal, oracle K plan, full oracle diagnostics | long/overnight expected | `401` supported EXL3 linears: `285` K4, `115` K5, K6 `lm_head`; use real per-module calibration and `--resume`. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |
