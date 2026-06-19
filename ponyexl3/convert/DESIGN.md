@@ -173,6 +173,19 @@ Current checkpoint-backed pilot:
   for `gate/up` and `3` for `k/q/v`; source-only computed-scale LDLQ for
   `model.layers.0.mlp.down_proj` ran `13` GSS evaluations and wrote a K4 layer
   in `4.49 s` wall.
+- New converter GPU-residency step 5:
+  production LDLQ no longer copies packed trellis blocks from MLX to NumPy at
+  every feedback step. Both `_ldlq_inner_matrix_mlx` and grouped
+  `ldlq_quantize_group` keep packed trellis buffers as MLX `uint16` arrays
+  through the reverse-LDLQ loop and copy them back once, when constructing the
+  emitted `EXL3Layer`. The stat `mlx_packed_deferred=true` marks this path.
+  The debug/state-collecting CPU/Metal paths are unchanged. Parity tests still
+  compare the no-state MLX path against the debug state-collecting path
+  bit-for-bit on packed trellis and reconstruction, and grouped synthetic
+  siblings remain bit-identical to independent LDLQ. Real MiniCPM5 smoke after
+  this step: full layer 0 wrote `7` layers in `7.28 s` wall with
+  `mlx_packed_deferred=true` on every module; source-only computed-scale LDLQ
+  for `model.layers.0.mlp.down_proj` wrote a K4 layer in `4.54 s` wall.
 - Qwen3.6-27B M6 gate setup:
   source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
   `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
@@ -286,7 +299,8 @@ Current checkpoint-backed pilot:
   reports converted-vs-source, oracle-vs-source, and converted/oracle proxy
   and output ratios. Production Metal LDLQ also has `ldlq_quantize_group`,
   which batches sibling modules at the trellis-search call boundary while
-  preserving each module's independent scales/Hessian/LDL state.
+  preserving each module's independent scales/Hessian/LDL state. Production
+  LDLQ keeps packed trellis buffers on MLX until module/group finalization.
 - `convert/regularize.py` — post-M4 regularization port: blockwise RMS,
   deterministic random sign flips, upstream `CODEBOOK_SCALE`, output/input
   channel scales, 128-block Hadamards, wrapped-diagonal tile sampling, and

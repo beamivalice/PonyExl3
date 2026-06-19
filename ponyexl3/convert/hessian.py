@@ -103,7 +103,7 @@ class _LDLQGroupState:
     l_factor: Any
     reconstructed: Any
     prod_cache: Any
-    packed: np.ndarray
+    packed: Any
 
 
 def capture_hessian(activations: np.ndarray, *, normalize: bool = True) -> np.ndarray:
@@ -469,7 +469,7 @@ def _ldlq_inner_matrix_mlx(
     tiles_k = rows // 16
     tiles_n = cols // 16
     packed_size = 256 * k // 16
-    packed = np.empty((tiles_k, tiles_n, packed_size), dtype=np.uint16)
+    packed_mx = mx.zeros((tiles_k, tiles_n, packed_size), dtype=mx.uint16)
 
     j = rows
     while j > 0:
@@ -495,8 +495,12 @@ def _ldlq_inner_matrix_mlx(
             )
             mx.eval(block_packed_mx, block_reconstructed)
             tk = (i + bi) // 16
-            tk1 = tk + (bj - bi) // 16
-            packed[tk:tk1] = np.array(block_packed_mx).astype(np.uint16, copy=False)
+            packed_mx = mx.slice_update(
+                packed_mx,
+                block_packed_mx,
+                start_indices=mx.array([tk, 0, 0], dtype=mx.int32),
+                axes=(0, 1, 2),
+            )
             b_reconstructed = mx.slice_update(
                 b_reconstructed,
                 block_reconstructed,
@@ -521,7 +525,8 @@ def _ldlq_inner_matrix_mlx(
             )
         j = i
 
-    mx.eval(reconstructed)
+    mx.eval(reconstructed, packed_mx)
+    packed = np.array(packed_mx).astype(np.uint16, copy=False)
     reconstructed_np = np.array(reconstructed).astype(np.float32, copy=False)
     weight_np = inner.astype(np.float32, copy=False)
     delta = reconstructed_np - weight_np
@@ -533,6 +538,7 @@ def _ldlq_inner_matrix_mlx(
         "pack_roundtrip": True,
         "ldlq_feedback_rows": float(feedback_rows),
         "mlx_ldlq": True,
+        "mlx_packed_deferred": True,
     }
     if hessian is not None and compute_proxy:
         proxy = hessian_proxy_stats(delta, hessian, reference=weight_np)
@@ -937,9 +943,9 @@ def ldlq_quantize_group(
                 l_factor=mx.array(member.l_factor, dtype=mx.float32),
                 reconstructed=mx.zeros((rows, out_features), dtype=mx.float32),
                 prod_cache=mx.zeros((rows, out_features), dtype=mx.float32),
-                packed=np.empty(
+                packed=mx.zeros(
                     (rows // 16, out_features // 16, packed_size),
-                    dtype=np.uint16,
+                    dtype=mx.uint16,
                 ),
             )
         )
@@ -983,7 +989,6 @@ def ldlq_quantize_group(
             )
             mx.eval(block_packed_mx, block_reconstructed_cat)
             tk = (i + bi) // 16
-            tk1 = tk + (bj - bi) // 16
             col = 0
             tile_col = 0
             for index, state in enumerate(states):
@@ -996,9 +1001,12 @@ def ldlq_quantize_group(
                     start_indices=mx.array([bi, 0], dtype=mx.int32),
                     axes=(0, 1),
                 )
-                state.packed[tk:tk1] = np.array(
-                    block_packed_mx[:, tile_col : tile_col + out_tiles]
-                ).astype(np.uint16, copy=False)
+                state.packed = mx.slice_update(
+                    state.packed,
+                    block_packed_mx[:, tile_col : tile_col + out_tiles],
+                    start_indices=mx.array([tk, 0, 0], dtype=mx.int32),
+                    axes=(0, 1, 2),
+                )
                 col += out_features
                 tile_col += out_tiles
 
@@ -1020,11 +1028,12 @@ def ldlq_quantize_group(
                 )
         j = i
 
-    mx.eval(*[state.reconstructed for state in states])
+    mx.eval(*[state.reconstructed for state in states], *[state.packed for state in states])
     out: list[DirectLayerResult] = []
     for state in states:
         ref_layer = state.ref_layer
         recon_part = np.array(state.reconstructed).astype(np.float32, copy=False)
+        packed = np.array(state.packed).astype(np.uint16, copy=False)
         target_part = state.basis.target_inner
         delta = recon_part - target_part
         mse = float(np.mean(delta * delta))
@@ -1046,6 +1055,7 @@ def ldlq_quantize_group(
                 "batched_search_group_size": float(len(keys)),
                 "batched_search_group_out_features": float(total_out),
                 "batched_prep_workers": float(prep_workers),
+                "mlx_packed_deferred": True,
                 "public_mse": float("nan"),
                 "public_rel_rms": float("nan"),
                 "output_mse": float("nan"),
@@ -1057,7 +1067,7 @@ def ldlq_quantize_group(
             in_features=ref_layer.in_features,
             out_features=ref_layer.out_features,
             k=first_k,
-            trellis=state.packed,
+            trellis=packed,
             suh=state.basis.suh,
             svh=state.basis.svh,
             mcg=ref_layer.mcg,

@@ -242,6 +242,7 @@ def test_ldlq_mlx_no_state_matches_debug_state_path():
     assert debug.states is not None
     assert fast.states is None
     assert fast.stats["mlx_ldlq"] is True
+    assert fast.stats["mlx_packed_deferred"] is True
     np.testing.assert_array_equal(fast.packed, debug.packed)
     np.testing.assert_array_equal(fast.reconstructed, debug.reconstructed)
 
@@ -440,6 +441,7 @@ def test_ldlq_group_batched_search_matches_individual_with_distinct_scales(tmp_p
         assert batched.stats["batched_search_group_size"] == 2.0
         assert batched.stats["batched_prep_workers"] == 2.0
         assert batched.stats["mlx_ldlq"] is True
+        assert batched.stats["mlx_packed_deferred"] is True
 
 
 def test_reconstruct_oracle_public_fast_matches_reference():
