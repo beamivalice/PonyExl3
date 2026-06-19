@@ -91,6 +91,7 @@ class _LDLQGroupPrepared:
     cb: CodebookMode
     l_factor: np.ndarray
     activations_mlx_hadamard: bool
+    hessian_stats: dict[str, float | bool]
 
 
 @dataclass
@@ -109,6 +110,7 @@ class _LDLQGroupState:
     prod_cache: Any
     packed: Any
     activations_mlx_hadamard: bool
+    hessian_stats: dict[str, float | bool]
 
 
 def capture_hessian(activations: np.ndarray, *, normalize: bool = True) -> np.ndarray:
@@ -122,6 +124,60 @@ def capture_hessian(activations: np.ndarray, *, normalize: bool = True) -> np.nd
         h /= max(1, x.shape[0])
     h = (h + h.T) * np.float32(0.5)
     return h.astype(np.float32, copy=False)
+
+
+def apply_hessian_shrinkage(hessian: np.ndarray, *, shrinkage: float = 0.0) -> np.ndarray:
+    """Shrink off-diagonal covariance toward a diagonal Hessian estimate."""
+
+    if hessian.ndim != 2 or hessian.shape[0] != hessian.shape[1]:
+        raise ValueError(f"expected square Hessian, got {hessian.shape}")
+    if not np.isfinite(shrinkage) or shrinkage < 0.0 or shrinkage > 1.0:
+        raise ValueError(f"hessian_shrinkage must be in [0, 1], got {shrinkage}")
+    if shrinkage == 0.0:
+        return hessian.astype(np.float32, copy=False)
+    h = hessian.astype(np.float32, copy=True)
+    diag_idx = np.diag_indices_from(h)
+    diag = h[diag_idx].copy()
+    h *= np.float32(1.0 - shrinkage)
+    h[diag_idx] = diag
+    return h.astype(np.float32, copy=False)
+
+
+def hessian_offdiag_rel(hessian: np.ndarray) -> float:
+    """Return off-diagonal RMS normalized by diagonal RMS."""
+
+    if hessian.ndim != 2 or hessian.shape[0] != hessian.shape[1]:
+        raise ValueError(f"expected square Hessian, got {hessian.shape}")
+    n = hessian.shape[0]
+    if n == 0:
+        return 0.0
+    h = hessian.astype(np.float32, copy=False)
+    diag = np.diag(h).astype(np.float64, copy=False)
+    diag_ss = float(np.sum(diag * diag, dtype=np.float64))
+    total_ss = float(np.sum(h * h, dtype=np.float64))
+    offdiag_ss = max(0.0, total_ss - diag_ss)
+    offdiag_count = max(1, n * n - n)
+    diag_rms = float(np.sqrt(diag_ss / max(1, n)))
+    offdiag_rms = float(np.sqrt(offdiag_ss / offdiag_count))
+    return float(offdiag_rms / (diag_rms + 1e-20))
+
+
+def _prepare_activation_hessian(
+    inner_activations: np.ndarray,
+    *,
+    sigma_reg: float,
+    hessian_shrinkage: float,
+) -> tuple[PreparedHessian, dict[str, float | bool]]:
+    raw_hessian = capture_hessian(inner_activations)
+    raw_offdiag_rel = hessian_offdiag_rel(raw_hessian)
+    hessian = apply_hessian_shrinkage(raw_hessian, shrinkage=hessian_shrinkage)
+    shrunk_offdiag_rel = hessian_offdiag_rel(hessian)
+    prepared = prepare_hessian_for_ldl(hessian, sigma_reg=sigma_reg)
+    return prepared, {
+        "hessian_shrinkage": float(hessian_shrinkage),
+        "hessian_offdiag_rel_unshrunk": raw_offdiag_rel,
+        "hessian_offdiag_rel": shrunk_offdiag_rel,
+    }
 
 
 def prepare_hessian_for_ldl(
@@ -597,6 +653,7 @@ def ldlq_quantize_layer(
     search_backend: SearchBackend = "metal",
     scale_mode: ScaleMode = "oracle_safe",
     sigma_reg: float = 0.025,
+    hessian_shrinkage: float = 0.0,
     buf_size_rows: int = 128,
     feedback_rows: int = 16,
     max_pins: int = 4,
@@ -649,7 +706,11 @@ def ldlq_quantize_layer(
         suh,
         search_backend=search_backend,
     )
-    prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
+    prepared, hessian_stats = _prepare_activation_hessian(
+        inner_acts,
+        sigma_reg=sigma_reg,
+        hessian_shrinkage=hessian_shrinkage,
+    )
     ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
     quantized = ldlq_inner_matrix(
         target_inner,
@@ -691,6 +752,7 @@ def ldlq_quantize_layer(
             "activations_mlx_hadamard": activations_mlx_hadamard,
         }
     )
+    stats.update(hessian_stats)
     if fast_metrics:
         source_y = np.empty((0, 0), dtype=np.float32)
         converted_y = np.empty((0, 0), dtype=np.float32)
@@ -811,6 +873,7 @@ def _prepare_ldlq_group_member(
     scale_mode: ScaleMode,
     search_backend: SearchBackend,
     sigma_reg: float,
+    hessian_shrinkage: float,
     max_pins: int,
     skip_g_scale: bool,
     regularization_seed: int,
@@ -841,7 +904,11 @@ def _prepare_ldlq_group_member(
         basis.suh,
         search_backend=search_backend,
     )
-    prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
+    prepared, hessian_stats = _prepare_activation_hessian(
+        inner_acts,
+        sigma_reg=sigma_reg,
+        hessian_shrinkage=hessian_shrinkage,
+    )
     ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
     l_factor = ldl.l.astype(np.float32, copy=True)
     l_factor[np.diag_indices_from(l_factor)] = np.float32(0.0)
@@ -856,6 +923,7 @@ def _prepare_ldlq_group_member(
         cb=oracle.cb,
         l_factor=l_factor,
         activations_mlx_hadamard=activations_mlx_hadamard,
+        hessian_stats=hessian_stats,
     )
 
 
@@ -867,6 +935,7 @@ def ldlq_quantize_group(
     search_backend: SearchBackend = "metal",
     scale_mode: ScaleMode = "oracle_safe",
     sigma_reg: float = 0.025,
+    hessian_shrinkage: float = 0.0,
     buf_size_rows: int = 128,
     feedback_rows: int = 16,
     max_pins: int = 4,
@@ -924,6 +993,7 @@ def ldlq_quantize_group(
                 scale_mode=scale_mode,
                 search_backend=search_backend,
                 sigma_reg=sigma_reg,
+                hessian_shrinkage=hessian_shrinkage,
                 max_pins=max_pins,
                 skip_g_scale=skip_g_scale,
                 regularization_seed=regularization_seed,
@@ -946,6 +1016,7 @@ def ldlq_quantize_group(
                     scale_mode=scale_mode,
                     search_backend=search_backend,
                     sigma_reg=sigma_reg,
+                    hessian_shrinkage=hessian_shrinkage,
                     max_pins=max_pins,
                     skip_g_scale=skip_g_scale,
                     regularization_seed=regularization_seed,
@@ -993,6 +1064,7 @@ def ldlq_quantize_group(
                     dtype=mx.uint16,
                 ),
                 activations_mlx_hadamard=member.activations_mlx_hadamard,
+                hessian_stats=member.hessian_stats,
             )
         )
 
@@ -1109,6 +1181,7 @@ def ldlq_quantize_group(
                 "output_rel_rms": float("nan"),
             }
         )
+        stats.update(state.hessian_stats)
         layer = EXL3Layer(
             key=state.key,
             in_features=ref_layer.in_features,

@@ -12,9 +12,11 @@ from safetensors.numpy import save_file
 from ponyexl3.convert.direct import quantize_inner_matrix_direct, write_direct_layer_bundle
 from ponyexl3.convert.hessian import (
     _public_activations_to_inner_for_backend,
+    apply_hessian_shrinkage,
     block_ldl,
     capture_hessian,
     hessian_proxy_stats,
+    hessian_offdiag_rel,
     ldlq_quantize_layer,
     ldlq_quantize_group,
     ldlq_inner_matrix,
@@ -125,6 +127,31 @@ def test_capture_prepare_block_ldl_identity_blocks():
         block = result.l[start : start + 16, start : start + 16]
         np.testing.assert_allclose(block, np.eye(16, dtype=np.float32), atol=2e-5)
     np.testing.assert_allclose(np.triu(result.l, k=1), 0.0, atol=2e-5)
+
+
+def test_hessian_shrinkage_preserves_diag_and_reduces_offdiag():
+    rng = np.random.default_rng(111)
+    activations = rng.standard_normal((96, 32)).astype(np.float32)
+    activations[:, :16] += 0.7 * activations[:, 16:]
+    hessian = capture_hessian(activations)
+
+    shrunk = apply_hessian_shrinkage(hessian, shrinkage=0.25)
+
+    np.testing.assert_allclose(np.diag(shrunk), np.diag(hessian), rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        hessian_offdiag_rel(shrunk),
+        hessian_offdiag_rel(hessian) * 0.75,
+        rtol=3e-6,
+        atol=1e-7,
+    )
+
+
+def test_hessian_shrinkage_rejects_invalid_values():
+    hessian = np.eye(16, dtype=np.float32)
+    with pytest.raises(ValueError, match="hessian_shrinkage"):
+        apply_hessian_shrinkage(hessian, shrinkage=-0.1)
+    with pytest.raises(ValueError, match="hessian_shrinkage"):
+        apply_hessian_shrinkage(hessian, shrinkage=1.1)
 
 
 def test_ldlq_identity_hessian_matches_direct_quantization():
@@ -380,6 +407,7 @@ def test_ldlq_layer_computed_scales_with_calibration_rows(tmp_path: Path):
         PILOT_MODULE,
         search_backend="metal",
         scale_mode="computed",
+        hessian_shrinkage=0.2,
         buf_size_rows=128,
         calibration_activations=activations,
         skip_g_scale=True,
@@ -390,6 +418,10 @@ def test_ldlq_layer_computed_scales_with_calibration_rows(tmp_path: Path):
     assert result.layer.svh is not None
     assert result.stats["regularize_computed_scales"] is True
     assert result.stats["regularize_g_scale_skipped"] is True
+    assert result.stats["hessian_shrinkage"] == 0.2
+    assert float(result.stats["hessian_offdiag_rel"]) < float(
+        result.stats["hessian_offdiag_rel_unshrunk"]
+    )
     assert result.stats["activations_mlx_hadamard"] is False
     np.testing.assert_allclose(result.activations, activations, rtol=0.0, atol=0.0)
     assert np.isfinite(result.converted_output).all()
@@ -424,6 +456,7 @@ def test_ldlq_group_batched_search_matches_individual_with_distinct_scales(tmp_p
         keys,
         search_backend="metal",
         scale_mode="computed",
+        hessian_shrinkage=0.15,
         buf_size_rows=64,
         feedback_rows=32,
         calibration_activations_by_module=activations,
@@ -437,6 +470,7 @@ def test_ldlq_group_batched_search_matches_individual_with_distinct_scales(tmp_p
             key,
             search_backend="metal",
             scale_mode="computed",
+            hessian_shrinkage=0.15,
             buf_size_rows=64,
             feedback_rows=32,
             calibration_activations=activations[key],
@@ -458,6 +492,8 @@ def test_ldlq_group_batched_search_matches_individual_with_distinct_scales(tmp_p
         assert batched.layer.svh is not None
         assert single.layer.svh is not None
         np.testing.assert_array_equal(batched.layer.trellis, single.layer.trellis)
+        assert batched.stats["hessian_shrinkage"] == 0.15
+        assert batched.stats["hessian_offdiag_rel"] == single.stats["hessian_offdiag_rel"]
         np.testing.assert_allclose(batched.layer.suh, single.layer.suh, rtol=0.0, atol=0.0)
         np.testing.assert_allclose(batched.layer.svh, single.layer.svh, rtol=0.0, atol=0.0)
         assert batched.stats["batched_search_group_size"] == 2.0

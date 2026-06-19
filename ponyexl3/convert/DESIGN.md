@@ -4,7 +4,7 @@ Updated 2026-06-19. Status: **M1 complete, M2 complete, M3b direct full-layer
 emit/load gate complete, M4 complete for selected-module/layer-set LDLQ emit,
 post-M4 computed-scale/calibration inputs complete, MiniCPM5 direct full-model
 conversion/load/KLD gated, M5a priority allocation wired, and new-converter
-GPU-residency/batched-search optimization in progress**
+GPU-residency/batched-search optimization plus Hessian-quality exploration in progress**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`,
 `tests/test_convert_hessian.py`, `tests/test_convert_driver.py`,
 `tests/test_convert_regularize.py`, `tests/test_convert_calibration.py`,
@@ -203,6 +203,20 @@ Current checkpoint-backed pilot:
   Real MiniCPM5 smoke after this step: full layer 0 wrote `7` layers in
   `7.04 s` wall with `basis_mlx_hadamard=true` on every module and
   `activations_mlx_hadamard=false` for the 4-row fixture.
+- Post-step-6 Hessian quality lever:
+  LDLQ can now apply optional off-diagonal Hessian shrinkage via
+  `--hessian-shrinkage A`, where `A=0.0` is the unchanged empirical Hessian
+  and `A=1.0` is diagonal-only. The transform preserves the captured Hessian
+  diagonal exactly and scales only off-diagonal covariance by `1-A`, which
+  gives us a cheap robustness sweep for small/noisy calibration maps without
+  changing the default converter. Single-module and grouped LDLQ both record
+  `hessian_shrinkage`, `hessian_offdiag_rel_unshrunk`, and
+  `hessian_offdiag_rel` in stats/manifest summaries. Use this only as an
+  explicit KLD experiment for now; the baseline M6 command remains
+  `--hessian-shrinkage 0.0`. MiniCPM5 `down_proj` no-calibration smoke with
+  computed scales reduced off-diagonal rel-RMS from `0.2320` to `0.2088` at
+  `A=0.10`, but output rel-RMS moved slightly worse (`0.005719` →
+  `0.005795`), so shrinkage is not a default win.
 - Qwen3.6-27B M6 gate setup:
   source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
   `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
@@ -654,6 +668,10 @@ Important command notes:
   public reconstruction uses the fast Metal trellis decode path. Production
   runs without diagnostics should omit both flags and keep default
   `--fast-layer-metrics`.
+- If Qwen KLD underperforms with the baseline empirical Hessian, run bounded
+  MiniCPM/Qwen layer sweeps with `--hessian-shrinkage 0.05`, `0.10`, and
+  `0.20` before changing the full M6 command. This is a quality knob, not a
+  speed knob; validate against original-vs-converted KLD, not only proxy error.
 
 Acceptance after conversion:
 
@@ -696,6 +714,7 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | MiniCPM5 full `--oracle-metrics` layer | exact LDLQ, full diagnostics | `56 s` -> `1.78 s` | `~31x` faster after swapping only the hot oracle trellis decode; metrics unchanged. |
 | MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, Metal, GPU trellis pack, no state materialization | `3.55 s` | Bounded smoke after adding `pack_trellis_mlx`; wrote/reloaded K4 layer. |
 | MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, MLX-resident compensation/prod-cache, no state materialization | `3.69 s` | Bounded smoke after adding `mlx_ldlq`; similar wall time on one module, much lower CPU user time (`0.65 s`). |
+| Hessian shrinkage sweep | LDLQ quality experiment | neutral expected | `--hessian-shrinkage` preserves diagonal energy and damps off-diagonal covariance; default `0.0` keeps baseline timings/quality unchanged. |
 | Qwen3.6-27B full model | exact LDLQ, Metal, oracle K plan, full oracle diagnostics | long/overnight expected | `401` supported EXL3 linears: `285` K4, `115` K5, K6 `lm_head`; use real per-module calibration and `--resume`. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |

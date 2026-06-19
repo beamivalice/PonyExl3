@@ -123,11 +123,20 @@ def _module_set_progress(scope: str):
                 shape_s = f"{shape[0]}x{shape[1]}"
             proxy = data.get("hessian_proxy_rel_rms")
             proxy_s = "" if proxy is None else f" proxy={_progress_value(proxy)}"
+            shrinkage = _as_float(data.get("hessian_shrinkage"))
+            shrinkage_s = (
+                ""
+                if shrinkage == 0.0
+                else (
+                    f" shrink={shrinkage:.3f} "
+                    f"offdiag={_progress_value(data.get('hessian_offdiag_rel'))}"
+                )
+            )
             print(
                 f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
                 f"done {data['module']} shape={shape_s} k={data.get('k')} "
                 f"output={_progress_value(data.get('output_rel_rms'))} "
-                f"public={_progress_value(data.get('public_rel_rms'))}{proxy_s} "
+                f"public={_progress_value(data.get('public_rel_rms'))}{proxy_s}{shrinkage_s} "
                 f"module={_format_seconds(data['module_s'])} "
                 f"elapsed={_format_seconds(data['elapsed_s'])}",
                 file=sys.stderr,
@@ -378,6 +387,15 @@ def main() -> int:
     )
     parser.add_argument("--sigma-reg", type=float, default=0.025, help="Hessian diagonal damping")
     parser.add_argument(
+        "--hessian-shrinkage",
+        type=float,
+        default=0.0,
+        help=(
+            "shrink Hessian off-diagonal covariance toward a diagonal estimate; "
+            "0.0 preserves the empirical Hessian, 1.0 is diagonal-only"
+        ),
+    )
+    parser.add_argument(
         "--buf-size-rows",
         type=int,
         default=128,
@@ -601,6 +619,8 @@ def main() -> int:
         ldlq_fast_metrics = bool(args.ldlq_layer and args.fast_layer_metrics)
         if args.oracle_metrics and ldlq_fast_metrics:
             raise ValueError("--oracle-metrics requires --full-layer-metrics")
+        if not 0.0 <= args.hessian_shrinkage <= 1.0:
+            raise ValueError("--hessian-shrinkage must be in [0, 1]")
         allocation_requested = bool(
             args.use_bit_allocation or args.allocation_dry_run or args.layer_bits
         )
@@ -704,6 +724,7 @@ def main() -> int:
                     search_backend=args.search_backend,
                     scale_mode=args.scale_mode,
                     sigma_reg=args.sigma_reg,
+                    hessian_shrinkage=args.hessian_shrinkage,
                     buf_size_rows=args.buf_size_rows,
                     feedback_rows=args.ldlq_feedback_rows,
                     compare_oracle=bool(args.oracle_metrics),
@@ -735,6 +756,7 @@ def main() -> int:
                     "search_backend": args.search_backend,
                     "scale_mode": args.scale_mode,
                     "sigma_reg": args.sigma_reg,
+                    "hessian_shrinkage": args.hessian_shrinkage,
                     "buf_size_rows": args.buf_size_rows,
                     "ldlq_feedback_rows": args.ldlq_feedback_rows,
                     "oracle_metrics": bool(args.oracle_metrics),
@@ -791,6 +813,7 @@ def main() -> int:
                     search_backend=args.search_backend,
                     scale_mode=args.scale_mode,
                     sigma_reg=args.sigma_reg,
+                    hessian_shrinkage=args.hessian_shrinkage,
                     buf_size_rows=args.buf_size_rows,
                     feedback_rows=args.ldlq_feedback_rows,
                     compare_oracle=bool(args.oracle_metrics),
@@ -822,6 +845,7 @@ def main() -> int:
                 "search_backend": args.search_backend,
                 "scale_mode": args.scale_mode,
                 "sigma_reg": args.sigma_reg,
+                "hessian_shrinkage": args.hessian_shrinkage,
                 "buf_size_rows": args.buf_size_rows,
                 "ldlq_feedback_rows": args.ldlq_feedback_rows,
                 "oracle_metrics": bool(args.oracle_metrics),
@@ -875,6 +899,8 @@ def main() -> int:
                     f"oracle={stats.get('oracle_hessian_proxy_rel_rms', float('nan')):.6f}  "
                     f"ratio={stats.get('hessian_proxy_rel_rms_over_oracle', float('nan')):.6f}  "
                     f"diag_mean={stats['hessian_diag_mean']:.6e}  "
+                    f"shrinkage={stats.get('hessian_shrinkage', 0.0):.3f}  "
+                    f"offdiag={stats.get('hessian_offdiag_rel', float('nan')):.6f}  "
                     f"ldl_retries={stats['ldl_retries']:.0f}"
                 )
             if "oracle_output_rel_rms" in stats:

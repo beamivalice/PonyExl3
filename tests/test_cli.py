@@ -85,6 +85,28 @@ def test_convert_oracle_metrics_requires_full_layer_metrics():
     assert "--oracle-metrics requires --full-layer-metrics" in proc.stderr
 
 
+def test_convert_rejects_invalid_hessian_shrinkage():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ponyexl3.cli.convert",
+            "--in-dir",
+            "/tmp",
+            "--oracle-dir",
+            "/tmp",
+            "--ldlq-layer",
+            "--hessian-shrinkage",
+            "1.5",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "--hessian-shrinkage must be in [0, 1]" in proc.stderr
+
+
 def test_generate_bench_missing_prompt_file():
     proc = subprocess.run(
         [
