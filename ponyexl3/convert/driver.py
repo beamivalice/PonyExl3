@@ -28,7 +28,12 @@ from ponyexl3.convert.direct import (
     write_exl3_layers_bundle,
 )
 from ponyexl3.convert.fixtures import SearchBackend, resolve_source_linear
-from ponyexl3.convert.hessian import ldlq_layer_summary, ldlq_quantize_layer
+from ponyexl3.convert.hessian import (
+    LDLQGroupIncompatible,
+    ldlq_layer_summary,
+    ldlq_quantize_group,
+    ldlq_quantize_layer,
+)
 from ponyexl3.ref.layer import EXL3Layer
 from ponyexl3.ref.loader import layer_meta_from_config, list_exl3_layers, load_exl3_layer
 
@@ -298,6 +303,55 @@ def _summary(quantizer: LayerQuantizer, result: DirectLayerResult) -> dict[str, 
     return ldlq_layer_summary(result)
 
 
+def _sibling_group_signature(key: str) -> str | None:
+    prefix, sep, suffix = key.rpartition(".")
+    if not sep:
+        return None
+    if prefix.endswith(".self_attn") and suffix in {"q_proj", "k_proj", "v_proj"}:
+        return f"{prefix}._qkv"
+    if prefix.endswith(".linear_attn") and suffix in {"in_proj_qkv", "in_proj_z"}:
+        return f"{prefix}._in_proj_qkvz"
+    if suffix in {"gate_proj", "up_proj"} and (
+        prefix.endswith(".mlp") or ".experts." in prefix
+    ):
+        return f"{prefix}._gate_up"
+    return None
+
+
+def _candidate_sibling_group(
+    requested: Sequence[str],
+    key: str,
+    processed: set[str],
+    existing: dict[str, EXL3Layer],
+) -> list[str]:
+    signature = _sibling_group_signature(key)
+    if signature is None:
+        return [key]
+    group = [
+        item
+        for item in requested
+        if item not in processed
+        and item not in existing
+        and _sibling_group_signature(item) == signature
+    ]
+    return group if len(group) >= 2 else [key]
+
+
+def _grouping_enabled(
+    *,
+    quantizer: LayerQuantizer,
+    search_backend: SearchBackend,
+    compare_oracle: bool,
+    fast_metrics: bool,
+) -> bool:
+    return (
+        quantizer == "ldlq"
+        and search_backend == "metal"
+        and fast_metrics
+        and not compare_oracle
+    )
+
+
 def convert_module_set(
     source_dir: str | Path,
     oracle_dir: str | Path,
@@ -356,7 +410,12 @@ def convert_module_set(
                 if key in available:
                     existing[key] = load_exl3_layer(str(out_dir), key)
 
-    for index, key in enumerate(requested, start=1):
+    positions = {key: index for index, key in enumerate(requested, start=1)}
+    processed: set[str] = set()
+    for key in requested:
+        if key in processed:
+            continue
+        index = positions[key]
         module_start = time.perf_counter()
         if progress is not None:
             planned_k = planned_bits.get(key)
@@ -371,6 +430,7 @@ def convert_module_set(
                 },
             )
         if key in existing:
+            processed.add(key)
             layer = existing[key]
             layers.append(layer)
             completed.append(
@@ -396,6 +456,87 @@ def convert_module_set(
                     },
                 )
             continue
+        group_keys = (
+            _candidate_sibling_group(requested, key, processed, existing)
+            if _grouping_enabled(
+                quantizer=quantizer,
+                search_backend=search_backend,
+                compare_oracle=compare_oracle,
+                fast_metrics=fast_metrics,
+            )
+            else [key]
+        )
+        if len(group_keys) > 1:
+            if progress is not None:
+                progress(
+                    "module_group_start",
+                    {
+                        "index": index,
+                        "total": len(requested),
+                        "module": key,
+                        "modules": group_keys,
+                        "elapsed_s": time.perf_counter() - total_start,
+                    },
+                )
+            try:
+                grouped_results = ldlq_quantize_group(
+                    source_dir,
+                    oracle_dir,
+                    group_keys,
+                    search_backend=search_backend,
+                    scale_mode=scale_mode,
+                    sigma_reg=sigma_reg,
+                    buf_size_rows=buf_size_rows,
+                    feedback_rows=feedback_rows,
+                    calibration_activations=calibration_activations,
+                    calibration_activations_by_module=calibration_activations_by_module,
+                    skip_g_scale=skip_g_scale,
+                    regularization_seed=regularization_seed,
+                    quant_bits_by_module={
+                        group_key: planned_bits.get(group_key) for group_key in group_keys
+                    },
+                )
+            except LDLQGroupIncompatible as exc:
+                if progress is not None:
+                    progress(
+                        "module_group_fallback",
+                        {
+                            "index": index,
+                            "total": len(requested),
+                            "module": key,
+                            "modules": group_keys,
+                            "reason": str(exc),
+                            "elapsed_s": time.perf_counter() - total_start,
+                        },
+                    )
+                group_keys = [key]
+            else:
+                group_elapsed = time.perf_counter() - module_start
+                for result in grouped_results:
+                    processed.add(result.module_key)
+                    layers.append(result.layer)
+                    item = _summary(quantizer, result)
+                    completed.append(item)
+                    if progress is not None:
+                        stats = item.get("stats", {})
+                        progress(
+                            "module_done",
+                            {
+                                "index": positions[result.module_key],
+                                "total": len(requested),
+                                "module": result.module_key,
+                                "shape": item.get("shape"),
+                                "k": item.get("k"),
+                                "output_rel_rms": stats.get("output_rel_rms"),
+                                "public_rel_rms": stats.get("public_rel_rms"),
+                                "hessian_proxy_rel_rms": stats.get(
+                                    "hessian_proxy_rel_rms"
+                                ),
+                                "module_s": group_elapsed,
+                                "elapsed_s": time.perf_counter() - total_start,
+                            },
+                        )
+                continue
         try:
             result = _convert_one(
                 quantizer,
@@ -418,6 +559,7 @@ def convert_module_set(
         except (KeyError, ValueError, FileNotFoundError) as exc:
             if not skip_unsupported:
                 raise
+            processed.add(key)
             skipped.append({"module": key, "reason": str(exc)})
             if progress is not None:
                 progress(
@@ -430,8 +572,9 @@ def convert_module_set(
                         "module_s": time.perf_counter() - module_start,
                         "elapsed_s": time.perf_counter() - total_start,
                     },
-                )
+            )
             continue
+        processed.add(key)
         layers.append(result.layer)
         item = _summary(quantizer, result)
         completed.append(item)

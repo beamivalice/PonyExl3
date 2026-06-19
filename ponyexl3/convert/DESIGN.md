@@ -1,9 +1,10 @@
 # pony-quant: HF → EXL3 converter — engineering roadmap (handoff)
 
-Updated 2026-06-18. Status: **M1 complete, M2 complete, M3b direct full-layer
+Updated 2026-06-19. Status: **M1 complete, M2 complete, M3b direct full-layer
 emit/load gate complete, M4 complete for selected-module/layer-set LDLQ emit,
 post-M4 computed-scale/calibration inputs complete, MiniCPM5 direct full-model
-conversion/load/KLD gated, and M5a priority allocation wired**
+conversion/load/KLD gated, M5a priority allocation wired, and new-converter
+GPU-residency/batched-search optimization in progress**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`,
 `tests/test_convert_hessian.py`, `tests/test_convert_driver.py`,
 `tests/test_convert_regularize.py`, `tests/test_convert_calibration.py`,
@@ -139,6 +140,25 @@ Current checkpoint-backed pilot:
   on packed trellis and reconstruction. Bounded MiniCPM5 LDLQ smoke for
   `model.layers.0.mlp.down_proj` wrote/reloaded a K4 layer in `3.69 s` wall
   time with `mlx_ldlq=True`.
+- New converter GPU-residency step 3:
+  sibling projection conversion now batches the hot Metal trellis search
+  calls without requiring shared source scales. Each grouped module keeps its
+  own source scales, calibration rows, Hessian, LDL factor, compensation, and
+  output layer; at each reverse-LDLQ feedback step the current rows are
+  concatenated across siblings for one larger Metal search and then split back
+  into per-module packed trellis tensors. This is safe for oracle-safe and
+  computed-scale conversion because it does not assume identical `suh`.
+  Driver grouping is enabled for production LDLQ (`--search-backend metal`,
+  fast metrics, no oracle metrics) on `gate_proj/up_proj`, `q_proj/k_proj/v_proj`,
+  and `linear_attn.in_proj_qkv/in_proj_z`. CLI progress now reports
+  `batch-start` and `batch-fallback` events, and grouped summaries include
+  `batched_search_group_size` / `batched_search_group_out_features`. Parity
+  test: two synthetic computed-scale siblings with distinct `suh` and distinct
+  calibration activations produce bit-identical trellis/scales versus two
+  independent LDLQ conversions. Real MiniCPM5 smoke:
+  `--only-layer 0 --module-limit 3` batched `gate/up` and wrote `3` layers in
+  `5.44 s` wall (`0.85 s` user); full layer-0 smoke batched `gate/up` plus
+  `k/q/v`, wrote `7` layers in `7.61 s` wall (`1.16 s` user).
 - Qwen3.6-27B M6 gate setup:
   source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
   `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
@@ -249,7 +269,9 @@ Current checkpoint-backed pilot:
   activation-space Hessians stay aligned. M4b adds
   `public_matrix_to_inner` and oracle comparison weights, so the same Hessian
   reports converted-vs-source, oracle-vs-source, and converted/oracle proxy
-  and output ratios.
+  and output ratios. Production Metal LDLQ also has `ldlq_quantize_group`,
+  which batches sibling modules at the trellis-search call boundary while
+  preserving each module's independent scales/Hessian/LDL state.
 - `convert/regularize.py` — post-M4 regularization port: blockwise RMS,
   deterministic random sign flips, upstream `CODEBOOK_SCALE`, output/input
   channel scales, 128-block Hadamards, wrapped-diagonal tile sampling, and

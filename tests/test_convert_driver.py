@@ -140,6 +140,55 @@ def test_module_set_bit_plan_overrides_emitted_k(tmp_path: Path, monkeypatch: py
     assert manifest["bit_plan"] == {key: 5}
 
 
+def test_module_set_batches_fast_ldlq_siblings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    keys = [
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj",
+    ]
+    calls: list[list[str]] = []
+
+    def fake_group(*args, **kwargs):  # noqa: ARG001
+        group_keys = list(args[2])
+        calls.append(group_keys)
+        out = []
+        for key in group_keys:
+            layer = _layer(key)
+            out.append(
+                DirectLayerResult(
+                    module_key=key,
+                    search_backend="metal",
+                    scale_mode="oracle_safe",
+                    layer=layer,
+                    activations=np.zeros((1, layer.in_features), dtype=np.float32),
+                    source_output=np.empty((0, 0), dtype=np.float32),
+                    converted_output=np.empty((0, 0), dtype=np.float32),
+                    stats={
+                        "output_rel_rms": float("nan"),
+                        "public_rel_rms": float("nan"),
+                        "batched_group_size": float(len(group_keys)),
+                    },
+                )
+            )
+        return out
+
+    monkeypatch.setattr(convert_driver, "ldlq_quantize_group", fake_group)
+
+    result = convert_driver.convert_module_set(
+        tmp_path / "source",
+        tmp_path / "oracle",
+        keys,
+        quantizer="ldlq",
+        search_backend="metal",
+        compare_oracle=False,
+        fast_metrics=True,
+    )
+
+    assert calls == [keys]
+    assert [item["module"] for item in result.completed] == keys
+    assert all(item["stats"]["batched_group_size"] == 3.0 for item in result.completed)
+
+
 _EXL3_DIR = Path(
     os.environ.get("PONYEXL3_MODELS_DIR", Path.home() / "llm/models/exl3")
 )

@@ -97,6 +97,25 @@ def _module_set_progress(scope: str):
                 file=sys.stderr,
                 flush=True,
             )
+        elif event == "module_group_start":
+            modules = data.get("modules")
+            group_size = len(modules) if isinstance(modules, list | tuple) else 0
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"batch-start size={group_size} first={data['module']} "
+                f"elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "module_group_fallback":
+            modules = data.get("modules")
+            group_size = len(modules) if isinstance(modules, list | tuple) else 0
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"batch-fallback size={group_size} first={data['module']}: {data['reason']}",
+                file=sys.stderr,
+                flush=True,
+            )
         elif event == "module_done":
             shape = data.get("shape")
             shape_s = "?"

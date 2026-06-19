@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,27 @@ class LDLQResult:
     states: np.ndarray | None
     reconstructed: np.ndarray
     stats: dict[str, float | bool]
+
+
+class LDLQGroupIncompatible(ValueError):
+    """Raised when candidate sibling linears cannot share batched search."""
+
+
+@dataclass
+class _LDLQGroupState:
+    """Mutable MLX state for one member of a batched-search LDLQ group."""
+
+    key: str
+    fixture: Any
+    basis: Any
+    prepared: PreparedHessian
+    ldl: BlockLDLResult
+    ref_layer: EXL3Layer
+    weight: Any
+    l_factor: Any
+    reconstructed: Any
+    prod_cache: Any
+    packed: np.ndarray
 
 
 def capture_hessian(activations: np.ndarray, *, normalize: bool = True) -> np.ndarray:
@@ -702,6 +724,253 @@ def ldlq_quantize_layer(
         converted_output=converted_y.astype(np.float32),
         stats=stats,
     )
+
+
+def ldlq_quantize_group(
+    source_dir: str | Path,
+    oracle_dir: str | Path,
+    module_keys: Sequence[str],
+    *,
+    search_backend: SearchBackend = "metal",
+    scale_mode: ScaleMode = "oracle_safe",
+    sigma_reg: float = 0.025,
+    buf_size_rows: int = 128,
+    feedback_rows: int = 16,
+    max_pins: int = 4,
+    calibration_activations: np.ndarray | None = None,
+    calibration_activations_by_module: Mapping[str, np.ndarray | None] | None = None,
+    skip_g_scale: bool = False,
+    regularization_seed: int = 0,
+    quant_bits_by_module: dict[str, int | None] | None = None,
+) -> list[DirectLayerResult]:
+    """Quantize compatible sibling linears with batched Metal search calls.
+
+    Each module keeps its own source scales, Hessian, LDL factor, compensation,
+    and reconstructed matrix. At each reverse-LDLQ feedback step we concatenate
+    the current rows across modules, launch one larger trellis search, then split
+    the packed/reconstructed result back to the independent module states. This
+    avoids the unsafe assumption that sibling modules share identical input
+    scales while still reducing the small-kernel gaps between modules.
+    """
+
+    keys = list(module_keys)
+    if len(keys) < 2:
+        raise LDLQGroupIncompatible("need at least two modules for grouped LDLQ")
+    if search_backend != "metal":
+        raise LDLQGroupIncompatible("grouped LDLQ is only enabled for Metal")
+    if buf_size_rows < 16 or buf_size_rows % 16 != 0:
+        raise ValueError(f"buf_size_rows must be a positive 16-multiple, got {buf_size_rows}")
+    if feedback_rows < 16 or feedback_rows % 16 != 0:
+        raise ValueError(f"feedback_rows must be a positive 16-multiple, got {feedback_rows}")
+    if feedback_rows > buf_size_rows:
+        raise ValueError("feedback_rows must be <= buf_size_rows")
+
+    import mlx.core as mx
+
+    states: list[_LDLQGroupState] = []
+    ks: list[int] = []
+    first_cb: CodebookMode | None = None
+    first_rows: int | None = None
+    for key in keys:
+        acts = calibration_activations
+        if calibration_activations_by_module is not None and key in calibration_activations_by_module:
+            acts = calibration_activations_by_module[key]
+        fixture = build_layer_fixture(source_dir, oracle_dir, key, activations=acts)
+        oracle = fixture.oracle
+        ref_layer = oracle.layer
+        if ref_layer.in_features % HAD_DIM != 0 or ref_layer.out_features % HAD_DIM != 0:
+            raise LDLQGroupIncompatible(f"{key}: dimensions must be 128-multiple")
+        k = ref_layer.k
+        planned_k = None if quant_bits_by_module is None else quant_bits_by_module.get(key)
+        if planned_k is not None:
+            k = int(planned_k)
+        if k < 1 or k > 8:
+            raise LDLQGroupIncompatible(f"{key}: EXL3 trellis K must be in [1, 8], got {k}")
+        basis = prepare_layer_quantization_basis(
+            source_dir,
+            fixture.source,
+            ref_layer,
+            oracle.cb,
+            scale_mode=scale_mode,
+            search_backend=search_backend,
+            max_pins=max_pins,
+            skip_g_scale=skip_g_scale,
+            regularization_seed=regularization_seed,
+            quant_bits=k,
+        )
+        ks.append(k)
+        if first_cb is None:
+            first_cb = oracle.cb
+        elif oracle.cb != first_cb:
+            raise LDLQGroupIncompatible(f"{key}: codebook differs from group")
+        if first_rows is None:
+            first_rows = int(ref_layer.in_features)
+        elif int(ref_layer.in_features) != first_rows:
+            raise LDLQGroupIncompatible(f"{key}: in_features differs from group")
+        inner_acts = public_activations_to_inner(fixture.activations, basis.suh)
+        prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
+        ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
+        l_np = ldl.l.astype(np.float32, copy=True)
+        l_np[np.diag_indices_from(l_np)] = np.float32(0.0)
+        rows = int(ref_layer.in_features)
+        out_features = int(ref_layer.out_features)
+        packed_size = 256 * k // 16
+        states.append(
+            _LDLQGroupState(
+                key=key,
+                fixture=fixture,
+                basis=basis,
+                prepared=prepared,
+                ldl=ldl,
+                ref_layer=ref_layer,
+                weight=mx.array(basis.target_inner.astype(np.float32, copy=False), dtype=mx.float32),
+                l_factor=mx.array(l_np, dtype=mx.float32),
+                reconstructed=mx.zeros((rows, out_features), dtype=mx.float32),
+                prod_cache=mx.zeros((rows, out_features), dtype=mx.float32),
+                packed=np.empty(
+                    (rows // 16, out_features // 16, packed_size),
+                    dtype=np.uint16,
+                ),
+            )
+        )
+
+    if not states:
+        raise LDLQGroupIncompatible("empty grouped LDLQ request")
+    first_k = ks[0]
+    for key, k in zip(keys, ks, strict=True):
+        if k != first_k:
+            raise LDLQGroupIncompatible(f"{key}: K differs from group")
+    if first_cb is None or first_rows is None:
+        raise LDLQGroupIncompatible("invalid grouped LDLQ request")
+
+    rows = first_rows
+    total_out = sum(int(state.ref_layer.out_features) for state in states)
+    j = rows
+    while j > 0:
+        i = max(0, j - buf_size_rows)
+        if (j - i) % 16 != 0:
+            raise ValueError("LDLQ row chunks must stay 16-aligned")
+        chunk_rows = j - i
+        b_weights = [state.weight[i:j] for state in states]
+        b_reconstructed = [state.reconstructed[i:j] for state in states]
+        b_prod_cache = [state.prod_cache[i:j] for state in states]
+        b_l = [state.l_factor[i:j] for state in states]
+
+        for bj in range(chunk_rows, 0, -feedback_rows):
+            bi = max(0, bj - feedback_rows)
+            if (bj - bi) % 16 != 0:
+                raise ValueError("LDLQ feedback groups must stay 16-aligned")
+            rows_to_quantize = []
+            for index, state in enumerate(states):
+                bb_err = b_weights[index][bj:] - b_reconstructed[index][bj:]
+                compensation = b_prod_cache[index][bi:bj]
+                if bb_err.size:
+                    bb_l = b_l[index][bj:, i + bi : i + bj]
+                    compensation = compensation + mx.matmul(bb_l.T, bb_err)
+                rows_to_quantize.append(b_weights[index][bi:bj] + compensation)
+
+            search_input = mx.concatenate(rows_to_quantize, axis=1)
+            block_packed_mx, block_reconstructed_cat = quantize_inner_matrix_direct_mlx(
+                search_input,
+                k=first_k,
+                cb=first_cb,
+            )
+            mx.eval(block_packed_mx, block_reconstructed_cat)
+            tk = (i + bi) // 16
+            tk1 = tk + (bj - bi) // 16
+            col = 0
+            tile_col = 0
+            for index, state in enumerate(states):
+                out_features = int(state.ref_layer.out_features)
+                out_tiles = out_features // 16
+                block_reconstructed = block_reconstructed_cat[:, col : col + out_features]
+                b_reconstructed[index] = mx.slice_update(
+                    b_reconstructed[index],
+                    block_reconstructed,
+                    start_indices=mx.array([bi, 0], dtype=mx.int32),
+                    axes=(0, 1),
+                )
+                state.packed[tk:tk1] = np.array(
+                    block_packed_mx[:, tile_col : tile_col + out_tiles]
+                ).astype(np.uint16, copy=False)
+                col += out_features
+                tile_col += out_tiles
+
+        for index, state in enumerate(states):
+            b_err = b_weights[index] - b_reconstructed[index]
+            state.reconstructed = mx.slice_update(
+                state.reconstructed,
+                b_reconstructed[index],
+                start_indices=mx.array([i, 0], dtype=mx.int32),
+                axes=(0, 1),
+            )
+            if i > 0:
+                prod_update = mx.matmul(b_l[index][:, :i].T, b_err)
+                state.prod_cache = mx.slice_update(
+                    state.prod_cache,
+                    state.prod_cache[:i] + prod_update,
+                    start_indices=mx.array([0, 0], dtype=mx.int32),
+                    axes=(0, 1),
+                )
+        j = i
+
+    mx.eval(*[state.reconstructed for state in states])
+    out: list[DirectLayerResult] = []
+    for state in states:
+        ref_layer = state.ref_layer
+        recon_part = np.array(state.reconstructed).astype(np.float32, copy=False)
+        target_part = state.basis.target_inner
+        delta = recon_part - target_part
+        mse = float(np.mean(delta * delta))
+        ref_rms = float(np.sqrt(np.mean(target_part * target_part))) + 1e-20
+        stats = dict(state.basis.stats)
+        stats.update(
+            {
+                "inner_mse": mse,
+                "inner_rel_rms": float(np.sqrt(mse) / ref_rms),
+                "pack_roundtrip": True,
+                "ldlq_feedback_rows": float(feedback_rows),
+                "hessian_diag_mean": state.prepared.diag_mean,
+                "ldl_retries": float(state.ldl.retries),
+                "oracle_metrics": False,
+                "fast_metrics": True,
+                "mlx_ldlq": True,
+                "batched_group_size": float(len(keys)),
+                "batched_group_out_features": float(total_out),
+                "batched_search_group_size": float(len(keys)),
+                "batched_search_group_out_features": float(total_out),
+                "public_mse": float("nan"),
+                "public_rel_rms": float("nan"),
+                "output_mse": float("nan"),
+                "output_rel_rms": float("nan"),
+            }
+        )
+        layer = EXL3Layer(
+            key=state.key,
+            in_features=ref_layer.in_features,
+            out_features=ref_layer.out_features,
+            k=first_k,
+            trellis=state.packed,
+            suh=state.basis.suh,
+            svh=state.basis.svh,
+            mcg=ref_layer.mcg,
+            mul1=ref_layer.mul1,
+        )
+        layer.validate()
+        empty = np.empty((0, 0), dtype=np.float32)
+        out.append(
+            DirectLayerResult(
+                module_key=state.key,
+                search_backend=search_backend,
+                scale_mode=scale_mode,
+                layer=layer,
+                activations=state.fixture.activations.astype(np.float32),
+                source_output=empty,
+                converted_output=empty,
+                stats=stats,
+            )
+        )
+    return out
 
 
 def ldlq_layer_summary(result: DirectLayerResult) -> dict[str, Any]:
