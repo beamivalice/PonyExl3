@@ -76,6 +76,97 @@ def _parse_layer_bit_overrides(
     return overrides
 
 
+def _parse_csv_ints(value: str | None, *, flag: str, min_value: int, max_value: int) -> list[int] | None:
+    if value is None:
+        return None
+    out: list[int] = []
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        try:
+            parsed = int(item)
+        except ValueError as exc:
+            raise ValueError(f"{flag} must be a comma-separated integer list") from exc
+        if parsed < min_value or parsed > max_value:
+            raise ValueError(f"{flag} entries must be in [{min_value}, {max_value}], got {parsed}")
+        out.append(parsed)
+    if not out:
+        raise ValueError(f"{flag} must contain at least one value")
+    return out
+
+
+def _parse_csv_floats(value: str | None, *, flag: str, min_value: float, max_value: float) -> list[float] | None:
+    if value is None:
+        return None
+    out: list[float] = []
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        try:
+            parsed = float(item)
+        except ValueError as exc:
+            raise ValueError(f"{flag} must be a comma-separated number list") from exc
+        if parsed < min_value or parsed > max_value:
+            raise ValueError(f"{flag} entries must be in [{min_value}, {max_value}], got {parsed}")
+        out.append(parsed)
+    if not out:
+        raise ValueError(f"{flag} must contain at least one value")
+    return out
+
+
+def _measurement_progress(scope: str):
+    def emit(event: str, data: dict[str, object]) -> None:
+        prefix = f"[measure:{scope}]"
+        if event == "measure_start":
+            bits = data.get("candidate_bits")
+            bits_s = "oracle" if bits is None else str(bits)
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"start {data['module']} K={bits_s} "
+                f"shrink={_as_float(data.get('hessian_shrinkage')):.3f} "
+                f"elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "measure_done":
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"done {data['module']} K={data.get('k')} "
+                f"shrink={_as_float(data.get('hessian_shrinkage')):.3f} "
+                f"{data.get('score_metric')}={_progress_value(data.get('score'))} "
+                f"candidate={_format_seconds(data['candidate_s'])} "
+                f"elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    return emit
+
+
+def _print_measurement_summary(summary: dict[str, object]) -> None:
+    print(
+        f"measurement: modules={_as_int(summary.get('module_count'))} "
+        f"candidates={_as_int(summary.get('candidate_count'))} "
+        f"score={summary.get('score_metric')} "
+        f"elapsed={_format_seconds(summary.get('elapsed_s'))}"
+    )
+    best = summary.get("best_by_module")
+    if isinstance(best, list):
+        for item in best:
+            if not isinstance(item, dict):
+                continue
+            requested = item.get("candidate_bits")
+            requested_s = "oracle" if requested is None else str(requested)
+            print(
+                f"  {item.get('module')}: best K={item.get('k')} "
+                f"requested={requested_s} "
+                f"shrink={_as_float(item.get('hessian_shrinkage')):.3f} "
+                f"{item.get('score_metric')}={_progress_value(item.get('score'))}"
+            )
+
+
 def _module_set_progress(scope: str):
     def emit(event: str, data: dict[str, object]) -> None:
         prefix = f"[convert:{scope}]"
@@ -352,6 +443,37 @@ def main() -> int:
         help="print the selected module K allocation plan and exit",
     )
     parser.add_argument(
+        "--measure-candidates",
+        action="store_true",
+        help="run bounded LDLQ candidate measurements for selected modules and exit",
+    )
+    parser.add_argument(
+        "--candidate-bits",
+        help=(
+            "comma-separated K candidates for --measure-candidates; omitted means "
+            "the selected bit plan or oracle/plan K"
+        ),
+    )
+    parser.add_argument(
+        "--candidate-hessian-shrinkages",
+        help=(
+            "comma-separated Hessian shrinkage candidates for --measure-candidates; "
+            "omitted means the single --hessian-shrinkage value"
+        ),
+    )
+    parser.add_argument(
+        "--measure-score",
+        choices=(
+            "output_rel_rms",
+            "hessian_proxy_rel_rms",
+            "public_rel_rms",
+            "hessian_proxy_rel_rms_over_oracle",
+            "output_rel_rms_over_oracle",
+        ),
+        default="output_rel_rms",
+        help="stats key used to rank --measure-candidates results",
+    )
+    parser.add_argument(
         "--layer-bits",
         action="append",
         default=[],
@@ -616,11 +738,31 @@ def main() -> int:
         layer_modes = int(args.direct_window) + int(args.direct_layer) + int(args.ldlq_layer)
         if layer_modes > 1:
             raise ValueError("--direct-window, --direct-layer, and --ldlq-layer are mutually exclusive")
-        ldlq_fast_metrics = bool(args.ldlq_layer and args.fast_layer_metrics)
+        if args.measure_candidates and not args.ldlq_layer:
+            raise ValueError("--measure-candidates requires --ldlq-layer")
+        if args.measure_candidates and args.out_dir is not None:
+            raise ValueError("--measure-candidates does not write --out-dir")
+        if not args.measure_candidates and (
+            args.candidate_bits is not None or args.candidate_hessian_shrinkages is not None
+        ):
+            raise ValueError("--candidate-bits and --candidate-hessian-shrinkages require --measure-candidates")
+        ldlq_fast_metrics = bool(args.ldlq_layer and args.fast_layer_metrics and not args.measure_candidates)
         if args.oracle_metrics and ldlq_fast_metrics:
             raise ValueError("--oracle-metrics requires --full-layer-metrics")
         if not 0.0 <= args.hessian_shrinkage <= 1.0:
             raise ValueError("--hessian-shrinkage must be in [0, 1]")
+        candidate_bits = _parse_csv_ints(
+            args.candidate_bits,
+            flag="--candidate-bits",
+            min_value=1,
+            max_value=8,
+        )
+        candidate_shrinkages = _parse_csv_floats(
+            args.candidate_hessian_shrinkages,
+            flag="--candidate-hessian-shrinkages",
+            min_value=0.0,
+            max_value=1.0,
+        ) or [float(args.hessian_shrinkage)]
         allocation_requested = bool(
             args.use_bit_allocation or args.allocation_dry_run or args.layer_bits
         )
@@ -715,6 +857,60 @@ def main() -> int:
                         for key in module_keys:
                             print(f"  K={plan_for_print.get(key, 'oracle')} {key}")
                     return 0
+                if args.measure_candidates:
+                    from ponyexl3.convert.measure import measure_ldlq_candidates
+
+                    measurement = measure_ldlq_candidates(
+                        args.in_dir,
+                        args.oracle_dir,
+                        module_keys,
+                        candidate_bits=candidate_bits,
+                        hessian_shrinkages=candidate_shrinkages,
+                        bit_plan=bit_plan,
+                        search_backend=args.search_backend,
+                        scale_mode=args.scale_mode,
+                        sigma_reg=args.sigma_reg,
+                        buf_size_rows=args.buf_size_rows,
+                        feedback_rows=args.ldlq_feedback_rows,
+                        calibration_activations=calibration_activations,
+                        calibration_activations_by_module=calibration_activations_by_module,
+                        skip_g_scale=bool(args.skip_g_scale),
+                        regularization_seed=args.regularization_seed,
+                        compare_oracle=bool(args.oracle_metrics),
+                        score_metric=args.measure_score,
+                        progress=None if args.json else _measurement_progress(selected_scope),
+                    )
+                    measurement["scope"] = selected_scope
+                    measurement["selected_total"] = selected_total
+                    measurement["pre_skipped"] = pre_skipped
+                    measurement["allocation"] = allocation_info
+                    measurement["bit_plan"] = bit_plan or {}
+                    measurement["requested"] = {
+                        "bits": args.bits,
+                        "head_bits": args.head_bits,
+                        "candidate_bits": candidate_bits,
+                        "candidate_hessian_shrinkages": candidate_shrinkages,
+                        "measure_score": args.measure_score,
+                        "search_backend": args.search_backend,
+                        "scale_mode": args.scale_mode,
+                        "sigma_reg": args.sigma_reg,
+                        "buf_size_rows": args.buf_size_rows,
+                        "ldlq_feedback_rows": args.ldlq_feedback_rows,
+                        "oracle_metrics": bool(args.oracle_metrics),
+                        "calibration_activations": None
+                        if args.calibration_activations is None
+                        else str(args.calibration_activations),
+                        "calibration_activations_map": None
+                        if args.calibration_activations_map is None
+                        else str(args.calibration_activations_map),
+                        "skip_g_scale": bool(args.skip_g_scale),
+                        "regularization_seed": args.regularization_seed,
+                    }
+                    if args.json:
+                        print(json.dumps(measurement, indent=2, sort_keys=True))
+                    else:
+                        _print_measurement_summary(measurement)
+                    return 0
                 result = convert_module_set(
                     args.in_dir,
                     args.oracle_dir,
@@ -805,6 +1001,56 @@ def main() -> int:
 
             if args.ldlq_layer:
                 from ponyexl3.convert.hessian import ldlq_layer_summary, ldlq_quantize_layer
+
+                if args.measure_candidates:
+                    from ponyexl3.convert.measure import measure_ldlq_candidates
+
+                    measurement = measure_ldlq_candidates(
+                        args.in_dir,
+                        args.oracle_dir,
+                        [args.only_module],
+                        candidate_bits=candidate_bits,
+                        hessian_shrinkages=candidate_shrinkages,
+                        search_backend=args.search_backend,
+                        scale_mode=args.scale_mode,
+                        sigma_reg=args.sigma_reg,
+                        buf_size_rows=args.buf_size_rows,
+                        feedback_rows=args.ldlq_feedback_rows,
+                        calibration_activations=calibration_activations,
+                        skip_g_scale=bool(args.skip_g_scale),
+                        regularization_seed=args.regularization_seed,
+                        compare_oracle=bool(args.oracle_metrics),
+                        score_metric=args.measure_score,
+                        progress=None if args.json else _measurement_progress("module"),
+                    )
+                    measurement["scope"] = "module"
+                    measurement["selected_total"] = 1
+                    measurement["pre_skipped"] = []
+                    measurement["bit_plan"] = {}
+                    measurement["requested"] = {
+                        "bits": args.bits,
+                        "head_bits": args.head_bits,
+                        "candidate_bits": candidate_bits,
+                        "candidate_hessian_shrinkages": candidate_shrinkages,
+                        "measure_score": args.measure_score,
+                        "only_module": args.only_module,
+                        "search_backend": args.search_backend,
+                        "scale_mode": args.scale_mode,
+                        "sigma_reg": args.sigma_reg,
+                        "buf_size_rows": args.buf_size_rows,
+                        "ldlq_feedback_rows": args.ldlq_feedback_rows,
+                        "oracle_metrics": bool(args.oracle_metrics),
+                        "calibration_activations": None
+                        if args.calibration_activations is None
+                        else str(args.calibration_activations),
+                        "skip_g_scale": bool(args.skip_g_scale),
+                        "regularization_seed": args.regularization_seed,
+                    }
+                    if args.json:
+                        print(json.dumps(measurement, indent=2, sort_keys=True))
+                    else:
+                        _print_measurement_summary(measurement)
+                    return 0
 
                 result = ldlq_quantize_layer(
                     args.in_dir,

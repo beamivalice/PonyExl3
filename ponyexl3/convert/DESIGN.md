@@ -4,7 +4,8 @@ Updated 2026-06-19. Status: **M1 complete, M2 complete, M3b direct full-layer
 emit/load gate complete, M4 complete for selected-module/layer-set LDLQ emit,
 post-M4 computed-scale/calibration inputs complete, MiniCPM5 direct full-model
 conversion/load/KLD gated, M5a priority allocation wired, and new-converter
-GPU-residency/batched-search optimization plus Hessian-quality exploration in progress**
+GPU-residency/batched-search optimization plus M5b bounded measurement /
+Hessian-quality exploration in progress**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`,
 `tests/test_convert_hessian.py`, `tests/test_convert_driver.py`,
 `tests/test_convert_regularize.py`, `tests/test_convert_calibration.py`,
@@ -583,6 +584,15 @@ Port both upstream tiers, in this order:
   row/layer subsets before attempting a full KLD sweep. Mitigate the
   K-candidate multiplier by measuring on row subsets like upstream. CLI:
   `--hq`, `--layer-bits regex:K` overrides.
+- **M5b bounded measurement scaffold** (`convert/measure.py` now wired):
+  `ponyexl3-convert --ldlq-layer --measure-candidates` runs selected modules
+  across comma-separated `--candidate-bits` and
+  `--candidate-hessian-shrinkages`, records full LDLQ output/proxy stats, and
+  ranks each module by `--measure-score` (default `output_rel_rms`). It does
+  not emit model shards. If `--candidate-bits` is omitted, it measures the
+  selected bit plan (`--use-bit-allocation` / `--layer-bits`) or the oracle/
+  plan K. This is the first measurable M5b bridge; the remaining optimizer
+  should consume these records and choose a budgeted K plan.
 
 ## M6 — Qwen3.6-27B 4.15bpw gatekeeper
 
@@ -673,6 +683,28 @@ Important command notes:
   `0.20` before changing the full M6 command. This is a quality knob, not a
   speed knob; validate against original-vs-converted KLD, not only proxy error.
 
+Bounded M6 quality sweep example before a full overnight conversion:
+
+```bash
+cd /Users/beam/llm/PonyExl3
+CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
+.venv/bin/ponyexl3-convert \
+  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
+  --oracle-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
+  --only-layer 0 \
+  --layer-modules \
+  --module-limit 3 \
+  --ldlq-layer \
+  --measure-candidates \
+  --candidate-bits 4,5 \
+  --candidate-hessian-shrinkages 0,0.05,0.10,0.20 \
+  --measure-score output_rel_rms \
+  --search-backend metal \
+  --scale-mode oracle_safe \
+  --calibration-activations-map "$CALIB" \
+  --json | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.json
+```
+
 Acceptance after conversion:
 
 ```bash
@@ -715,6 +747,7 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, Metal, GPU trellis pack, no state materialization | `3.55 s` | Bounded smoke after adding `pack_trellis_mlx`; wrote/reloaded K4 layer. |
 | MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, MLX-resident compensation/prod-cache, no state materialization | `3.69 s` | Bounded smoke after adding `mlx_ldlq`; similar wall time on one module, much lower CPU user time (`0.65 s`). |
 | Hessian shrinkage sweep | LDLQ quality experiment | neutral expected | `--hessian-shrinkage` preserves diagonal energy and damps off-diagonal covariance; default `0.0` keeps baseline timings/quality unchanged. |
+| MiniCPM5 `model.layers.0.mlp.down_proj` | `--measure-candidates`, K4, shrinkage `0/0.10` | `7.70 s` | New M5b measurement mode ranked baseline shrinkage best by output rel-RMS (`0.005719` vs `0.005795`). |
 | Qwen3.6-27B full model | exact LDLQ, Metal, oracle K plan, full oracle diagnostics | long/overnight expected | `401` supported EXL3 linears: `285` K4, `115` K5, K6 `lm_head`; use real per-module calibration and `--resume`. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |
