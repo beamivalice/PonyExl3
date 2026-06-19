@@ -76,6 +76,52 @@ def _parse_layer_bit_overrides(
     return overrides
 
 
+def _load_measurement_plan(path: Path) -> tuple[dict[str, int], float | None, dict[str, object]]:
+    data_obj = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data_obj, dict):
+        raise ValueError("--measurement-plan JSON root must be an object")
+    plan_obj = data_obj.get("bit_plan")
+    if not isinstance(plan_obj, dict) or not plan_obj:
+        raise ValueError("--measurement-plan must contain a non-empty bit_plan object")
+    bit_plan: dict[str, int] = {}
+    for key_obj, bits_obj in plan_obj.items():
+        key = str(key_obj)
+        if not key:
+            raise ValueError("--measurement-plan contains an empty module key")
+        if isinstance(bits_obj, bool):
+            raise ValueError(f"--measurement-plan bit for {key!r} must be an integer")
+        if isinstance(bits_obj, int):
+            bits = bits_obj
+        elif isinstance(bits_obj, float):
+            if not bits_obj.is_integer():
+                raise ValueError(f"--measurement-plan bit for {key!r} must be an integer")
+            bits = int(bits_obj)
+        elif isinstance(bits_obj, str):
+            bits_s = bits_obj.strip()
+            if not re.fullmatch(r"\d+", bits_s):
+                raise ValueError(f"--measurement-plan bit for {key!r} must be an integer")
+            bits = int(bits_s)
+        else:
+            raise ValueError(f"--measurement-plan bit for {key!r} must be an integer")
+        if bits < 1 or bits > 8:
+            raise ValueError(f"--measurement-plan bit for {key!r} must be in [1, 8], got {bits}")
+        bit_plan[key] = bits
+
+    shrinkage_obj = data_obj.get("hessian_shrinkage")
+    if shrinkage_obj is None:
+        shrinkage = None
+    else:
+        if isinstance(shrinkage_obj, bool) or not isinstance(shrinkage_obj, int | float | str):
+            raise ValueError("--measurement-plan hessian_shrinkage must be a number or null")
+        try:
+            shrinkage = float(shrinkage_obj)
+        except ValueError as exc:
+            raise ValueError("--measurement-plan hessian_shrinkage must be a number or null") from exc
+        if not 0.0 <= shrinkage <= 1.0:
+            raise ValueError("--measurement-plan hessian_shrinkage must be in [0, 1]")
+    return bit_plan, shrinkage, data_obj
+
+
 def _parse_csv_ints(value: str | None, *, flag: str, min_value: int, max_value: int) -> list[int] | None:
     if value is None:
         return None
@@ -443,6 +489,14 @@ def main() -> int:
         help="print the selected module K allocation plan and exit",
     )
     parser.add_argument(
+        "--measurement-plan",
+        type=Path,
+        help=(
+            "optimized JSON plan from ponyexl3-optimize-measurements; applies "
+            "its bit_plan and, unless overridden, its global hessian_shrinkage"
+        ),
+    )
+    parser.add_argument(
         "--measure-candidates",
         action="store_true",
         help="run bounded LDLQ candidate measurements for selected modules and exit",
@@ -511,10 +565,11 @@ def main() -> int:
     parser.add_argument(
         "--hessian-shrinkage",
         type=float,
-        default=0.0,
+        default=None,
         help=(
             "shrink Hessian off-diagonal covariance toward a diagonal estimate; "
-            "0.0 preserves the empirical Hessian, 1.0 is diagonal-only"
+            "0.0 preserves the empirical Hessian, 1.0 is diagonal-only; "
+            "default uses --measurement-plan when present, otherwise 0.0"
         ),
     )
     parser.add_argument(
@@ -735,6 +790,30 @@ def main() -> int:
             if args.calibration_activations_map is None
             else load_calibration_activations_map(args.calibration_activations_map)
         )
+        measurement_plan_bits: dict[str, int] | None = None
+        measurement_plan_shrinkage: float | None = None
+        measurement_plan_summary: dict[str, object] | None = None
+        if args.measurement_plan is not None:
+            if args.measure_candidates:
+                raise ValueError("--measurement-plan consumes optimized output; do not combine with --measure-candidates")
+            if args.use_bit_allocation or args.allocation_dry_run:
+                raise ValueError("--measurement-plan cannot be combined with --use-bit-allocation or --allocation-dry-run")
+            if not (args.layer_modules or args.model_modules):
+                raise ValueError("--measurement-plan requires --layer-modules or --model-modules")
+            if not (args.direct_layer or args.ldlq_layer):
+                raise ValueError("--measurement-plan requires --direct-layer or --ldlq-layer")
+            measurement_plan_bits, measurement_plan_shrinkage, measurement_plan_summary = _load_measurement_plan(
+                args.measurement_plan,
+            )
+        hessian_shrinkage_source = "default"
+        if args.hessian_shrinkage is not None:
+            effective_hessian_shrinkage = float(args.hessian_shrinkage)
+            hessian_shrinkage_source = "cli"
+        elif measurement_plan_shrinkage is not None:
+            effective_hessian_shrinkage = measurement_plan_shrinkage
+            hessian_shrinkage_source = "measurement_plan"
+        else:
+            effective_hessian_shrinkage = 0.0
         layer_modes = int(args.direct_window) + int(args.direct_layer) + int(args.ldlq_layer)
         if layer_modes > 1:
             raise ValueError("--direct-window, --direct-layer, and --ldlq-layer are mutually exclusive")
@@ -749,7 +828,7 @@ def main() -> int:
         ldlq_fast_metrics = bool(args.ldlq_layer and args.fast_layer_metrics and not args.measure_candidates)
         if args.oracle_metrics and ldlq_fast_metrics:
             raise ValueError("--oracle-metrics requires --full-layer-metrics")
-        if not 0.0 <= args.hessian_shrinkage <= 1.0:
+        if not 0.0 <= effective_hessian_shrinkage <= 1.0:
             raise ValueError("--hessian-shrinkage must be in [0, 1]")
         candidate_bits = _parse_csv_ints(
             args.candidate_bits,
@@ -762,9 +841,12 @@ def main() -> int:
             flag="--candidate-hessian-shrinkages",
             min_value=0.0,
             max_value=1.0,
-        ) or [float(args.hessian_shrinkage)]
+        ) or [effective_hessian_shrinkage]
         allocation_requested = bool(
-            args.use_bit_allocation or args.allocation_dry_run or args.layer_bits
+            args.use_bit_allocation
+            or args.allocation_dry_run
+            or args.layer_bits
+            or args.measurement_plan is not None
         )
         if allocation_requested and not (args.layer_modules or args.model_modules):
             raise ValueError(
@@ -810,7 +892,34 @@ def main() -> int:
                 bit_overrides = _parse_layer_bit_overrides(args.layer_bits, module_keys)
                 allocation = None
                 allocation_info = None
-                bit_plan = bit_overrides or None
+                bit_plan = dict(measurement_plan_bits) if measurement_plan_bits is not None else None
+                if bit_plan is not None:
+                    missing_plan = [key for key in module_keys if key not in bit_plan]
+                    if missing_plan:
+                        preview = ", ".join(missing_plan[:5])
+                        suffix = "" if len(missing_plan) <= 5 else f", ... +{len(missing_plan) - 5}"
+                        raise ValueError(f"--measurement-plan missing selected modules: {preview}{suffix}")
+                    if bit_overrides:
+                        bit_plan.update(bit_overrides)
+                    allocation_info = {
+                        "target_bpw": measurement_plan_summary.get("target_bpw")
+                        if measurement_plan_summary is not None
+                        else args.bits,
+                        "average_bits": measurement_plan_summary.get("average_bits")
+                        if measurement_plan_summary is not None
+                        else None,
+                        "objective": measurement_plan_summary.get("objective")
+                        if measurement_plan_summary is not None
+                        else None,
+                        "measurement_plan": None
+                        if args.measurement_plan is None
+                        else str(args.measurement_plan),
+                        "measurement_plan_modules": len(bit_plan),
+                        "hessian_shrinkage": measurement_plan_shrinkage,
+                        "manual_overrides": bit_overrides,
+                    }
+                elif bit_overrides:
+                    bit_plan = bit_overrides
                 if args.use_bit_allocation or args.allocation_dry_run:
                     allocation = priority_bit_allocations(
                         args.oracle_dir,
@@ -894,6 +1003,8 @@ def main() -> int:
                         "search_backend": args.search_backend,
                         "scale_mode": args.scale_mode,
                         "sigma_reg": args.sigma_reg,
+                        "hessian_shrinkage": effective_hessian_shrinkage,
+                        "hessian_shrinkage_source": hessian_shrinkage_source,
                         "buf_size_rows": args.buf_size_rows,
                         "ldlq_feedback_rows": args.ldlq_feedback_rows,
                         "oracle_metrics": bool(args.oracle_metrics),
@@ -920,7 +1031,7 @@ def main() -> int:
                     search_backend=args.search_backend,
                     scale_mode=args.scale_mode,
                     sigma_reg=args.sigma_reg,
-                    hessian_shrinkage=args.hessian_shrinkage,
+                    hessian_shrinkage=effective_hessian_shrinkage,
                     buf_size_rows=args.buf_size_rows,
                     feedback_rows=args.ldlq_feedback_rows,
                     compare_oracle=bool(args.oracle_metrics),
@@ -952,7 +1063,11 @@ def main() -> int:
                     "search_backend": args.search_backend,
                     "scale_mode": args.scale_mode,
                     "sigma_reg": args.sigma_reg,
-                    "hessian_shrinkage": args.hessian_shrinkage,
+                    "hessian_shrinkage": effective_hessian_shrinkage,
+                    "hessian_shrinkage_source": hessian_shrinkage_source,
+                    "measurement_plan": None
+                    if args.measurement_plan is None
+                    else str(args.measurement_plan),
                     "buf_size_rows": args.buf_size_rows,
                     "ldlq_feedback_rows": args.ldlq_feedback_rows,
                     "oracle_metrics": bool(args.oracle_metrics),
@@ -1037,6 +1152,8 @@ def main() -> int:
                         "search_backend": args.search_backend,
                         "scale_mode": args.scale_mode,
                         "sigma_reg": args.sigma_reg,
+                        "hessian_shrinkage": effective_hessian_shrinkage,
+                        "hessian_shrinkage_source": hessian_shrinkage_source,
                         "buf_size_rows": args.buf_size_rows,
                         "ldlq_feedback_rows": args.ldlq_feedback_rows,
                         "oracle_metrics": bool(args.oracle_metrics),
@@ -1059,7 +1176,7 @@ def main() -> int:
                     search_backend=args.search_backend,
                     scale_mode=args.scale_mode,
                     sigma_reg=args.sigma_reg,
-                    hessian_shrinkage=args.hessian_shrinkage,
+                    hessian_shrinkage=effective_hessian_shrinkage,
                     buf_size_rows=args.buf_size_rows,
                     feedback_rows=args.ldlq_feedback_rows,
                     compare_oracle=bool(args.oracle_metrics),
@@ -1091,7 +1208,8 @@ def main() -> int:
                 "search_backend": args.search_backend,
                 "scale_mode": args.scale_mode,
                 "sigma_reg": args.sigma_reg,
-                "hessian_shrinkage": args.hessian_shrinkage,
+                "hessian_shrinkage": effective_hessian_shrinkage,
+                "hessian_shrinkage_source": hessian_shrinkage_source,
                 "buf_size_rows": args.buf_size_rows,
                 "ldlq_feedback_rows": args.ldlq_feedback_rows,
                 "oracle_metrics": bool(args.oracle_metrics),

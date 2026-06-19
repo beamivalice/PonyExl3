@@ -724,10 +724,36 @@ cd /Users/beam/llm/PonyExl3
   --json | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.plan.json
 ```
 
-For a full-model measured allocation, feed the resulting `layer_bits` specs
-back into `ponyexl3-convert` as repeated `--layer-bits REGEX:K` arguments.
-Only promote the selected global `--hessian-shrinkage` after a KLD check; the
-optimizer's module score is a proxy, not the final acceptance gate.
+For a full-model measured allocation, feed the optimized plan back into
+`ponyexl3-convert` with `--measurement-plan`. The converter loads the plan's
+`bit_plan` directly and, unless `--hessian-shrinkage` is explicitly provided,
+uses the plan's global `hessian_shrinkage`.
+
+Measured-plan conversion shape:
+
+```bash
+cd /Users/beam/llm/PonyExl3
+CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
+PLAN=/Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-full-measure.plan.json
+set -o pipefail
+/usr/bin/time -p .venv/bin/ponyexl3-convert \
+  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
+  --oracle-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
+  --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
+  --bits 4.15 \
+  --head-bits 6 \
+  --ldlq-layer \
+  --model-modules \
+  --measurement-plan "$PLAN" \
+  --search-backend metal \
+  --scale-mode oracle_safe \
+  --calibration-activations-map "$CALIB" \
+  --resume \
+  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.15bpw.measured.convert.log
+```
+
+Only promote a nonzero selected global `--hessian-shrinkage` after a KLD check;
+the optimizer's module score is a proxy, not the final acceptance gate.
 
 Acceptance after conversion:
 
@@ -773,6 +799,7 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | Hessian shrinkage sweep | LDLQ quality experiment | neutral expected | `--hessian-shrinkage` preserves diagonal energy and damps off-diagonal covariance; default `0.0` keeps baseline timings/quality unchanged. |
 | MiniCPM5 `model.layers.0.mlp.down_proj` | `--measure-candidates`, K4, shrinkage `0/0.10` | `7.70 s` | New M5b measurement mode ranked baseline shrinkage best by output rel-RMS (`0.005719` vs `0.005795`). |
 | Measurement optimizer | `ponyexl3-optimize-measurements` on JSON records | sub-second | No GPU work; converts measured candidate scores into a budgeted `--layer-bits` plan. |
+| Measurement-plan handoff | `ponyexl3-convert --measurement-plan plan.json` | sub-second setup | Loads optimized `bit_plan` and global shrinkage before normal conversion; no manual hundreds-of-flags step. |
 | Qwen3.6-27B full model | exact LDLQ, Metal, oracle K plan, full oracle diagnostics | long/overnight expected | `401` supported EXL3 linears: `285` K4, `115` K5, K6 `lm_head`; use real per-module calibration and `--resume`. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |

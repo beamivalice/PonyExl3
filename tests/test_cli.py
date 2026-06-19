@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from ponyexl3.cli._generate_common import build_prefill_prompt_ids, resolve_prompt_file
-from ponyexl3.cli.convert import _parse_layer_bit_overrides
+from ponyexl3.cli.convert import _load_measurement_plan, _parse_layer_bit_overrides
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -149,6 +149,57 @@ def test_convert_rejects_invalid_candidate_bits():
     )
     assert proc.returncode != 0
     assert "--candidate-bits entries must be in [1, 8]" in proc.stderr
+
+
+def test_load_measurement_plan_reads_bits_and_shrinkage(tmp_path: Path):
+    path = tmp_path / "plan.json"
+    path.write_text(
+        '{"bit_plan":{"model.layers.0.mlp.down_proj":5},"hessian_shrinkage":0.1}',
+        encoding="utf-8",
+    )
+
+    bit_plan, shrinkage, summary = _load_measurement_plan(path)
+
+    assert bit_plan == {"model.layers.0.mlp.down_proj": 5}
+    assert shrinkage == 0.1
+    assert summary["hessian_shrinkage"] == 0.1
+
+
+def test_load_measurement_plan_rejects_fractional_bits(tmp_path: Path):
+    path = tmp_path / "plan.json"
+    path.write_text(
+        '{"bit_plan":{"model.layers.0.mlp.down_proj":4.5}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        _load_measurement_plan(path)
+
+
+def test_convert_measurement_plan_conflicts_with_measure_mode():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ponyexl3.cli.convert",
+            "--in-dir",
+            "/tmp",
+            "--oracle-dir",
+            "/tmp",
+            "--ldlq-layer",
+            "--layer-modules",
+            "--only-layer",
+            "0",
+            "--measure-candidates",
+            "--measurement-plan",
+            "/tmp/plan.json",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "--measurement-plan consumes optimized output" in proc.stderr
 
 
 def test_generate_bench_missing_prompt_file():
