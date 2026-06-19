@@ -41,7 +41,10 @@ def block_rms_np(
 ) -> np.ndarray:
     """Compute upstream-style blockwise ``sqrt(mean(square(x), axis))``."""
 
-    arr = x.astype(np.float32, copy=False)
+    # Force C-contiguity once: callers often pass a transposed (F-order) weight
+    # view, on which the per-block strided gather below is ~100x slower than a
+    # plain slice. The copy is bit-identical and amortized across all blocks.
+    arr = np.ascontiguousarray(x, dtype=np.float32)
     if axis < 0:
         axis += arr.ndim
     if axis < 0 or axis >= arr.ndim:
@@ -50,10 +53,11 @@ def block_rms_np(
         raise ValueError(f"blocksize must be positive, got {blocksize}")
 
     n = arr.shape[axis]
+    prefix = (slice(None),) * axis
     sq: np.ndarray | None = None
     for start in range(0, n, blocksize):
         stop = min(start + blocksize, n)
-        block = np.take(arr, range(start, stop), axis=axis)
+        block = arr[prefix + (slice(start, stop),)]
         block_sq = np.asarray(
             np.sum(block * block, axis=axis, keepdims=keepdims, dtype=np.float32),
             dtype=np.float32,
