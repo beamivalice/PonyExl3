@@ -43,6 +43,20 @@ LayerQuantizer = Literal["direct", "ldlq"]
 ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
+def _release_gpu_cache() -> None:
+    """Return MLX's reclaimable Metal buffer pool to the OS between modules.
+
+    MLX never shrinks its buffer pool on its own, so per-module scratch otherwise
+    accumulates as wired memory across a long full-model conversion.
+    """
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
 @dataclass(frozen=True)
 class ModuleSetResult:
     """Summary of a module-set conversion run."""
@@ -597,6 +611,7 @@ def convert_module_set(
                             },
                         )
                 persist_incremental([result.layer for result in grouped_results])
+                _release_gpu_cache()
                 continue
         try:
             result = _convert_one(
@@ -641,6 +656,7 @@ def convert_module_set(
         item = _summary(quantizer, result)
         completed.append(item)
         persist_incremental([result.layer])
+        _release_gpu_cache()
         if progress is not None:
             stats = item.get("stats", {})
             progress(

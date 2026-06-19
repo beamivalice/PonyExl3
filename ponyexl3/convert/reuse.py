@@ -44,10 +44,25 @@ class _Cache:
 _CACHE: _Cache | None = None
 
 
-def enable(max_bytes: int = 8 << 30) -> None:
-    """Start a fresh reuse cache (default 8 GiB LRU budget)."""
+def _default_budget() -> int:
+    """LRU budget for the reuse cache: a slice of free RAM, capped at 8 GiB.
+
+    The cache holds quantized layers for the whole measure→convert span, so on a
+    memory-tight machine a fixed 8 GiB would crowd the live conversion working
+    set; scale it to available memory instead.
+    """
+    try:
+        import psutil
+
+        return max(512 << 20, min(8 << 30, int(psutil.virtual_memory().available * 0.25)))
+    except Exception:
+        return 2 << 30
+
+
+def enable(max_bytes: int | None = None) -> None:
+    """Start a fresh reuse cache (RAM-aware LRU budget unless overridden)."""
     global _CACHE
-    _CACHE = _Cache(max_bytes)
+    _CACHE = _Cache(_default_budget() if max_bytes is None else max_bytes)
 
 
 def disable() -> dict[str, int] | None:
