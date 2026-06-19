@@ -10,6 +10,7 @@ import pytest
 
 from ponyexl3.cli._generate_common import build_prefill_prompt_ids, resolve_prompt_file
 from ponyexl3.cli.convert import _load_measurement_plan, _parse_layer_bit_overrides
+from ponyexl3.cli.convert_e2e import _default_candidate_bits
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -200,6 +201,34 @@ def test_convert_measurement_plan_conflicts_with_measure_mode():
     )
     assert proc.returncode != 0
     assert "--measurement-plan consumes optimized output" in proc.stderr
+
+
+def test_convert_e2e_default_candidate_bits_include_head_bits():
+    assert _default_candidate_bits(4.15, 6) == [4, 5, 6]
+    assert _default_candidate_bits(4.0, 6) == [4, 5, 6]
+
+
+def test_convert_e2e_rejects_bad_bits():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ponyexl3.cli.convert_e2e",
+            "--in-dir",
+            "/tmp",
+            "--out-dir",
+            "/tmp/out",
+            "--bits",
+            "0",
+            "--calibration-text",
+            "/tmp/text.txt",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "--bits must be positive" in proc.stderr
 
 
 def test_generate_bench_missing_prompt_file():

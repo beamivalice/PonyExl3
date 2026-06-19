@@ -55,6 +55,13 @@ def _progress_value(value: object) -> str:
     return "nan" if value is None else f"{_as_float(value):.6f}"
 
 
+def _write_json_atomic(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
 def _parse_layer_bit_overrides(
     specs: list[str],
     module_keys: list[str],
@@ -183,6 +190,17 @@ def _measurement_progress(scope: str):
                 f"shrink={_as_float(data.get('hessian_shrinkage')):.3f} "
                 f"{data.get('score_metric')}={_progress_value(data.get('score'))} "
                 f"candidate={_format_seconds(data['candidate_s'])} "
+                f"elapsed={_format_seconds(data['elapsed_s'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif event == "measure_resumed":
+            bits = data.get("candidate_bits")
+            bits_s = "oracle" if bits is None else str(bits)
+            print(
+                f"{prefix} {_as_int(data['index']):03d}/{_as_int(data['total']):03d} "
+                f"resumed {data['module']} K={bits_s} "
+                f"shrink={_as_float(data.get('hessian_shrinkage')):.3f} "
                 f"elapsed={_format_seconds(data['elapsed_s'])}",
                 file=sys.stderr,
                 flush=True,
@@ -526,6 +544,11 @@ def main() -> int:
         ),
         default="output_rel_rms",
         help="stats key used to rank --measure-candidates results",
+    )
+    parser.add_argument(
+        "--measurement-output",
+        type=Path,
+        help="write --measure-candidates JSON here atomically after each candidate",
     )
     parser.add_argument(
         "--layer-bits",
@@ -987,6 +1010,8 @@ def main() -> int:
                         regularization_seed=args.regularization_seed,
                         compare_oracle=bool(args.oracle_metrics),
                         score_metric=args.measure_score,
+                        checkpoint_path=args.measurement_output,
+                        resume=bool(args.resume),
                         progress=None if args.json else _measurement_progress(selected_scope),
                     )
                     measurement["scope"] = selected_scope
@@ -1017,6 +1042,8 @@ def main() -> int:
                         "skip_g_scale": bool(args.skip_g_scale),
                         "regularization_seed": args.regularization_seed,
                     }
+                    if args.measurement_output is not None:
+                        _write_json_atomic(args.measurement_output, measurement)
                     if args.json:
                         print(json.dumps(measurement, indent=2, sort_keys=True))
                     else:
@@ -1043,6 +1070,7 @@ def main() -> int:
                     regularization_seed=args.regularization_seed,
                     include_plain_tensors=bool(args.model_modules),
                     bit_plan=bit_plan,
+                    incremental_output=bool(args.resume),
                     progress=_module_set_progress(selected_scope),
                 )
                 summary = module_set_summary(result)
@@ -1136,6 +1164,8 @@ def main() -> int:
                         regularization_seed=args.regularization_seed,
                         compare_oracle=bool(args.oracle_metrics),
                         score_metric=args.measure_score,
+                        checkpoint_path=args.measurement_output,
+                        resume=bool(args.resume),
                         progress=None if args.json else _measurement_progress("module"),
                     )
                     measurement["scope"] = "module"
@@ -1163,6 +1193,8 @@ def main() -> int:
                         "skip_g_scale": bool(args.skip_g_scale),
                         "regularization_seed": args.regularization_seed,
                     }
+                    if args.measurement_output is not None:
+                        _write_json_atomic(args.measurement_output, measurement)
                     if args.json:
                         print(json.dumps(measurement, indent=2, sort_keys=True))
                     else:

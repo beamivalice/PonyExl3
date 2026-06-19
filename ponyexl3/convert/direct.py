@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -28,7 +29,7 @@ from ponyexl3.convert.regularize import (
 from ponyexl3.ref.codebook import CodebookMode
 from ponyexl3.ref.hadamard import HAD_DIM, preapply_had_left, preapply_had_right
 from ponyexl3.ref.layer import EXL3Layer
-from ponyexl3.ref.loader import load_exl3_layer
+from ponyexl3.ref.loader import clear_weight_index_cache, load_exl3_layer
 from ponyexl3.ref.perm import tensor_core_perm, tensor_core_perm_inverse
 from ponyexl3.ref.signs import unpack_signs_or_pass
 from ponyexl3.ref.trellis import pack_trellis, unpack_trellis
@@ -810,6 +811,123 @@ def _copy_model_assets(asset_dir: str | Path | None, out: Path) -> list[str]:
             shutil.copy2(path, out / name)
             copied.append(name)
     return copied
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_json_object(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.is_file():
+        return dict(default)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} JSON root must be an object")
+    return data
+
+
+def _layer_shard_name(layer_key: str) -> str:
+    digest = hashlib.sha1(layer_key.encode("utf-8")).hexdigest()[:16]
+    return f"ponyexl3-layer-{digest}.safetensors"
+
+
+def _refresh_total_size(out: Path, weight_map: dict[str, str]) -> int:
+    total = 0
+    for shard in sorted(set(weight_map.values())):
+        path = out / shard
+        if path.is_file():
+            total += path.stat().st_size
+    return int(total)
+
+
+def _clear_loader_index_cache(out: Path) -> None:
+    clear_weight_index_cache(str(out))
+
+
+def write_exl3_incremental_bundle(
+    layers: Sequence[EXL3Layer],
+    out_dir: str | Path,
+    *,
+    asset_dir: str | Path | None = None,
+    manifest: dict[str, Any] | None = None,
+    plain_tensors: dict[str, np.ndarray] | None = None,
+) -> list[EXL3Layer]:
+    """Write converted layers as stable per-layer shards and update indexes."""
+
+    if not layers and not plain_tensors and manifest is None:
+        raise ValueError("nothing to write to incremental EXL3 bundle")
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    index_path = out / "model.safetensors.index.json"
+    qcfg_path = out / "quantization_config.json"
+    index = _load_json_object(index_path, {"metadata": {"total_size": 0}, "weight_map": {}})
+    qcfg = _load_json_object(qcfg_path, {"quant_method": "exl3", "tensor_storage": {}})
+    weight_map_obj = index.setdefault("weight_map", {})
+    storage_obj = qcfg.setdefault("tensor_storage", {})
+    if not isinstance(weight_map_obj, dict):
+        raise ValueError(f"{index_path} weight_map must be an object")
+    if not isinstance(storage_obj, dict):
+        raise ValueError(f"{qcfg_path} tensor_storage must be an object")
+    weight_map: dict[str, str] = {str(key): str(value) for key, value in weight_map_obj.items()}
+    tensor_storage: dict[str, Any] = dict(storage_obj)
+
+    if plain_tensors:
+        shard = "ponyexl3-plain.safetensors"
+        save_file(plain_tensors, str(out / shard))
+        for name, arr in plain_tensors.items():
+            weight_map[name] = shard
+            storage_key = name[: -len(".weight")] if name.endswith(".weight") else name
+            tensor_storage[storage_key] = {
+                "stored_tensors": {name: _stored_tensor_meta(arr)},
+            }
+
+    for layer in layers:
+        layer.validate()
+        shard = _layer_shard_name(layer.key)
+        tensors = _layer_tensors(layer)
+        save_file(tensors, str(out / shard))
+        for name in tensors:
+            weight_map[name] = shard
+        tensor_storage[layer.key] = {
+            "quant_format": "exl3",
+            "bits_per_weight": float(layer.k),
+            "mcg_multiplier": bool(layer.mcg),
+            "mul1_multiplier": bool(layer.mul1),
+            "stored_tensors": {name: _stored_tensor_meta(arr) for name, arr in tensors.items()},
+        }
+
+    index["weight_map"] = weight_map
+    index["metadata"] = {"total_size": _refresh_total_size(out, weight_map)}
+    qcfg["quant_method"] = "exl3"
+    qcfg["tensor_storage"] = tensor_storage
+    _write_json_atomic(index_path, index)
+    _write_json_atomic(qcfg_path, qcfg)
+
+    copied_assets = _copy_model_assets(asset_dir, out)
+    if manifest is not None:
+        manifest_out = dict(manifest)
+        existing_assets = manifest_out.get("asset_files")
+        if isinstance(existing_assets, list):
+            copied_assets = sorted(set(str(item) for item in existing_assets) | set(copied_assets))
+        manifest_out["asset_files"] = copied_assets
+        manifest_out["tensor_count"] = len(weight_map)
+        manifest_out["layer_count"] = sum(
+            1
+            for info in tensor_storage.values()
+            if isinstance(info, dict) and info.get("quant_format") == "exl3"
+        )
+        _write_json_atomic(out / "ponyexl3_convert_manifest.json", manifest_out)
+
+    _clear_loader_index_cache(out)
+    loaded: list[EXL3Layer] = []
+    for layer in layers:
+        item = load_exl3_layer(str(out), layer.key)
+        item.validate()
+        loaded.append(item)
+    return loaded
 
 
 def write_exl3_layers_bundle(

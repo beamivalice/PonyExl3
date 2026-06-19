@@ -140,6 +140,69 @@ def test_module_set_bit_plan_overrides_emitted_k(tmp_path: Path, monkeypatch: py
     assert manifest["bit_plan"] == {key: 5}
 
 
+def test_module_set_incremental_output_resumes_missing_layers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keys = [
+        "model.language_model.layers.0.linear_attn.in_proj_qkv",
+        "model.language_model.layers.0.linear_attn.in_proj_z",
+    ]
+    out_dir = tmp_path / "out"
+    calls: list[str] = []
+
+    def fake_convert_one(*args, **kwargs):  # noqa: ARG001
+        key = str(args[3])
+        calls.append(key)
+        layer = _layer(key)
+        return DirectLayerResult(
+            module_key=key,
+            search_backend="cpu",
+            scale_mode="identity",
+            layer=layer,
+            activations=np.zeros((1, layer.in_features), dtype=np.float32),
+            source_output=np.zeros((1, layer.out_features), dtype=np.float32),
+            converted_output=np.zeros((1, layer.out_features), dtype=np.float32),
+            stats={"output_rel_rms": 0.0, "public_rel_rms": 0.0},
+        )
+
+    monkeypatch.setattr(convert_driver, "_convert_one", fake_convert_one)
+
+    first = convert_driver.convert_module_set(
+        tmp_path / "source",
+        tmp_path / "oracle",
+        [keys[0]],
+        quantizer="direct",
+        out_dir=out_dir,
+        search_backend="cpu",
+        scale_mode="identity",
+        incremental_output=True,
+    )
+    assert [item["module"] for item in first.completed] == [keys[0]]
+
+    second = convert_driver.convert_module_set(
+        tmp_path / "source",
+        tmp_path / "oracle",
+        keys,
+        quantizer="direct",
+        out_dir=out_dir,
+        search_backend="cpu",
+        scale_mode="identity",
+        resume=True,
+        incremental_output=True,
+    )
+
+    assert calls == keys
+    assert second.completed[0]["resumed"] is True
+    qcfg = json.loads((out_dir / "quantization_config.json").read_text(encoding="utf-8"))
+    assert sorted(qcfg["tensor_storage"]) == sorted(keys)
+    index = json.loads((out_dir / "model.safetensors.index.json").read_text(encoding="utf-8"))
+    assert index["weight_map"][f"{keys[0]}.trellis"].startswith("ponyexl3-layer-")
+    manifest = json.loads((out_dir / "ponyexl3_convert_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["incremental_output"] is True
+    assert manifest["layer_count"] == 2
+
+
 def test_module_set_batches_fast_ldlq_siblings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     keys = [
         "model.layers.0.self_attn.q_proj",

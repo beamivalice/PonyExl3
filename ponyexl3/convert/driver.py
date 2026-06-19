@@ -25,6 +25,7 @@ from ponyexl3.convert.direct import (
     direct_layer_summary,
     direct_quantize_layer,
     read_source_plain_tensors,
+    write_exl3_incremental_bundle,
     write_exl3_layers_bundle,
 )
 from ponyexl3.convert.fixtures import SearchBackend, resolve_source_linear
@@ -378,6 +379,7 @@ def convert_module_set(
     regularization_seed: int = 0,
     include_plain_tensors: bool = False,
     bit_plan: dict[str, int] | None = None,
+    incremental_output: bool = False,
     progress: ProgressCallback | None = None,
 ) -> ModuleSetResult:
     """Convert a selected module set and optionally emit one bundle."""
@@ -413,6 +415,46 @@ def convert_module_set(
             for key in requested:
                 if key in available:
                     existing[key] = load_exl3_layer(str(out_dir), key)
+
+    def build_manifest() -> dict[str, Any]:
+        return {
+            "quantizer": quantizer,
+            "search_backend": search_backend,
+            "scale_mode": scale_mode,
+            "sigma_reg": sigma_reg,
+            "hessian_shrinkage": hessian_shrinkage,
+            "buf_size_rows": buf_size_rows,
+            "feedback_rows": feedback_rows,
+            "compare_oracle": compare_oracle,
+            "fast_metrics": fast_metrics,
+            "resume": resume,
+            "incremental_output": incremental_output,
+            "calibration_rows": 0
+            if calibration_activations is None
+            else int(calibration_activations.shape[0]),
+            "calibration_module_count": 0
+            if calibration_activations_by_module is None
+            else len(calibration_activations_by_module),
+            "skip_g_scale": skip_g_scale,
+            "regularization_seed": regularization_seed,
+            "include_plain_tensors": include_plain_tensors,
+            "bit_plan": planned_bits,
+            "requested_modules": requested,
+            "completed": completed,
+            "skipped": skipped,
+        }
+
+    def persist_incremental(new_layers: Sequence[EXL3Layer]) -> None:
+        if not incremental_output or out_dir is None:
+            return
+        if not new_layers:
+            return
+        write_exl3_incremental_bundle(
+            new_layers,
+            out_dir,
+            asset_dir=source_dir if asset_dir is None else asset_dir,
+            manifest=build_manifest(),
+        )
 
     positions = {key: index for index, key in enumerate(requested, start=1)}
     processed: set[str] = set()
@@ -543,6 +585,7 @@ def convert_module_set(
                                 "elapsed_s": time.perf_counter() - total_start,
                             },
                         )
+                persist_incremental([result.layer for result in grouped_results])
                 continue
         try:
             result = _convert_one(
@@ -586,6 +629,7 @@ def convert_module_set(
         layers.append(result.layer)
         item = _summary(quantizer, result)
         completed.append(item)
+        persist_incremental([result.layer])
         if progress is not None:
             stats = item.get("stats", {})
             progress(
@@ -607,7 +651,50 @@ def convert_module_set(
             )
 
     loaded: list[EXL3Layer] = []
-    if out_dir is not None and layers:
+    if out_dir is not None and incremental_output:
+        plain_tensors = None
+        if include_plain_tensors:
+            if progress is not None:
+                progress(
+                    "plain_start",
+                    {
+                        "include_plain_tensors": include_plain_tensors,
+                        "elapsed_s": time.perf_counter() - total_start,
+                    },
+                )
+            plain_tensors = read_source_plain_tensors(source_dir, plain_tensor_keys(oracle_dir))
+        if plain_tensors is not None or completed or skipped:
+            if progress is not None:
+                progress(
+                    "write_start",
+                    {
+                        "layers": len(layers),
+                        "plain_tensors": 0 if plain_tensors is None else len(plain_tensors),
+                        "out_dir": str(out_dir),
+                        "elapsed_s": time.perf_counter() - total_start,
+                    },
+                )
+            write_exl3_incremental_bundle(
+                [],
+                out_dir,
+                asset_dir=source_dir if asset_dir is None else asset_dir,
+                manifest={
+                    **build_manifest(),
+                    "plain_tensor_count": 0 if plain_tensors is None else len(plain_tensors),
+                },
+                plain_tensors=plain_tensors,
+            )
+            if progress is not None:
+                progress(
+                    "write_done",
+                    {
+                        "layers": len(layers),
+                        "loaded_layers": 0,
+                        "out_dir": str(out_dir),
+                        "elapsed_s": time.perf_counter() - total_start,
+                    },
+                )
+    elif out_dir is not None and layers:
         if progress is not None:
             progress(
                 "plain_start",
@@ -632,30 +719,8 @@ def convert_module_set(
                 },
             )
         manifest = {
-            "quantizer": quantizer,
-            "search_backend": search_backend,
-            "scale_mode": scale_mode,
-            "sigma_reg": sigma_reg,
-            "hessian_shrinkage": hessian_shrinkage,
-            "buf_size_rows": buf_size_rows,
-            "feedback_rows": feedback_rows,
-            "compare_oracle": compare_oracle,
-            "fast_metrics": fast_metrics,
-            "resume": resume,
-            "calibration_rows": 0
-            if calibration_activations is None
-            else int(calibration_activations.shape[0]),
-            "calibration_module_count": 0
-            if calibration_activations_by_module is None
-            else len(calibration_activations_by_module),
-            "skip_g_scale": skip_g_scale,
-            "regularization_seed": regularization_seed,
-            "include_plain_tensors": include_plain_tensors,
+            **build_manifest(),
             "plain_tensor_count": 0 if plain_tensors is None else len(plain_tensors),
-            "bit_plan": planned_bits,
-            "requested_modules": requested,
-            "completed": completed,
-            "skipped": skipped,
         }
         loaded = write_exl3_layers_bundle(
             layers,

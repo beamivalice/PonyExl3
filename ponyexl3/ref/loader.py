@@ -16,6 +16,12 @@ from ponyexl3.types import Exl3LayerInfo, LayerMeta
 _WEIGHT_INDEX_CACHE: dict[str, dict[str, str] | None] = {}
 
 
+def clear_weight_index_cache(model_dir: str) -> None:
+    """Drop the cached safetensors index for a model directory."""
+
+    _WEIGHT_INDEX_CACHE.pop(model_dir, None)
+
+
 def _read_tensor(st: Any, key: str) -> np.ndarray:
     t = st.get_tensor(key)
     return np.array(t)

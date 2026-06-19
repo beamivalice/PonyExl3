@@ -148,6 +148,54 @@ def test_measure_ldlq_candidates_uses_bit_plan_when_no_candidate_bits(
     assert [item["k"] for item in summary["best_by_module"]] == [4, 5]
 
 
+def test_measure_ldlq_candidates_resumes_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    checkpoint = tmp_path / "measure.json"
+    seen_bits: list[int | None] = []
+
+    def fake_ldlq(source_dir, oracle_dir, module_key, **kwargs):  # noqa: ARG001
+        seen_bits.append(kwargs["quant_bits"])
+        k = int(kwargs["quant_bits"])
+        layer = _fake_layer(module_key, k)
+        return DirectLayerResult(
+            module_key=module_key,
+            search_backend="metal",
+            scale_mode="computed",
+            layer=layer,
+            activations=np.zeros((1, 128), dtype=np.float32),
+            source_output=np.zeros((1, 128), dtype=np.float32),
+            converted_output=np.zeros((1, 128), dtype=np.float32),
+            stats={"output_rel_rms": float(6 - k), "pack_roundtrip": True},
+        )
+
+    monkeypatch.setattr(measure, "ldlq_quantize_layer", fake_ldlq)
+
+    first = measure.measure_ldlq_candidates(
+        tmp_path / "source",
+        tmp_path / "oracle",
+        ["a"],
+        candidate_bits=[4],
+        checkpoint_path=checkpoint,
+    )
+    assert first["candidate_count"] == 1
+    assert seen_bits == [4]
+
+    resumed = measure.measure_ldlq_candidates(
+        tmp_path / "source",
+        tmp_path / "oracle",
+        ["a"],
+        candidate_bits=[4, 5],
+        checkpoint_path=checkpoint,
+        resume=True,
+    )
+
+    assert seen_bits == [4, 5]
+    assert resumed["candidate_count"] == 2
+    assert [record["k"] for record in resumed["records"]] == [4, 5]
+
+
 def test_optimize_measurement_plan_spends_budget_by_measured_gain():
     measurement = {
         "score_metric": "output_rel_rms",
@@ -188,6 +236,28 @@ def test_optimize_measurement_plan_selects_best_global_shrinkage():
     assert len(plan["global_plans"]) == 2
 
 
+def test_optimize_measurement_plan_forces_fixed_bits():
+    measurement = {
+        "score_metric": "output_rel_rms",
+        "records": [
+            _measurement_record("lm_head", k=4, score=0.01, weight=1),
+            _measurement_record("lm_head", k=6, score=0.20, weight=1),
+            _measurement_record("body", k=4, score=0.30, weight=10),
+            _measurement_record("body", k=5, score=0.10, weight=10),
+        ],
+    }
+
+    plan = measure.optimize_measurement_plan(
+        measurement,
+        target_bpw=4.2,
+        fixed_bits={"lm_head": 6},
+    )
+
+    assert plan["bit_plan"]["lm_head"] == 6
+    assert plan["fixed_bits"] == {"lm_head": 6}
+    assert all(item["module"] != "lm_head" for item in plan["upgrades"])
+
+
 def test_optimize_measurements_cli_json(tmp_path: Path):
     measurement = {
         "score_metric": "output_rel_rms",
@@ -218,6 +288,40 @@ def test_optimize_measurements_cli_json(tmp_path: Path):
     plan = json.loads(proc.stdout)
     assert plan["bit_plan"] == {"a": 5}
     assert plan["layer_bits_args"] == ["--layer-bits", r"^a$:5"]
+
+
+def test_optimize_measurements_cli_head_bits(tmp_path: Path):
+    measurement = {
+        "score_metric": "output_rel_rms",
+        "records": [
+            _measurement_record("lm_head", k=4, score=0.01),
+            _measurement_record("lm_head", k=6, score=0.20),
+        ],
+    }
+    path = tmp_path / "measurement.json"
+    path.write_text(json.dumps(measurement), encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ponyexl3.cli.optimize_measurements",
+            str(path),
+            "--bits",
+            "6.0",
+            "--head-bits",
+            "6",
+            "--json",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    plan = json.loads(proc.stdout)
+    assert plan["bit_plan"] == {"lm_head": 6}
+    assert plan["fixed_bits"] == {"lm_head": 6}
 
 
 def test_measure_ldlq_candidates_rejects_bad_inputs(tmp_path: Path):

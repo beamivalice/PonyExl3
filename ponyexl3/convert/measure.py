@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import math
 import re
@@ -139,6 +140,7 @@ def _plan_from_candidates(
     target_bpw: float,
     score_metric: str,
     hessian_shrinkage: float | None,
+    fixed_bits: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     if target_bpw <= 0.0:
         raise ValueError(f"target_bpw must be positive, got {target_bpw}")
@@ -160,12 +162,19 @@ def _plan_from_candidates(
             by_k[candidate.k] = candidate
 
     selected: dict[str, _MeasuredCandidate] = {}
+    fixed = {module: int(bits) for module, bits in (fixed_bits or {}).items()}
     for module in module_order:
         by_k = by_module[module]
         if not by_k:
             raise ValueError(f"measurement has no candidates for {module}")
-        min_k = min(by_k)
-        selected[module] = by_k[min_k]
+        if module in fixed:
+            fixed_k = fixed[module]
+            if fixed_k not in by_k:
+                raise ValueError(f"measurement has no fixed K={fixed_k} candidate for {module}")
+            selected[module] = by_k[fixed_k]
+        else:
+            min_k = min(by_k)
+            selected[module] = by_k[min_k]
 
     baseline = dict(selected)
     total_weight = sum(candidate.weight for candidate in selected.values())
@@ -177,6 +186,8 @@ def _plan_from_candidates(
     while spent_weighted_bits < target_weighted_bits:
         best_upgrade: tuple[tuple[float, float, int, int, str], _MeasuredCandidate] | None = None
         for module in module_order:
+            if module in fixed:
+                continue
             current = selected[module]
             for candidate in by_module[module].values():
                 if candidate.k <= current.k:
@@ -232,6 +243,7 @@ def _plan_from_candidates(
         "target_bpw": float(target_bpw),
         "score_metric": score_metric,
         "hessian_shrinkage": hessian_shrinkage,
+        "fixed_bits": {module: bits for module, bits in fixed.items() if module in by_module},
         "module_count": len(module_order),
         "candidate_count": len(candidates),
         "total_weight": int(total_weight),
@@ -272,6 +284,7 @@ def optimize_measurement_plan(
     score_metric: str | None = None,
     hessian_shrinkage: float | None = None,
     per_module_shrinkage: bool = False,
+    fixed_bits: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Build a budgeted K plan from candidate measurement records."""
 
@@ -283,6 +296,7 @@ def optimize_measurement_plan(
             target_bpw=target_bpw,
             score_metric=metric,
             hessian_shrinkage=None,
+            fixed_bits=fixed_bits,
         )
         plan["mode"] = "per_module_shrinkage"
         return plan
@@ -305,6 +319,7 @@ def optimize_measurement_plan(
                 target_bpw=target_bpw,
                 score_metric=metric,
                 hessian_shrinkage=shrinkage,
+                fixed_bits=fixed_bits,
             )
         )
     if not global_plans:
@@ -336,6 +351,80 @@ def _candidate_bits_for_module(
     return [None]
 
 
+def _candidate_identity(module_key: str, bits: int | None, shrinkage: float) -> tuple[str, int | None, str]:
+    return (module_key, None if bits is None else int(bits), f"{float(shrinkage):.12g}")
+
+
+def _measurement_summary(
+    *,
+    modules: Sequence[str],
+    candidate_bits: Sequence[int] | None,
+    shrinkages: Sequence[float],
+    score_metric: str,
+    records: Sequence[dict[str, Any]],
+    elapsed_s: float,
+) -> dict[str, Any]:
+    best_by_module: list[dict[str, Any]] = []
+    for key in modules:
+        candidates = [record for record in records if record["module"] == key]
+        if not candidates:
+            continue
+        best = min(
+            candidates,
+            key=lambda record: (
+                float(record["score"]),
+                int(record["k"]),
+                float(record["hessian_shrinkage"]),
+            ),
+        )
+        best_by_module.append(
+            {
+                "module": key,
+                "candidate_bits": best["candidate_bits"],
+                "k": best["k"],
+                "hessian_shrinkage": best["hessian_shrinkage"],
+                "score_metric": score_metric,
+                "score": best["score"],
+            }
+        )
+
+    return {
+        "measure": "ldlq_candidates",
+        "module_count": len(modules),
+        "candidate_count": len(records),
+        "candidate_bits": None if candidate_bits is None else [int(bits) for bits in candidate_bits],
+        "hessian_shrinkages": [float(item) for item in shrinkages],
+        "score_metric": score_metric,
+        "records": list(records),
+        "best_by_module": best_by_module,
+        "elapsed_s": elapsed_s,
+    }
+
+
+def _write_json_atomic(path: Path, data: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_measurement_checkpoint(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    data_obj = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data_obj, Mapping):
+        raise ValueError(f"measurement checkpoint root must be an object: {path}")
+    records_obj = data_obj.get("records", [])
+    if not isinstance(records_obj, Sequence) or isinstance(records_obj, str):
+        raise ValueError(f"measurement checkpoint records must be a list: {path}")
+    out: list[dict[str, Any]] = []
+    for record_obj in records_obj:
+        if not isinstance(record_obj, Mapping):
+            raise ValueError(f"measurement checkpoint record must be an object: {path}")
+        out.append(dict(record_obj))
+    return out
+
+
 def measure_ldlq_candidates(
     source_dir: str | Path,
     oracle_dir: str | Path,
@@ -355,6 +444,8 @@ def measure_ldlq_candidates(
     regularization_seed: int = 0,
     compare_oracle: bool = False,
     score_metric: str = _DEFAULT_SCORE_METRIC,
+    checkpoint_path: str | Path | None = None,
+    resume: bool = False,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Quantize selected modules over candidate K/shrinkage grids and rank them."""
@@ -374,7 +465,26 @@ def measure_ldlq_candidates(
         * len(shrinkages)
         for key in modules
     )
+    planned: set[tuple[str, int | None, str]] = set()
+    for key in modules:
+        for bits in _candidate_bits_for_module(key, candidate_bits=candidate_bits, bit_plan=bit_plan):
+            for shrinkage in shrinkages:
+                planned.add(_candidate_identity(key, bits, shrinkage))
+
+    checkpoint = None if checkpoint_path is None else Path(checkpoint_path)
+    checkpoint_records = _load_measurement_checkpoint(checkpoint) if checkpoint is not None and resume else []
     records: list[dict[str, Any]] = []
+    seen: set[tuple[str, int | None, str]] = set()
+    for record in checkpoint_records:
+        ident = _candidate_identity(
+            str(record.get("module")),
+            None if record.get("candidate_bits") is None else int(record["candidate_bits"]),
+            float(record.get("hessian_shrinkage", 0.0)),
+        )
+        if ident not in planned or ident in seen:
+            continue
+        records.append(record)
+        seen.add(ident)
     start = time.perf_counter()
     index = 0
     for key in modules:
@@ -393,6 +503,21 @@ def measure_ldlq_candidates(
             for shrinkage in shrinkages:
                 index += 1
                 candidate_start = time.perf_counter()
+                ident = _candidate_identity(key, bits, shrinkage)
+                if ident in seen:
+                    if progress is not None:
+                        progress(
+                            "measure_resumed",
+                            {
+                                "index": index,
+                                "total": total,
+                                "module": key,
+                                "candidate_bits": bits,
+                                "hessian_shrinkage": shrinkage,
+                                "elapsed_s": candidate_start - start,
+                            },
+                        )
+                    continue
                 if progress is not None:
                     progress(
                         "measure_start",
@@ -436,6 +561,19 @@ def measure_ldlq_candidates(
                     "summary": item,
                 }
                 records.append(record)
+                seen.add(ident)
+                if checkpoint is not None:
+                    _write_json_atomic(
+                        checkpoint,
+                        _measurement_summary(
+                            modules=modules,
+                            candidate_bits=candidate_bits,
+                            shrinkages=shrinkages,
+                            score_metric=score_metric,
+                            records=records,
+                            elapsed_s=time.perf_counter() - start,
+                        ),
+                    )
                 if progress is not None:
                     progress(
                         "measure_done",
@@ -453,38 +591,14 @@ def measure_ldlq_candidates(
                         },
                     )
 
-    best_by_module: list[dict[str, Any]] = []
-    for key in modules:
-        candidates = [record for record in records if record["module"] == key]
-        if not candidates:
-            continue
-        best = min(
-            candidates,
-            key=lambda record: (
-                float(record["score"]),
-                int(record["k"]),
-                float(record["hessian_shrinkage"]),
-            ),
-        )
-        best_by_module.append(
-            {
-                "module": key,
-                "candidate_bits": best["candidate_bits"],
-                "k": best["k"],
-                "hessian_shrinkage": best["hessian_shrinkage"],
-                "score_metric": score_metric,
-                "score": best["score"],
-            }
-        )
-
-    return {
-        "measure": "ldlq_candidates",
-        "module_count": len(modules),
-        "candidate_count": len(records),
-        "candidate_bits": None if candidate_bits is None else [int(bits) for bits in candidate_bits],
-        "hessian_shrinkages": shrinkages,
-        "score_metric": score_metric,
-        "records": records,
-        "best_by_module": best_by_module,
-        "elapsed_s": time.perf_counter() - start,
-    }
+    summary = _measurement_summary(
+        modules=modules,
+        candidate_bits=candidate_bits,
+        shrinkages=shrinkages,
+        score_metric=score_metric,
+        records=records,
+        elapsed_s=time.perf_counter() - start,
+    )
+    if checkpoint is not None:
+        _write_json_atomic(checkpoint, summary)
+    return summary

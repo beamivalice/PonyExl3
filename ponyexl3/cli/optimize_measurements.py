@@ -63,6 +63,11 @@ def main() -> int:
         help="optimize only candidates with this global shrinkage",
     )
     parser.add_argument(
+        "--head-bits",
+        type=int,
+        help="force lm_head to this K when lm_head is present in the measurement",
+    )
+    parser.add_argument(
         "--per-module-shrinkage",
         action="store_true",
         help="allow each module to choose its best measured shrinkage; diagnostic only",
@@ -75,6 +80,8 @@ def main() -> int:
             raise ValueError("--hessian-shrinkage must be in [0, 1]")
         if args.per_module_shrinkage and args.hessian_shrinkage is not None:
             raise ValueError("--per-module-shrinkage and --hessian-shrinkage are mutually exclusive")
+        if args.head_bits is not None and not 1 <= args.head_bits <= 8:
+            raise ValueError("--head-bits must be in [1, 8]")
         measurement = _load_measurement(args.measurement)
         plan = optimize_measurement_plan(
             measurement,
@@ -82,6 +89,7 @@ def main() -> int:
             score_metric=args.score,
             hessian_shrinkage=args.hessian_shrinkage,
             per_module_shrinkage=bool(args.per_module_shrinkage),
+            fixed_bits=None if args.head_bits is None else {"lm_head": args.head_bits},
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

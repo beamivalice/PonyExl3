@@ -610,83 +610,80 @@ Goal: produce
 KLD-vs-original is on par with the official
 `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw` oracle.
 
-First capture real BF16 calibration activations:
+Primary end-to-end gate command:
 
 ```bash
 cd /Users/beam/llm/PonyExl3
 mkdir -p /Users/beam/llm/PonyExl3/.work/logs
 set -o pipefail
-/usr/bin/time -p .venv/bin/ponyexl3-convert \
+/usr/bin/time -p .venv/bin/python -m ponyexl3.cli.convert_e2e \
   --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
-  --oracle-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
-  --capture-calibration-map /Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors \
+  --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
+  --work-dir /Users/beam/llm/PonyExl3/.work/qwen3.6-27b-e2e-4.15bpw \
+  --bits 4.15 \
   --calibration-text /Users/beam/llm/kld-eval/mlx_eval/prompt.txt \
   --calibration-rows 250 \
   --calibration-seq-len 2048 \
-  --model-modules \
-  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-calib-r250.capture.log
+  --search-backend metal \
+  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.15bpw.e2e.log
 ```
 
-For a source-only exact 4.00bpw run without consulting the oracle config, omit
-`--oracle-dir` and set the head to K4 as well:
+This one command performs:
+
+1. Source-only BF16 quant-plan generation under `--work-dir/source_quant_plan`.
+2. BF16 calibration capture to `--work-dir/calibration.safetensors`.
+3. Candidate LDLQ measurement to `--work-dir/measurements.json`.
+4. Measured budget optimization to `--work-dir/measurement.plan.json`.
+5. Incremental EXL3 conversion to `--out-dir`.
+
+Resume behavior:
+
+- The command resumes by default; use `--no-resume` only to intentionally
+  recompute everything.
+- Measurement writes a valid checkpoint JSON after every candidate, so `^C`
+  during measurement resumes at the next missing module/K/shrinkage candidate.
+- Conversion writes a stable per-layer safetensors shard after every completed
+  module/group and atomically updates `model.safetensors.index.json` plus
+  `quantization_config.json`. `^C` during conversion resumes at the next
+  missing module instead of losing the whole module-set run.
+- The final output is multi-shard rather than one giant `model.safetensors`;
+  this is intentional for resume safety and is compatible with the existing
+  indexed loader path.
+
+Default measured candidates are `floor(--bits)`, `floor(--bits)+1`, and
+`--head-bits` (default K6), so the Qwen 4.15 command measures K4/K5/K6 and
+forces `lm_head` to K6 during optimization.
+
+For a source-only exact 4.00bpw run, set the head to K4 as well:
 
 ```bash
 cd /Users/beam/llm/PonyExl3
 mkdir -p /Users/beam/llm/PonyExl3/.work/logs
-CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
-test -f "$CALIB" || { echo "missing calibration map: $CALIB" >&2; exit 2; }
 set -o pipefail
-/usr/bin/time -p .venv/bin/ponyexl3-convert \
+/usr/bin/time -p .venv/bin/python -m ponyexl3.cli.convert_e2e \
   --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
   --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.00bpw \
-  --work-dir /Users/beam/llm/PonyExl3/.work/qwen3.6-27b-source-4.00bpw \
+  --work-dir /Users/beam/llm/PonyExl3/.work/qwen3.6-27b-e2e-4.00bpw \
   --bits 4.00 \
   --head-bits 4 \
-  --ldlq-layer \
-  --model-modules \
   --search-backend metal \
-  --scale-mode computed \
-  --calibration-activations-map "$CALIB" \
-  --resume \
-  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.00bpw.source.convert.log
-```
-
-Then run this conversion command when the machine is free:
-
-```bash
-cd /Users/beam/llm/PonyExl3
-mkdir -p /Users/beam/llm/PonyExl3/.work/logs
-CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
-test -f "$CALIB" || { echo "missing calibration map: $CALIB" >&2; exit 2; }
-set -o pipefail
-/usr/bin/time -p .venv/bin/ponyexl3-convert \
-  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
-  --oracle-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
-  --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
-  --bits 4.15 \
-  --head-bits 6 \
-  --ldlq-layer \
-  --model-modules \
-  --search-backend metal \
-  --scale-mode oracle_safe \
-  --oracle-metrics \
-  --full-layer-metrics \
-  --calibration-activations-map "$CALIB" \
-  --resume \
-  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.15bpw.convert.log
+  --calibration-text /Users/beam/llm/kld-eval/mlx_eval/prompt.txt \
+  --calibration-rows 250 \
+  --calibration-seq-len 2048 \
+  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.00bpw.e2e.log
 ```
 
 Important command notes:
 
 - The `CALIB` map must be real per-module calibration activations keyed by
-  module name. Do not use the fixture/random fallback for this acceptance run.
-- `--bits` and `--head-bits` record the intended budget in the manifest. Since
-  `--use-bit-allocation` is deliberately omitted, the driver preserves the
-  oracle's exact K plan: `285` K4 linears, `115` K5 linears, and K6 `lm_head`.
-- `--oracle-metrics --full-layer-metrics` is now viable on M6 because oracle
-  public reconstruction uses the fast Metal trellis decode path. Production
-  runs without diagnostics should omit both flags and keep default
-  `--fast-layer-metrics`.
+  module name. `ponyexl3-convert-e2e` captures it itself; do not replace it
+  with fixture/random activations for acceptance.
+- `--bits` is the only quality budget input required for the primary path.
+  `--head-bits` remains available but defaults to K6, and the optimizer now
+  forces `lm_head` when present.
+- The e2e path intentionally uses source-only computed scales. The official
+  oracle remains diagnostic for KLD comparison, not an input to production
+  conversion.
 - If Qwen KLD underperforms with the baseline empirical Hessian, run bounded
   MiniCPM/Qwen layer sweeps with `--hessian-shrinkage 0.05`, `0.10`, and
   `0.20` before changing the full M6 command. This is a quality knob, not a
@@ -721,6 +718,7 @@ cd /Users/beam/llm/PonyExl3
 .venv/bin/ponyexl3-optimize-measurements \
   /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.json \
   --bits 4.15 \
+  --head-bits 6 \
   --json | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.plan.json
 ```
 
@@ -800,7 +798,9 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | MiniCPM5 `model.layers.0.mlp.down_proj` | `--measure-candidates`, K4, shrinkage `0/0.10` | `7.70 s` | New M5b measurement mode ranked baseline shrinkage best by output rel-RMS (`0.005719` vs `0.005795`). |
 | Measurement optimizer | `ponyexl3-optimize-measurements` on JSON records | sub-second | No GPU work; converts measured candidate scores into a budgeted `--layer-bits` plan. |
 | Measurement-plan handoff | `ponyexl3-convert --measurement-plan plan.json` | sub-second setup | Loads optimized `bit_plan` and global shrinkage before normal conversion; no manual hundreds-of-flags step. |
-| Qwen3.6-27B full model | exact LDLQ, Metal, oracle K plan, full oracle diagnostics | long/overnight expected | `401` supported EXL3 linears: `285` K4, `115` K5, K6 `lm_head`; use real per-module calibration and `--resume`. |
+| Measurement checkpoint resume | `--measurement-output` / e2e measurement stage | per candidate | Writes atomic partial JSON after every candidate; resume skips completed module/K/shrinkage triples. |
+| Incremental conversion resume | `ponyexl3-convert --resume` module sets / e2e convert stage | per module/group | Writes stable per-layer shards and updates index/config after each completed module; avoids losing hours on `^C`. |
+| Qwen3.6-27B full model | `python -m ponyexl3.cli.convert_e2e --bits 4.15` | long/overnight expected | Source-only plan, BF16 calibration, measured K4/K5/K6 allocation, K6 `lm_head`, incremental multi-shard output. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |
 | Qwen3.6-35B-A3B full model | current fixture-style path | overnight expected | M5b/M6 should add measured allocation, block-sequential calibration, resume, and better progress before relying on this path. |
