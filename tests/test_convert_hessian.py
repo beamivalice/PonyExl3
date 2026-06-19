@@ -199,6 +199,40 @@ def test_ldlq_can_skip_diagnostic_state_and_proxy():
     assert result.reconstructed.shape == inner.shape
 
 
+@pytest.mark.skipif(not _metal_available(), reason="Metal is required for MLX LDLQ parity")
+def test_ldlq_mlx_no_state_matches_debug_state_path():
+    rng = np.random.default_rng(108)
+    inner = (rng.standard_normal((32, 32)) * 0.05).astype(np.float32)
+    l_factor = np.eye(32, dtype=np.float32)
+
+    debug = ldlq_inner_matrix(
+        inner,
+        l_factor,
+        k=4,
+        cb=CodebookMode.MCG,
+        search_backend="metal",
+        buf_size_rows=32,
+        collect_states=True,
+        compute_proxy=False,
+    )
+    fast = ldlq_inner_matrix(
+        inner,
+        l_factor,
+        k=4,
+        cb=CodebookMode.MCG,
+        search_backend="metal",
+        buf_size_rows=32,
+        collect_states=False,
+        compute_proxy=False,
+    )
+
+    assert debug.states is not None
+    assert fast.states is None
+    assert fast.stats["mlx_ldlq"] is True
+    np.testing.assert_array_equal(fast.packed, debug.packed)
+    np.testing.assert_array_equal(fast.reconstructed, debug.reconstructed)
+
+
 def test_public_matrix_to_inner_identity_mode_is_noop():
     rng = np.random.default_rng(105)
     public = rng.standard_normal((128, 128)).astype(np.float32)

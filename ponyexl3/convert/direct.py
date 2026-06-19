@@ -373,6 +373,65 @@ def _kernel_tiles_to_inner(tiles: np.ndarray, rows: int, cols: int) -> np.ndarra
     )
 
 
+def _inner_to_kernel_tiles_mlx(inner: Any) -> Any:
+    import mlx.core as mx
+
+    if inner.ndim != 2 or inner.shape[0] % 16 != 0 or inner.shape[1] % 16 != 0:
+        raise ValueError(f"expected 2D matrix with 16-multiple dims, got {inner.shape}")
+    in_tiles = inner.shape[0] // 16
+    out_tiles = inner.shape[1] // 16
+    row_major = (
+        inner.reshape(in_tiles, 16, out_tiles, 16)
+        .transpose(0, 2, 1, 3)
+        .reshape(in_tiles * out_tiles, 256)
+    )
+    perm = mx.array(_TENSOR_CORE_PERM.astype(np.int32))
+    return mx.take(row_major, perm, axis=1).astype(mx.float32)
+
+
+def _kernel_tiles_to_inner_mlx(tiles: Any, rows: int, cols: int) -> Any:
+    import mlx.core as mx
+
+    in_tiles = rows // 16
+    out_tiles = cols // 16
+    if tiles.shape != (in_tiles * out_tiles, 256):
+        raise ValueError(f"decoded tile shape {tiles.shape} does not match {(rows, cols)}")
+    perm_inv = mx.array(_TENSOR_CORE_PERM_INV.astype(np.int32))
+    return (
+        mx.take(tiles, perm_inv, axis=1)
+        .reshape(in_tiles, out_tiles, 16, 16)
+        .transpose(0, 2, 1, 3)
+        .reshape(rows, cols)
+        .astype(mx.float32)
+    )
+
+
+def quantize_inner_matrix_direct_mlx(
+    inner: Any,
+    *,
+    k: int,
+    cb: CodebookMode,
+) -> tuple[Any, Any]:
+    """MLX-native Metal direct quantization for production LDLQ loops."""
+
+    import mlx.core as mx
+
+    arr = mx.array(inner, dtype=mx.float32)
+    kernel_tiles = _inner_to_kernel_tiles_mlx(arr)
+    from ponyexl3.convert.metal_search import quantize_tiles_mlx
+    from ponyexl3.convert.mlx_trellis import pack_trellis_mlx
+
+    decoded_mx, states_mx = quantize_tiles_mlx(kernel_tiles, k=k, cb=cb)
+    in_tiles = arr.shape[0] // 16
+    out_tiles = arr.shape[1] // 16
+    packed_mx = pack_trellis_mlx(
+        (states_mx & ((1 << k) - 1)).reshape(in_tiles, out_tiles, 256),
+        k,
+    )
+    reconstructed_mx = _kernel_tiles_to_inner_mlx(decoded_mx, arr.shape[0], arr.shape[1])
+    return packed_mx, reconstructed_mx
+
+
 def quantize_inner_matrix_direct(
     inner: np.ndarray,
     *,

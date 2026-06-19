@@ -128,8 +128,17 @@ Current checkpoint-backed pilot:
   path on Metal parity tests; a bounded MiniCPM5 LDLQ smoke for
   `model.layers.0.mlp.down_proj` wrote/reloaded a K4 layer in `3.55 s` wall
   time. This is the first slice of the larger GPU-resident converter design;
-  remaining work is to move LDLQ compensation/prod-cache and sibling batching
-  onto MLX instead of NumPy.
+  remaining work is sibling batching and broader timing instrumentation.
+- New converter GPU-residency step 2:
+  production LDLQ (`search_backend=metal`, `collect_states=False`) now uses an
+  MLX-resident inner loop for row buffers, reconstruction, compensation GEMMs,
+  and prod-cache updates. The old NumPy loop remains active for CPU mode and
+  debug/state-collecting Metal parity. `ldlq_inner_matrix` reports
+  `mlx_ldlq=True` on the production path. A parity test compares the new
+  no-state MLX loop against the debug state-collecting Metal loop bit-for-bit
+  on packed trellis and reconstruction. Bounded MiniCPM5 LDLQ smoke for
+  `model.layers.0.mlp.down_proj` wrote/reloaded a K4 layer in `3.69 s` wall
+  time with `mlx_ldlq=True`.
 - Qwen3.6-27B M6 gate setup:
   source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
   `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
@@ -615,6 +624,7 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | MiniCPM5 `gate_proj` oracle public reconstruct | reference vs fast Metal oracle path | `53.6 s` -> `0.014 s` | `~3900x` faster; bit-identical (`max abs diff = 0`) to the reference oracle decode path. |
 | MiniCPM5 full `--oracle-metrics` layer | exact LDLQ, full diagnostics | `56 s` -> `1.78 s` | `~31x` faster after swapping only the hot oracle trellis decode; metrics unchanged. |
 | MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, Metal, GPU trellis pack, no state materialization | `3.55 s` | Bounded smoke after adding `pack_trellis_mlx`; wrote/reloaded K4 layer. |
+| MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, MLX-resident compensation/prod-cache, no state materialization | `3.69 s` | Bounded smoke after adding `mlx_ldlq`; similar wall time on one module, much lower CPU user time (`0.65 s`). |
 | Qwen3.6-27B full model | exact LDLQ, Metal, oracle K plan, full oracle diagnostics | long/overnight expected | `401` supported EXL3 linears: `285` K4, `115` K5, K6 `lm_head`; use real per-module calibration and `--resume`. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |

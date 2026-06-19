@@ -17,6 +17,7 @@ from ponyexl3.convert.direct import (
     public_block_to_inner_with_scale_slices,
     prepare_layer_quantization_basis,
     quantize_inner_matrix_direct,
+    quantize_inner_matrix_direct_mlx,
     rel_rms_from_sse,
 )
 from ponyexl3.convert.fixtures import SearchBackend, build_layer_fixture
@@ -311,6 +312,18 @@ def ldlq_inner_matrix(
     if hessian is not None and hessian.shape != (rows, rows):
         raise ValueError(f"Hessian shape {hessian.shape} does not match rows {rows}")
 
+    if search_backend == "metal" and not collect_states:
+        return _ldlq_inner_matrix_mlx(
+            inner,
+            l_factor,
+            k=k,
+            cb=cb,
+            hessian=hessian,
+            buf_size_rows=buf_size_rows,
+            feedback_rows=feedback_rows,
+            compute_proxy=compute_proxy,
+        )
+
     weight = inner.astype(np.float32, copy=True)
     l = l_factor.astype(np.float32, copy=True)
     l[np.diag_indices_from(l)] = np.float32(0.0)
@@ -387,6 +400,116 @@ def ldlq_inner_matrix(
         packed=packed,
         states=states,
         reconstructed=reconstructed,
+        stats=stats,
+    )
+
+
+def _ldlq_inner_matrix_mlx(
+    inner: np.ndarray,
+    l_factor: np.ndarray,
+    *,
+    k: int,
+    cb: CodebookMode,
+    hessian: np.ndarray | None,
+    buf_size_rows: int,
+    feedback_rows: int,
+    compute_proxy: bool,
+) -> LDLQResult:
+    """MLX-resident production LDLQ loop for Metal/no-state conversion."""
+
+    import mlx.core as mx
+
+    rows, cols = inner.shape
+    l_np = l_factor.astype(np.float32, copy=True)
+    l_np[np.diag_indices_from(l_np)] = np.float32(0.0)
+
+    weight = mx.array(inner.astype(np.float32, copy=False), dtype=mx.float32)
+    l = mx.array(l_np, dtype=mx.float32)
+    reconstructed = mx.zeros_like(weight)
+    prod_cache = mx.zeros_like(weight)
+
+    tiles_k = rows // 16
+    tiles_n = cols // 16
+    packed_size = 256 * k // 16
+    packed = np.empty((tiles_k, tiles_n, packed_size), dtype=np.uint16)
+
+    j = rows
+    while j > 0:
+        i = max(0, j - buf_size_rows)
+        b_weight = weight[i:j]
+        b_reconstructed = reconstructed[i:j]
+        b_prod_cache = prod_cache[i:j]
+        b_l = l[i:j]
+        chunk_rows = j - i
+
+        for bj in range(chunk_rows, 0, -feedback_rows):
+            bi = max(0, bj - feedback_rows)
+            bb_err = b_weight[bj:] - b_reconstructed[bj:]
+            compensation = b_prod_cache[bi:bj]
+            if bb_err.size:
+                bb_l = b_l[bj:, i + bi : i + bj]
+                compensation = compensation + mx.matmul(bb_l.T, bb_err)
+            rows_to_quantize = b_weight[bi:bj] + compensation
+            block_packed_mx, block_reconstructed = quantize_inner_matrix_direct_mlx(
+                rows_to_quantize,
+                k=k,
+                cb=cb,
+            )
+            mx.eval(block_packed_mx, block_reconstructed)
+            tk = (i + bi) // 16
+            tk1 = tk + (bj - bi) // 16
+            packed[tk:tk1] = np.array(block_packed_mx).astype(np.uint16, copy=False)
+            b_reconstructed = mx.slice_update(
+                b_reconstructed,
+                block_reconstructed,
+                start_indices=mx.array([bi, 0], dtype=mx.int32),
+                axes=(0, 1),
+            )
+
+        b_err = b_weight - b_reconstructed
+        reconstructed = mx.slice_update(
+            reconstructed,
+            b_reconstructed,
+            start_indices=mx.array([i, 0], dtype=mx.int32),
+            axes=(0, 1),
+        )
+        if i > 0:
+            prod_update = mx.matmul(b_l[:, :i].T, b_err)
+            prod_cache = mx.slice_update(
+                prod_cache,
+                prod_cache[:i] + prod_update,
+                start_indices=mx.array([0, 0], dtype=mx.int32),
+                axes=(0, 1),
+            )
+        j = i
+
+    mx.eval(reconstructed)
+    reconstructed_np = np.array(reconstructed).astype(np.float32, copy=False)
+    weight_np = inner.astype(np.float32, copy=False)
+    delta = reconstructed_np - weight_np
+    mse = float(np.mean(delta * delta))
+    ref_rms = float(np.sqrt(np.mean(weight_np * weight_np))) + 1e-20
+    stats: dict[str, float | bool] = {
+        "inner_mse": mse,
+        "inner_rel_rms": float(np.sqrt(mse) / ref_rms),
+        "pack_roundtrip": True,
+        "ldlq_feedback_rows": float(feedback_rows),
+        "mlx_ldlq": True,
+    }
+    if hessian is not None and compute_proxy:
+        proxy = hessian_proxy_stats(delta, hessian, reference=weight_np)
+        stats.update(
+            {
+                "hessian_proxy_sse": proxy.proxy_sse,
+                "hessian_proxy_mse": proxy.proxy_mse,
+                "hessian_proxy_rel_rms": proxy.proxy_rel_rms,
+            }
+        )
+
+    return LDLQResult(
+        packed=packed,
+        states=None,
+        reconstructed=reconstructed_np,
         stats=stats,
     )
 
