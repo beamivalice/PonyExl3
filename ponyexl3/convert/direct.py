@@ -230,9 +230,28 @@ def _oracle_or_identity_basis(
     ref_layer: EXL3Layer,
     *,
     scale_mode: ScaleMode,
+    search_backend: SearchBackend,
 ) -> LayerQuantizationBasis:
     suh, suh_zero_count = scale_full_for_mode(ref_layer.suh, ref_layer.in_features, scale_mode)
     svh, svh_zero_count = scale_full_for_mode(ref_layer.svh, ref_layer.out_features, scale_mode)
+    if scale_mode != "identity" and search_backend == "metal":
+        try:
+            target_inner = _oracle_basis_mlx_hadamard(source_public, suh=suh, svh=svh)
+        except Exception:
+            target_inner = None
+        if target_inner is not None:
+            return LayerQuantizationBasis(
+                source_public=source_public,
+                target_inner=target_inner,
+                suh=suh,
+                svh=svh,
+                stats={
+                    "suh_zero_replacements": float(suh_zero_count),
+                    "svh_zero_replacements": float(svh_zero_count),
+                    "regularize_computed_scales": False,
+                    "basis_mlx_hadamard": True,
+                },
+            )
     target_inner = np.empty_like(source_public, dtype=np.float32)
     for in_start in range(0, ref_layer.in_features, HAD_DIM):
         su_slice = None if suh is None else suh[in_start : in_start + HAD_DIM]
@@ -258,8 +277,42 @@ def _oracle_or_identity_basis(
             "suh_zero_replacements": float(suh_zero_count),
             "svh_zero_replacements": float(svh_zero_count),
             "regularize_computed_scales": False,
+            "basis_mlx_hadamard": False,
         },
     )
+
+
+def _oracle_basis_mlx_hadamard(
+    source_public: np.ndarray,
+    *,
+    suh: np.ndarray | None,
+    svh: np.ndarray | None,
+) -> np.ndarray | None:
+    if suh is None and svh is None:
+        return source_public.astype(np.float32, copy=False)
+    try:
+        import mlx.core as mx
+
+        from ponyexl3.mlx.hadamard import preapply_had_left_mlx, preapply_had_right_mlx
+    except Exception:
+        return None
+
+    out = mx.array(source_public.astype(np.float32, copy=False), dtype=mx.float32)
+    rows, cols = source_public.shape
+    if svh is not None:
+        out = out / mx.array(svh.astype(np.float32, copy=False), dtype=mx.float32).reshape(
+            1,
+            cols,
+        )
+        out = preapply_had_right_mlx(out).astype(mx.float32)
+    if suh is not None:
+        out = out / mx.array(suh.astype(np.float32, copy=False), dtype=mx.float32).reshape(
+            rows,
+            1,
+        )
+        out = preapply_had_left_mlx(out).astype(mx.float32)
+    mx.eval(out)
+    return np.array(out).astype(np.float32, copy=False)
 
 
 def prepare_layer_quantization_basis(
@@ -280,7 +333,12 @@ def prepare_layer_quantization_basis(
 
     source_public = read_source_public_matrix(source_dir, source)
     if scale_mode != "computed":
-        return _oracle_or_identity_basis(source_public, ref_layer, scale_mode=scale_mode)
+        return _oracle_or_identity_basis(
+            source_public,
+            ref_layer,
+            scale_mode=scale_mode,
+            search_backend=search_backend,
+        )
 
     k = ref_layer.k if quant_bits is None else int(quant_bits)
     regularized = regularize_public_weight(

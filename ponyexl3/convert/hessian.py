@@ -30,6 +30,9 @@ from ponyexl3.ref.reconstruct import reconstruct_public_weights
 from ponyexl3.ref.signs import unpack_signs_or_pass
 
 
+_MLX_ACTIVATION_HADAMARD_MIN_ROWS = 192
+
+
 @dataclass(frozen=True)
 class PreparedHessian:
     """Regularized input Hessian ready for block LDL factorization."""
@@ -87,6 +90,7 @@ class _LDLQGroupPrepared:
     k: int
     cb: CodebookMode
     l_factor: np.ndarray
+    activations_mlx_hadamard: bool
 
 
 @dataclass
@@ -104,6 +108,7 @@ class _LDLQGroupState:
     reconstructed: Any
     prod_cache: Any
     packed: Any
+    activations_mlx_hadamard: bool
 
 
 def capture_hessian(activations: np.ndarray, *, normalize: bool = True) -> np.ndarray:
@@ -235,6 +240,32 @@ def public_activations_to_inner(activations: np.ndarray, suh: np.ndarray | None)
     if suh is None:
         return x.copy()
     return had_r_128(x, pre_scale=suh).astype(np.float32, copy=False)
+
+
+def _public_activations_to_inner_for_backend(
+    activations: np.ndarray,
+    suh: np.ndarray | None,
+    *,
+    search_backend: SearchBackend,
+) -> tuple[np.ndarray, bool]:
+    if (
+        suh is not None
+        and search_backend == "metal"
+        and activations.shape[0] >= _MLX_ACTIVATION_HADAMARD_MIN_ROWS
+    ):
+        try:
+            import mlx.core as mx
+
+            from ponyexl3.mlx.hadamard import had_r_128_mlx
+
+            x = mx.array(activations.astype(np.float32, copy=False), dtype=mx.float32)
+            scale = mx.array(suh.astype(np.float32, copy=False), dtype=mx.float32)
+            out = had_r_128_mlx(x, pre_scale=scale, r_scale=1.0).astype(mx.float32)
+            mx.eval(out)
+            return np.array(out).astype(np.float32, copy=False), True
+        except Exception:
+            pass
+    return public_activations_to_inner(activations, suh), False
 
 
 def public_matrix_to_inner(
@@ -613,7 +644,11 @@ def ldlq_quantize_layer(
     suh = basis.suh
     svh = basis.svh
 
-    inner_acts = public_activations_to_inner(fixture.activations, suh)
+    inner_acts, activations_mlx_hadamard = _public_activations_to_inner_for_backend(
+        fixture.activations,
+        suh,
+        search_backend=search_backend,
+    )
     prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
     ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
     quantized = ldlq_inner_matrix(
@@ -653,6 +688,7 @@ def ldlq_quantize_layer(
             "ldl_retries": float(ldl.retries),
             "oracle_metrics": bool(compare_oracle),
             "fast_metrics": bool(fast_metrics),
+            "activations_mlx_hadamard": activations_mlx_hadamard,
         }
     )
     if fast_metrics:
@@ -751,14 +787,17 @@ def ldlq_quantize_layer(
 def _group_prep_worker_count(
     group_size: int,
     *,
+    search_backend: SearchBackend,
     scale_mode: ScaleMode,
     skip_g_scale: bool,
 ) -> int:
     if group_size <= 1:
         return 1
-    # Computed-scale GSS launches trellis search kernels during prep. Keep that
-    # path serial so several worker threads do not compete for the Metal queue.
-    if scale_mode == "computed" and not skip_g_scale:
+    # Metal prep can launch Hadamard/GSS kernels before LDLQ search. Keep those
+    # paths serial so worker threads do not compete for the same GPU queue.
+    if search_backend == "metal" and scale_mode in ("oracle", "oracle_safe"):
+        return 1
+    if search_backend == "metal" and scale_mode == "computed" and not skip_g_scale:
         return 1
     return min(group_size, 4)
 
@@ -797,7 +836,11 @@ def _prepare_ldlq_group_member(
         regularization_seed=regularization_seed,
         quant_bits=k,
     )
-    inner_acts = public_activations_to_inner(fixture.activations, basis.suh)
+    inner_acts, activations_mlx_hadamard = _public_activations_to_inner_for_backend(
+        fixture.activations,
+        basis.suh,
+        search_backend=search_backend,
+    )
     prepared = prepare_hessian_for_ldl(capture_hessian(inner_acts), sigma_reg=sigma_reg)
     ldl = block_ldl(prepared.hessian, block_size=16, sigma_reg=sigma_reg)
     l_factor = ldl.l.astype(np.float32, copy=True)
@@ -812,6 +855,7 @@ def _prepare_ldlq_group_member(
         k=k,
         cb=oracle.cb,
         l_factor=l_factor,
+        activations_mlx_hadamard=activations_mlx_hadamard,
     )
 
 
@@ -866,6 +910,7 @@ def ldlq_quantize_group(
 
     prep_workers = _group_prep_worker_count(
         len(keys),
+        search_backend=search_backend,
         scale_mode=scale_mode,
         skip_g_scale=skip_g_scale,
     )
@@ -947,6 +992,7 @@ def ldlq_quantize_group(
                     (rows // 16, out_features // 16, packed_size),
                     dtype=mx.uint16,
                 ),
+                activations_mlx_hadamard=member.activations_mlx_hadamard,
             )
         )
 
@@ -1050,6 +1096,7 @@ def ldlq_quantize_group(
                 "oracle_metrics": False,
                 "fast_metrics": True,
                 "mlx_ldlq": True,
+                "activations_mlx_hadamard": state.activations_mlx_hadamard,
                 "batched_group_size": float(len(keys)),
                 "batched_group_out_features": float(total_out),
                 "batched_search_group_size": float(len(keys)),

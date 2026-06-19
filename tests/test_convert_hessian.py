@@ -11,6 +11,7 @@ from safetensors.numpy import save_file
 
 from ponyexl3.convert.direct import quantize_inner_matrix_direct, write_direct_layer_bundle
 from ponyexl3.convert.hessian import (
+    _public_activations_to_inner_for_backend,
     block_ldl,
     capture_hessian,
     hessian_proxy_stats,
@@ -18,6 +19,7 @@ from ponyexl3.convert.hessian import (
     ldlq_quantize_group,
     ldlq_inner_matrix,
     prepare_hessian_for_ldl,
+    public_activations_to_inner,
     public_matrix_to_inner,
     reconstruct_oracle_public_fast,
 )
@@ -254,6 +256,25 @@ def test_public_matrix_to_inner_identity_mode_is_noop():
     np.testing.assert_allclose(inner, public, rtol=0.0, atol=2e-6)
 
 
+@pytest.mark.skipif(not _metal_available(), reason="Metal is required for MLX activation Hadamard")
+def test_public_activations_to_inner_mlx_matches_ref():
+    rng = np.random.default_rng(110)
+    activations = rng.standard_normal((256, 256)).astype(np.float32)
+    suh = (np.where(rng.random(256) > 0.5, -1.0, 1.0) * (0.5 + rng.random(256))).astype(
+        np.float32,
+    )
+
+    ref = public_activations_to_inner(activations, suh)
+    got, used = _public_activations_to_inner_for_backend(
+        activations,
+        suh,
+        search_backend="metal",
+    )
+
+    assert used is True
+    np.testing.assert_allclose(got, ref, rtol=2e-5, atol=3e-5)
+
+
 def test_ldlq_correlated_hessian_emits_roundtrippable_proxy_stats():
     rng = np.random.default_rng(103)
     activations = rng.standard_normal((128, 32)).astype(np.float32)
@@ -369,6 +390,7 @@ def test_ldlq_layer_computed_scales_with_calibration_rows(tmp_path: Path):
     assert result.layer.svh is not None
     assert result.stats["regularize_computed_scales"] is True
     assert result.stats["regularize_g_scale_skipped"] is True
+    assert result.stats["activations_mlx_hadamard"] is False
     np.testing.assert_allclose(result.activations, activations, rtol=0.0, atol=0.0)
     assert np.isfinite(result.converted_output).all()
 
@@ -442,6 +464,7 @@ def test_ldlq_group_batched_search_matches_individual_with_distinct_scales(tmp_p
         assert batched.stats["batched_prep_workers"] == 2.0
         assert batched.stats["mlx_ldlq"] is True
         assert batched.stats["mlx_packed_deferred"] is True
+        assert batched.stats["activations_mlx_hadamard"] is False
 
 
 def test_reconstruct_oracle_public_fast_matches_reference():

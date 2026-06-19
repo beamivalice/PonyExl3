@@ -186,6 +186,23 @@ Current checkpoint-backed pilot:
   this step: full layer 0 wrote `7` layers in `7.28 s` wall with
   `mlx_packed_deferred=true` on every module; source-only computed-scale LDLQ
   for `model.layers.0.mlp.down_proj` wrote a K4 layer in `4.54 s` wall.
+- New converter GPU-residency step 6:
+  oracle/identity basis inversion now uses the parity-tested
+  `ponyexl3.mlx.hadamard` wrappers over MLX's native `mx.hadamard_transform`
+  on the production Metal path. CPU/debug stays on the NumPy reference block
+  loop. The stat `basis_mlx_hadamard=true` marks this path. Group prep is
+  serialized for Metal oracle/oracle-safe conversion because basis prep now
+  launches GPU work; computed `--skip-g-scale` remains parallel. Activation
+  Hadamard also has an MLX path, but it is gated to `>=192` activation rows:
+  microbenchmarks show MLX is slower for fixture-sized batches (`4` rows:
+  `2.6x` slower) and starts winning around real calibration sizes (`250` rows:
+  `0.95x`, `512` rows: `0.60x`). Checked other MLX primitives:
+  `mx.linalg.cholesky/solve/inv` exist for a future LDL port, but MLX Hessian
+  capture via `mx.matmul(X.T, X)` was rejected for now after parity showed
+  about `1.9e-3` max absolute drift on a small matrix with no precision knob.
+  Real MiniCPM5 smoke after this step: full layer 0 wrote `7` layers in
+  `7.04 s` wall with `basis_mlx_hadamard=true` on every module and
+  `activations_mlx_hadamard=false` for the 4-row fixture.
 - Qwen3.6-27B M6 gate setup:
   source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
   `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
@@ -288,6 +305,7 @@ Current checkpoint-backed pilot:
   trellis pack/unpack is vectorized, and metric paths reuse Metal-returned
   reconstructed inner weights instead of decoding the packed trellis on CPU.
   Computed-scale GSS sample scoring also uses the no-state quantizer path.
+  Production oracle/identity basis inversion uses MLX native Hadamard.
 - `convert/hessian.py` — M4b Hessian/LDLQ primitives: activation Hessian
   capture, upstream-style diagonal damping, NumPy/Accelerate block-LDL,
   reverse 16-row LDLQ over inner-domain weights, Hessian proxy metrics, and a
@@ -301,6 +319,8 @@ Current checkpoint-backed pilot:
   which batches sibling modules at the trellis-search call boundary while
   preserving each module's independent scales/Hessian/LDL state. Production
   LDLQ keeps packed trellis buffers on MLX until module/group finalization.
+  Calibration-sized activation Hadamards use MLX; fixture-sized batches stay
+  on the NumPy path to avoid launch overhead.
 - `convert/regularize.py` — post-M4 regularization port: blockwise RMS,
   deterministic random sign flips, upstream `CODEBOOK_SCALE`, output/input
   channel scales, 128-block Hadamards, wrapped-diagonal tile sampling, and

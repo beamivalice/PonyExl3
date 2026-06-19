@@ -178,6 +178,53 @@ def test_read_source_public_matrix_matches_block_reader(tmp_path: Path):
     np.testing.assert_allclose(block, full[:, 128:256])
 
 
+@pytest.mark.skipif(not _metal_available(), reason="Metal/MLX is required for basis Hadamard")
+def test_oracle_safe_basis_uses_mlx_hadamard_and_matches_cpu_reference(tmp_path: Path):
+    module_key = "model.layers.0.self_attn.q_proj"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    rng = np.random.default_rng(126)
+    public_weight = (rng.standard_normal((128, 256)) * 0.05).astype(np.float32)
+    _write_synthetic_source(source_dir, module_key, public_weight)
+    source = resolve_source_linear(source_dir, module_key)
+    suh = (np.where(rng.random(128) > 0.5, -1.0, 1.0) * (0.5 + rng.random(128))).astype(
+        np.float16,
+    )
+    svh = (np.where(rng.random(256) > 0.5, -1.0, 1.0) * (0.5 + rng.random(256))).astype(
+        np.float16,
+    )
+    ref_layer = EXL3Layer(
+        key=module_key,
+        in_features=128,
+        out_features=256,
+        k=4,
+        trellis=np.zeros((8, 16, 64), dtype=np.uint16),
+        suh=suh,
+        svh=svh,
+    )
+
+    cpu = prepare_layer_quantization_basis(
+        source_dir,
+        source,
+        ref_layer,
+        CodebookMode.DEFAULT,
+        scale_mode="oracle_safe",
+        search_backend="cpu",
+    )
+    mlx = prepare_layer_quantization_basis(
+        source_dir,
+        source,
+        ref_layer,
+        CodebookMode.DEFAULT,
+        scale_mode="oracle_safe",
+        search_backend="metal",
+    )
+
+    assert cpu.stats["basis_mlx_hadamard"] is False
+    assert mlx.stats["basis_mlx_hadamard"] is True
+    np.testing.assert_allclose(mlx.target_inner, cpu.target_inner, rtol=2e-5, atol=3e-5)
+
+
 def test_computed_scale_gss_uses_no_state_quantizer_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
