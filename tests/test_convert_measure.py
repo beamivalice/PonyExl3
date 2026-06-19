@@ -144,7 +144,8 @@ def test_measure_ldlq_candidates_uses_bit_plan_when_no_candidate_bits(
         bit_plan={"a": 4, "b": 5},
     )
 
-    assert seen_bits == [4, 5]
+    # Order-independent: candidates run on a thread pool (default max_workers>1).
+    assert sorted(seen_bits) == [4, 5]
     assert [item["k"] for item in summary["best_by_module"]] == [4, 5]
 
 
@@ -179,7 +180,9 @@ def test_measure_ldlq_candidates_supports_per_module_candidate_bits(
         candidate_bits_by_module={"lm_head": [6]},
     )
 
-    assert seen == [("body", 4), ("body", 5), ("lm_head", 6)]
+    # Candidate resolution, order-independent: measure runs candidates on a thread
+    # pool (default max_workers>1), so the call order is non-deterministic.
+    assert sorted(seen) == [("body", 4), ("body", 5), ("lm_head", 6)]
     assert summary["candidate_count"] == 3
     assert summary["candidate_bits_by_module"] == {"lm_head": [6]}
 
