@@ -581,7 +581,6 @@ def _ldlq_inner_matrix_mlx(
                 k=k,
                 cb=cb,
             )
-            mx.eval(block_packed_mx, block_reconstructed)
             tk = (i + bi) // 16
             packed_mx = mx.slice_update(
                 packed_mx,
@@ -595,6 +594,11 @@ def _ldlq_inner_matrix_mlx(
                 start_indices=mx.array([bi, 0], dtype=mx.int32),
                 axes=(0, 1),
             )
+            # Force the accumulators every feedback group. Otherwise the deferred
+            # slice_updates into packed_mx pile up into one enormous final eval for
+            # huge layers (lm_head ~1.3B params), which balloons MLX's buffer pool
+            # past RAM mid-layer (observed ~108 GB on the 27B lm_head before OOM).
+            mx.eval(packed_mx, b_reconstructed)
 
         b_err = b_weight - b_reconstructed
         reconstructed = mx.slice_update(
@@ -611,6 +615,11 @@ def _ldlq_inner_matrix_mlx(
                 start_indices=mx.array([0, 0], dtype=mx.int32),
                 axes=(0, 1),
             )
+        # Materialize this row-buffer's accumulators and hand the freed buffers
+        # back to the OS, so steady-state memory stays at the live working set
+        # rather than the running total of every group's discarded scratch.
+        mx.eval(reconstructed, prod_cache)
+        mx.clear_cache()
         j = i
 
     mx.eval(reconstructed, packed_mx)
@@ -1166,7 +1175,6 @@ def ldlq_quantize_group(
                 k=first_k,
                 cb=first_cb,
             )
-            mx.eval(block_packed_mx, block_reconstructed_cat)
             tk = (i + bi) // 16
             col = 0
             tile_col = 0
@@ -1188,6 +1196,9 @@ def ldlq_quantize_group(
                 )
                 col += out_features
                 tile_col += out_tiles
+            # Force per feedback group so the per-state packed slice_updates don't
+            # defer into one giant final eval that balloons the buffer pool.
+            mx.eval(*[state.packed for state in states], *b_reconstructed)
 
         for index, state in enumerate(states):
             b_err = b_weights[index] - b_reconstructed[index]
@@ -1205,6 +1216,12 @@ def ldlq_quantize_group(
                     start_indices=mx.array([0, 0], dtype=mx.int32),
                     axes=(0, 1),
                 )
+        # Materialize this row-buffer's accumulators and release the freed pool.
+        mx.eval(
+            *[state.reconstructed for state in states],
+            *[state.prod_cache for state in states],
+        )
+        mx.clear_cache()
         j = i
 
     mx.eval(*[state.reconstructed for state in states], *[state.packed for state in states])

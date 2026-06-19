@@ -532,9 +532,12 @@ def main() -> int:
         _write_json_atomic(work_dir / "pipeline_summary.json", final)
         _stage(state_path, "done", {"summary": str(work_dir / "pipeline_summary.json")})
     except (OSError, KeyError, TypeError, ValueError) as exc:
-        reuse.disable()
         print(str(exc), file=sys.stderr)
         return 1
+    finally:
+        # Always release the reuse cache, including on KeyboardInterrupt or any
+        # uncaught error, so it can't hold layers wired after the run.
+        reuse.disable()
 
     if args.json:
         print(json.dumps(final, indent=2, sort_keys=True))
