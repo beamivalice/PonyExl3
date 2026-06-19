@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -10,6 +13,8 @@ import pytest
 from ponyexl3.convert import measure
 from ponyexl3.convert.direct import DirectLayerResult
 from ponyexl3.ref.layer import EXL3Layer
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _fake_layer(key: str, k: int) -> EXL3Layer:
@@ -21,6 +26,33 @@ def _fake_layer(key: str, k: int) -> EXL3Layer:
         trellis=np.zeros((8, 8, 256 * k // 16), dtype=np.uint16),
         mcg=True,
     )
+
+
+def _measurement_record(
+    module: str,
+    *,
+    k: int,
+    score: float,
+    weight: int = 1,
+    shrinkage: float = 0.0,
+) -> dict[str, object]:
+    return {
+        "module": module,
+        "candidate_bits": k,
+        "k": k,
+        "hessian_shrinkage": shrinkage,
+        "score": score,
+        "score_metric": "output_rel_rms",
+        "summary": {
+            "module": module,
+            "k": k,
+            "shape": [weight, 1],
+            "stats": {
+                "output_rel_rms": score,
+                "hessian_shrinkage": shrinkage,
+            },
+        },
+    }
 
 
 def test_measure_ldlq_candidates_ranks_bits_and_shrinkage(
@@ -114,6 +146,78 @@ def test_measure_ldlq_candidates_uses_bit_plan_when_no_candidate_bits(
 
     assert seen_bits == [4, 5]
     assert [item["k"] for item in summary["best_by_module"]] == [4, 5]
+
+
+def test_optimize_measurement_plan_spends_budget_by_measured_gain():
+    measurement = {
+        "score_metric": "output_rel_rms",
+        "records": [
+            _measurement_record("huge", k=4, score=0.10, weight=10),
+            _measurement_record("huge", k=5, score=0.05, weight=10),
+            _measurement_record("small", k=4, score=0.20, weight=1),
+            _measurement_record("small", k=5, score=0.01, weight=1),
+        ],
+    }
+
+    plan = measure.optimize_measurement_plan(measurement, target_bpw=4.1)
+
+    assert plan["bit_plan"] == {"huge": 4, "small": 5}
+    assert plan["spent_weighted_bits"] == 45
+    assert plan["target_weighted_bits"] == 45
+    assert plan["average_bits"] == pytest.approx(45 / 11)
+    assert plan["upgrades"][0]["module"] == "small"
+    assert plan["layer_bits"] == [r"^huge$:4", r"^small$:5"]
+
+
+def test_optimize_measurement_plan_selects_best_global_shrinkage():
+    measurement = {
+        "score_metric": "output_rel_rms",
+        "records": [
+            _measurement_record("a", k=4, score=0.20, shrinkage=0.0),
+            _measurement_record("b", k=4, score=0.20, shrinkage=0.0),
+            _measurement_record("a", k=4, score=0.05, shrinkage=0.1),
+            _measurement_record("b", k=4, score=0.06, shrinkage=0.1),
+        ],
+    }
+
+    plan = measure.optimize_measurement_plan(measurement, target_bpw=4.0)
+
+    assert plan["mode"] == "global_hessian_shrinkage"
+    assert plan["hessian_shrinkage"] == 0.1
+    assert plan["objective"] == pytest.approx(0.055)
+    assert len(plan["global_plans"]) == 2
+
+
+def test_optimize_measurements_cli_json(tmp_path: Path):
+    measurement = {
+        "score_metric": "output_rel_rms",
+        "records": [
+            _measurement_record("a", k=4, score=0.30),
+            _measurement_record("a", k=5, score=0.10),
+        ],
+    }
+    path = tmp_path / "measurement.json"
+    path.write_text(json.dumps(measurement), encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ponyexl3.cli.optimize_measurements",
+            str(path),
+            "--bits",
+            "5.0",
+            "--json",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    plan = json.loads(proc.stdout)
+    assert plan["bit_plan"] == {"a": 5}
+    assert plan["layer_bits_args"] == ["--layer-bits", r"^a$:5"]
 
 
 def test_measure_ldlq_candidates_rejects_bad_inputs(tmp_path: Path):

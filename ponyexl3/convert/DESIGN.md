@@ -5,7 +5,7 @@ emit/load gate complete, M4 complete for selected-module/layer-set LDLQ emit,
 post-M4 computed-scale/calibration inputs complete, MiniCPM5 direct full-model
 conversion/load/KLD gated, M5a priority allocation wired, and new-converter
 GPU-residency/batched-search optimization plus M5b bounded measurement /
-Hessian-quality exploration in progress**
+budget optimizer / Hessian-quality exploration in progress**
 (`tests/test_convert.py`, `tests/test_convert_metal.py`,
 `tests/test_convert_hessian.py`, `tests/test_convert_driver.py`,
 `tests/test_convert_regularize.py`, `tests/test_convert_calibration.py`,
@@ -593,6 +593,15 @@ Port both upstream tiers, in this order:
   selected bit plan (`--use-bit-allocation` / `--layer-bits`) or the oracle/
   plan K. This is the first measurable M5b bridge; the remaining optimizer
   should consume these records and choose a budgeted K plan.
+- **M5b measured budget optimizer** (`ponyexl3-optimize-measurements` now
+  wired): consumes measurement JSON, groups candidates by module/K, starts
+  from the cheapest measured K, and greedily spends the weighted bit budget on
+  the best measured score improvement per added bit. By default it respects a
+  single global Hessian shrinkage because production conversion currently has
+  one `--hessian-shrinkage` value; `--per-module-shrinkage` is available only
+  as a diagnostic upper bound. Output includes `bit_plan`, copyable
+  `--layer-bits` specs, `average_bits`, objective, and the selected global
+  shrinkage.
 
 ## M6 — Qwen3.6-27B 4.15bpw gatekeeper
 
@@ -705,6 +714,21 @@ CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
   --json | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.json
 ```
 
+Then optimize that bounded measurement under the target budget:
+
+```bash
+cd /Users/beam/llm/PonyExl3
+.venv/bin/ponyexl3-optimize-measurements \
+  /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.json \
+  --bits 4.15 \
+  --json | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.plan.json
+```
+
+For a full-model measured allocation, feed the resulting `layer_bits` specs
+back into `ponyexl3-convert` as repeated `--layer-bits REGEX:K` arguments.
+Only promote the selected global `--hessian-shrinkage` after a KLD check; the
+optimizer's module score is a proxy, not the final acceptance gate.
+
 Acceptance after conversion:
 
 ```bash
@@ -748,6 +772,7 @@ bounds until M5b measured allocation and the M6 layer-sequential streamer land.
 | MiniCPM5 `model.layers.0.mlp.down_proj` | exact LDLQ, MLX-resident compensation/prod-cache, no state materialization | `3.69 s` | Bounded smoke after adding `mlx_ldlq`; similar wall time on one module, much lower CPU user time (`0.65 s`). |
 | Hessian shrinkage sweep | LDLQ quality experiment | neutral expected | `--hessian-shrinkage` preserves diagonal energy and damps off-diagonal covariance; default `0.0` keeps baseline timings/quality unchanged. |
 | MiniCPM5 `model.layers.0.mlp.down_proj` | `--measure-candidates`, K4, shrinkage `0/0.10` | `7.70 s` | New M5b measurement mode ranked baseline shrinkage best by output rel-RMS (`0.005719` vs `0.005795`). |
+| Measurement optimizer | `ponyexl3-optimize-measurements` on JSON records | sub-second | No GPU work; converts measured candidate scores into a budgeted `--layer-bits` plan. |
 | Qwen3.6-27B full model | exact LDLQ, Metal, oracle K plan, full oracle diagnostics | long/overnight expected | `401` supported EXL3 linears: `285` K4, `115` K5, K6 `lm_head`; use real per-module calibration and `--resume`. |
 | Qwen3.6-35B-A3B `in_proj_qkv` | direct, Metal, oracle-safe scales | `147 s` | Single large pilot linear, shape `(2048, 8192)`. |
 | Qwen3.6-35B-A3B layer 0 | direct/LDLQ fixture driver | tens of minutes expected | Depends on routed expert inclusion and activation rows. Use module limits while tuning. |

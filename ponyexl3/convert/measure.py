@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 import math
+import re
 import time
 from typing import Any
 
@@ -20,6 +22,16 @@ ProgressCallback = Callable[[str, dict[str, object]], None]
 _DEFAULT_SCORE_METRIC = "output_rel_rms"
 
 
+@dataclass(frozen=True)
+class _MeasuredCandidate:
+    module: str
+    k: int
+    hessian_shrinkage: float
+    score: float
+    weight: int
+    record: Mapping[str, Any]
+
+
 def _as_score(value: object) -> float:
     if isinstance(value, int | float):
         score = float(value)
@@ -31,6 +43,284 @@ def candidate_score(stats: Mapping[str, object], metric: str = _DEFAULT_SCORE_ME
     """Return a finite-sortable score for one measured candidate."""
 
     return _as_score(stats.get(metric))
+
+
+def _as_mapping(value: object, *, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"measurement {name} must be an object")
+    return value
+
+
+def _required_int(value: object, *, name: str) -> int:
+    if not isinstance(value, int | float | str):
+        raise ValueError(f"measurement {name} must be an integer")
+    return int(value)
+
+
+def _required_float(value: object, *, name: str) -> float:
+    if not isinstance(value, int | float | str):
+        raise ValueError(f"measurement {name} must be a number")
+    return float(value)
+
+
+def _record_shape_weight(record: Mapping[str, Any]) -> int:
+    summary = _as_mapping(record.get("summary"), name="record.summary")
+    shape = summary.get("shape")
+    if not isinstance(shape, Sequence) or isinstance(shape, str) or len(shape) != 2:
+        raise ValueError(f"measurement record for {record.get('module')!r} is missing shape")
+    return max(1, int(shape[0]) * int(shape[1]))
+
+
+def _record_stats(record: Mapping[str, Any]) -> Mapping[str, object]:
+    summary = _as_mapping(record.get("summary"), name="record.summary")
+    return _as_mapping(summary.get("stats"), name="record.summary.stats")
+
+
+def _candidate_from_record(record: Mapping[str, Any], *, score_metric: str) -> _MeasuredCandidate:
+    summary = _as_mapping(record.get("summary"), name="record.summary")
+    stats = _record_stats(record)
+    module = str(record.get("module") or summary.get("module") or "")
+    if not module:
+        raise ValueError("measurement record is missing module")
+    k = _required_int(record.get("k") or summary.get("k"), name=f"{module}.k")
+    if k < 1 or k > 8:
+        raise ValueError(f"measurement record for {module} has invalid K={k}")
+    shrinkage = _required_float(
+        record.get("hessian_shrinkage", stats.get("hessian_shrinkage", 0.0)),
+        name=f"{module}.hessian_shrinkage",
+    )
+    score = candidate_score(stats, score_metric)
+    if math.isinf(score):
+        score = _as_score(record.get("score"))
+    return _MeasuredCandidate(
+        module=module,
+        k=k,
+        hessian_shrinkage=shrinkage,
+        score=score,
+        weight=_record_shape_weight(record),
+        record=record,
+    )
+
+
+def _measurement_candidates(
+    measurement: Mapping[str, Any],
+    *,
+    score_metric: str,
+) -> list[_MeasuredCandidate]:
+    records_obj = measurement.get("records")
+    if not isinstance(records_obj, Sequence) or isinstance(records_obj, str):
+        raise ValueError("measurement records must be a list")
+    candidates = [
+        _candidate_from_record(_as_mapping(record, name="record"), score_metric=score_metric)
+        for record in records_obj
+    ]
+    if not candidates:
+        raise ValueError("measurement records are empty")
+    return candidates
+
+
+def _objective(candidates: Sequence[_MeasuredCandidate]) -> float:
+    total_weight = sum(candidate.weight for candidate in candidates)
+    if total_weight <= 0:
+        return float("inf")
+    return float(
+        sum(candidate.score * candidate.weight for candidate in candidates)
+        / total_weight
+    )
+
+
+def _layer_bits_specs(bit_plan: Mapping[str, int]) -> list[str]:
+    return [f"^{re.escape(module)}$:{bits}" for module, bits in bit_plan.items()]
+
+
+def _plan_from_candidates(
+    candidates: Sequence[_MeasuredCandidate],
+    *,
+    target_bpw: float,
+    score_metric: str,
+    hessian_shrinkage: float | None,
+) -> dict[str, Any]:
+    if target_bpw <= 0.0:
+        raise ValueError(f"target_bpw must be positive, got {target_bpw}")
+    by_module: dict[str, dict[int, _MeasuredCandidate]] = {}
+    module_order: list[str] = []
+    for candidate in candidates:
+        if candidate.module not in by_module:
+            by_module[candidate.module] = {}
+            module_order.append(candidate.module)
+        by_k = by_module[candidate.module]
+        current = by_k.get(candidate.k)
+        if current is None or (
+            candidate.score,
+            candidate.hessian_shrinkage,
+        ) < (
+            current.score,
+            current.hessian_shrinkage,
+        ):
+            by_k[candidate.k] = candidate
+
+    selected: dict[str, _MeasuredCandidate] = {}
+    for module in module_order:
+        by_k = by_module[module]
+        if not by_k:
+            raise ValueError(f"measurement has no candidates for {module}")
+        min_k = min(by_k)
+        selected[module] = by_k[min_k]
+
+    baseline = dict(selected)
+    total_weight = sum(candidate.weight for candidate in selected.values())
+    target_weighted_bits = int(round(target_bpw * total_weight))
+    spent_weighted_bits = sum(candidate.k * candidate.weight for candidate in selected.values())
+    feasible = spent_weighted_bits <= target_weighted_bits
+    upgrades: list[dict[str, Any]] = []
+
+    while spent_weighted_bits < target_weighted_bits:
+        best_upgrade: tuple[tuple[float, float, int, int, str], _MeasuredCandidate] | None = None
+        for module in module_order:
+            current = selected[module]
+            for candidate in by_module[module].values():
+                if candidate.k <= current.k:
+                    continue
+                cost = (candidate.k - current.k) * candidate.weight
+                if cost <= 0 or spent_weighted_bits + cost > target_weighted_bits:
+                    continue
+                improvement = (current.score - candidate.score) * candidate.weight
+                if improvement <= 0.0:
+                    continue
+                ratio = improvement / cost
+                key = (
+                    ratio,
+                    improvement,
+                    -cost,
+                    -candidate.k,
+                    module,
+                )
+                if best_upgrade is None or key > best_upgrade[0]:
+                    best_upgrade = (key, candidate)
+        if best_upgrade is None:
+            break
+        (_ratio, improvement, cost_neg, _k_neg, module), candidate = best_upgrade
+        previous = selected[module]
+        cost = -cost_neg
+        selected[module] = candidate
+        spent_weighted_bits += cost
+        upgrades.append(
+            {
+                "module": module,
+                "from_k": previous.k,
+                "to_k": candidate.k,
+                "from_score": previous.score,
+                "to_score": candidate.score,
+                "score_improvement": improvement / candidate.weight,
+                "weighted_score_improvement": improvement,
+                "weighted_bit_cost": cost,
+                "hessian_shrinkage": candidate.hessian_shrinkage,
+            }
+        )
+
+    selected_list = [selected[module] for module in module_order]
+    baseline_list = [baseline[module] for module in module_order]
+    bit_plan = {module: int(selected[module].k) for module in module_order}
+    hessian_plan = {
+        module: float(selected[module].hessian_shrinkage)
+        for module in module_order
+    }
+    layer_bits_specs = _layer_bits_specs(bit_plan)
+    average_bits = spent_weighted_bits / total_weight if total_weight else 0.0
+    baseline_weighted_bits = sum(candidate.k * candidate.weight for candidate in baseline_list)
+    return {
+        "target_bpw": float(target_bpw),
+        "score_metric": score_metric,
+        "hessian_shrinkage": hessian_shrinkage,
+        "module_count": len(module_order),
+        "candidate_count": len(candidates),
+        "total_weight": int(total_weight),
+        "target_weighted_bits": int(target_weighted_bits),
+        "spent_weighted_bits": int(spent_weighted_bits),
+        "baseline_weighted_bits": int(baseline_weighted_bits),
+        "average_bits": float(average_bits),
+        "average_bits_delta": float(average_bits - target_bpw),
+        "feasible": bool(feasible),
+        "objective": _objective(selected_list),
+        "baseline_objective": _objective(baseline_list),
+        "bit_plan": bit_plan,
+        "hessian_shrinkage_plan": hessian_plan,
+        "layer_bits": layer_bits_specs,
+        "layer_bits_args": [
+            item
+            for spec in layer_bits_specs
+            for item in ("--layer-bits", spec)
+        ],
+        "selected": [
+            {
+                "module": candidate.module,
+                "k": int(candidate.k),
+                "hessian_shrinkage": float(candidate.hessian_shrinkage),
+                "score": float(candidate.score),
+                "weight": int(candidate.weight),
+            }
+            for candidate in selected_list
+        ],
+        "upgrades": upgrades,
+    }
+
+
+def optimize_measurement_plan(
+    measurement: Mapping[str, Any],
+    *,
+    target_bpw: float,
+    score_metric: str | None = None,
+    hessian_shrinkage: float | None = None,
+    per_module_shrinkage: bool = False,
+) -> dict[str, Any]:
+    """Build a budgeted K plan from candidate measurement records."""
+
+    metric = str(score_metric or measurement.get("score_metric") or _DEFAULT_SCORE_METRIC)
+    candidates = _measurement_candidates(measurement, score_metric=metric)
+    if per_module_shrinkage:
+        plan = _plan_from_candidates(
+            candidates,
+            target_bpw=target_bpw,
+            score_metric=metric,
+            hessian_shrinkage=None,
+        )
+        plan["mode"] = "per_module_shrinkage"
+        return plan
+
+    shrinkages = sorted({candidate.hessian_shrinkage for candidate in candidates})
+    selected_shrinkages = [float(hessian_shrinkage)] if hessian_shrinkage is not None else shrinkages
+    global_plans: list[dict[str, Any]] = []
+    module_count = len({candidate.module for candidate in candidates})
+    for shrinkage in selected_shrinkages:
+        filtered = [
+            candidate
+            for candidate in candidates
+            if math.isclose(candidate.hessian_shrinkage, shrinkage, rel_tol=0.0, abs_tol=1e-9)
+        ]
+        if len({candidate.module for candidate in filtered}) != module_count:
+            continue
+        global_plans.append(
+            _plan_from_candidates(
+                filtered,
+                target_bpw=target_bpw,
+                score_metric=metric,
+                hessian_shrinkage=shrinkage,
+            )
+        )
+    if not global_plans:
+        raise ValueError("no complete global hessian-shrinkage candidate plan found")
+    best = min(
+        global_plans,
+        key=lambda plan: (
+            float(plan["objective"]),
+            abs(float(plan["average_bits_delta"])),
+            float(plan["hessian_shrinkage"]),
+        ),
+    )
+    out = dict(best)
+    out["mode"] = "global_hessian_shrinkage"
+    out["global_plans"] = global_plans
+    return out
 
 
 def _candidate_bits_for_module(
