@@ -23,9 +23,9 @@ lines, the math core), `exllamav3_ext/quant/quantize.cu` (the search kernel).
 Current checkpoint-backed pilot:
 
 - Source BF16 model:
-  `/Users/beam/llm/models/Qwen/Qwen3.6-35B-A3B`
+  `/path/to/models/Qwen/Qwen3.6-35B-A3B`
 - Oracle EXL3 model:
-  `/Users/beam/llm/models/Exl3/Qwen3.6-35B-A3B-exl3-4.00bpw`
+  `/path/to/exl3/Qwen3.6-35B-A3B-exl3-4.00bpw`
 - Fast module/tile:
   `model.language_model.layers.0.linear_attn.in_proj_qkv`, tile `[0, 0]`
 - Secondary MoE gate pilot:
@@ -53,9 +53,9 @@ Current checkpoint-backed pilot:
   `0.160857`, public rel-RMS `0.069466`, inner MSE `5.562147e-03`;
   `oracle_safe` again replaced `112` zero `svh` entries.
 - MiniCPM5 gate:
-  source `/Users/beam/llm/models/MiniCPM5-1B`, oracle
-  `/Users/beam/llm/models/Exl3/MiniCPM5-1B-exl3-4.00bpw`, generated output
-  `/Users/beam/llm/models/Exl3/MiniCPM5-1B-ponyexl3-4.00bpw`. The generated
+  source `/path/to/MiniCPM5-1B`, oracle
+  `/path/to/exl3/MiniCPM5-1B-exl3-4.00bpw`, generated output
+  `/path/to/exl3/MiniCPM5-1B-PonyExl3-4.00bpw`. The generated
   bundle has `169` EXL3 linears, `50` plain tensors, `557` stored tensors,
   and strict `load_model(warm=False)` succeeds through the `llama` mlx_lm
   mapping. Full direct/oracle-scale conversion took `428 s`; the fast
@@ -219,8 +219,8 @@ Current checkpoint-backed pilot:
   `A=0.10`, but output rel-RMS moved slightly worse (`0.005719` →
   `0.005795`), so shrinkage is not a default win.
 - Qwen3.6-27B M6 gate setup:
-  source `/Users/beam/llm/models/Qwen/Qwen3.6-27B`, oracle
-  `/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
+  source `/path/to/models/Qwen/Qwen3.6-27B`, oracle
+  `/path/to/exl3/Qwen3.6-27B-exl3-4.15bpw`. The oracle advertises
   `bits=4.15`, `head_bits=6`, `codebook=mcg`, calibration metadata
   `{rows: 250, cols: 2048}`, and has `401` supported EXL3 linears with no
   source-adapter skips: `285` at K4, `115` at K5, and `lm_head` at K6. For the
@@ -606,26 +606,26 @@ Port both upstream tiers, in this order:
 ## M6 — Qwen3.6-27B 4.15bpw gatekeeper
 
 Goal: produce
-`/Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw` and show its
+`/path/to/exl3/Qwen3.6-27B-PonyExl3-4.15bpw` and show its
 KLD-vs-original is on par with the official
-`/Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw` oracle.
+`/path/to/exl3/Qwen3.6-27B-exl3-4.15bpw` oracle.
 
 Primary end-to-end gate command:
 
 ```bash
-cd /Users/beam/llm/PonyExl3
-mkdir -p /Users/beam/llm/PonyExl3/.work/logs
+cd /path/to/PonyExl3
+mkdir -p .work/logs
 set -o pipefail
 /usr/bin/time -p .venv/bin/python -m ponyexl3.cli.convert_e2e \
-  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
-  --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
-  --work-dir /Users/beam/llm/PonyExl3/.work/qwen3.6-27b-e2e-4.15bpw \
+  --in-dir /path/to/models/Qwen/Qwen3.6-27B \
+  --out-dir /path/to/exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
+  --work-dir .work/qwen3.6-27b-e2e-4.15bpw \
   --bits 4.15 \
-  --calibration-text /Users/beam/llm/kld-eval/mlx_eval/prompt.txt \
+  --calibration-text /path/to/kld-eval/mlx_eval/prompt.txt \
   --calibration-rows 250 \
   --calibration-seq-len 2048 \
   --search-backend metal \
-  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.15bpw.e2e.log
+  2>&1 | tee .work/logs/qwen3.6-27b-ponyexl3-4.15bpw.e2e.log
 ```
 
 This one command performs:
@@ -658,20 +658,20 @@ The Qwen 4.15 command therefore measures K4/K5 for the body and K6 only for
 For a source-only exact 4.00bpw run, set the head to K4 as well:
 
 ```bash
-cd /Users/beam/llm/PonyExl3
-mkdir -p /Users/beam/llm/PonyExl3/.work/logs
+cd /path/to/PonyExl3
+mkdir -p .work/logs
 set -o pipefail
 /usr/bin/time -p .venv/bin/python -m ponyexl3.cli.convert_e2e \
-  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
-  --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.00bpw \
-  --work-dir /Users/beam/llm/PonyExl3/.work/qwen3.6-27b-e2e-4.00bpw \
+  --in-dir /path/to/models/Qwen/Qwen3.6-27B \
+  --out-dir /path/to/exl3/Qwen3.6-27B-PonyExl3-4.00bpw \
+  --work-dir .work/qwen3.6-27b-e2e-4.00bpw \
   --bits 4.00 \
   --head-bits 4 \
   --search-backend metal \
-  --calibration-text /Users/beam/llm/kld-eval/mlx_eval/prompt.txt \
+  --calibration-text /path/to/kld-eval/mlx_eval/prompt.txt \
   --calibration-rows 250 \
   --calibration-seq-len 2048 \
-  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.00bpw.e2e.log
+  2>&1 | tee .work/logs/qwen3.6-27b-ponyexl3-4.00bpw.e2e.log
 ```
 
 Important command notes:
@@ -693,11 +693,11 @@ Important command notes:
 Bounded M6 quality sweep example before a full overnight conversion:
 
 ```bash
-cd /Users/beam/llm/PonyExl3
-CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
+cd /path/to/PonyExl3
+CALIB=.work/qwen3.6-27b-calib-r250.safetensors
 .venv/bin/ponyexl3-convert \
-  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
-  --oracle-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
+  --in-dir /path/to/models/Qwen/Qwen3.6-27B \
+  --oracle-dir /path/to/exl3/Qwen3.6-27B-exl3-4.15bpw \
   --only-layer 0 \
   --layer-modules \
   --module-limit 3 \
@@ -709,18 +709,18 @@ CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
   --search-backend metal \
   --scale-mode oracle_safe \
   --calibration-activations-map "$CALIB" \
-  --json | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.json
+  --json | tee .work/logs/qwen3.6-27b-layer0-measure.json
 ```
 
 Then optimize that bounded measurement under the target budget:
 
 ```bash
-cd /Users/beam/llm/PonyExl3
+cd /path/to/PonyExl3
 .venv/bin/ponyexl3-optimize-measurements \
-  /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.json \
+  .work/logs/qwen3.6-27b-layer0-measure.json \
   --bits 4.15 \
   --head-bits 6 \
-  --json | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-layer0-measure.plan.json
+  --json | tee .work/logs/qwen3.6-27b-layer0-measure.plan.json
 ```
 
 For a full-model measured allocation, feed the optimized plan back into
@@ -731,14 +731,14 @@ uses the plan's global `hessian_shrinkage`.
 Measured-plan conversion shape:
 
 ```bash
-cd /Users/beam/llm/PonyExl3
-CALIB=/Users/beam/llm/PonyExl3/.work/qwen3.6-27b-calib-r250.safetensors
-PLAN=/Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-full-measure.plan.json
+cd /path/to/PonyExl3
+CALIB=.work/qwen3.6-27b-calib-r250.safetensors
+PLAN=.work/logs/qwen3.6-27b-full-measure.plan.json
 set -o pipefail
 /usr/bin/time -p .venv/bin/ponyexl3-convert \
-  --in-dir /Users/beam/llm/models/Qwen/Qwen3.6-27B \
-  --oracle-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
-  --out-dir /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
+  --in-dir /path/to/models/Qwen/Qwen3.6-27B \
+  --oracle-dir /path/to/exl3/Qwen3.6-27B-exl3-4.15bpw \
+  --out-dir /path/to/exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
   --bits 4.15 \
   --head-bits 6 \
   --ldlq-layer \
@@ -748,7 +748,7 @@ set -o pipefail
   --scale-mode oracle_safe \
   --calibration-activations-map "$CALIB" \
   --resume \
-  2>&1 | tee /Users/beam/llm/PonyExl3/.work/logs/qwen3.6-27b-ponyexl3-4.15bpw.measured.convert.log
+  2>&1 | tee .work/logs/qwen3.6-27b-ponyexl3-4.15bpw.measured.convert.log
 ```
 
 Only promote a nonzero selected global `--hessian-shrinkage` after a KLD check;
@@ -757,17 +757,17 @@ the optimizer's module score is a proxy, not the final acceptance gate.
 Acceptance after conversion:
 
 ```bash
-cd /Users/beam/llm/kld-eval
-mkdir -p /Users/beam/llm/kld-eval/results
+cd /path/to/kld-eval
+mkdir -p results
 set -o pipefail
 uv run mlx_eval.compare \
-  /Users/beam/llm/models/Exl3/Qwen3.6-27B-exl3-4.15bpw \
-  16 /Users/beam/llm/kld-eval/outputs/Qwen3.6-27B \
-  2>&1 | tee /Users/beam/llm/kld-eval/results/Qwen3.6-27B-exl3-4.15bpw-oracle-compare.log
+  /path/to/exl3/Qwen3.6-27B-exl3-4.15bpw \
+  16 /path/to/kld-eval/outputs/Qwen3.6-27B \
+  2>&1 | tee results/Qwen3.6-27B-exl3-4.15bpw-oracle-compare.log
 uv run mlx_eval.compare \
-  /Users/beam/llm/models/Exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
-  16 /Users/beam/llm/kld-eval/outputs/Qwen3.6-27B \
-  2>&1 | tee /Users/beam/llm/kld-eval/results/Qwen3.6-27B-PonyExl3-4.15bpw-compare.log
+  /path/to/exl3/Qwen3.6-27B-PonyExl3-4.15bpw \
+  16 /path/to/kld-eval/outputs/Qwen3.6-27B \
+  2>&1 | tee results/Qwen3.6-27B-PonyExl3-4.15bpw-compare.log
 ```
 
 Remaining polish after the gate: tile batching across MoE experts per launch;
