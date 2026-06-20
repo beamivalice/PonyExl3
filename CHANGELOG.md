@@ -2,6 +2,35 @@
 
 All notable changes to PonyExl3 are documented here.
 
+## [0.3.0] — 2026-06-21
+
+### Converter — one-command pipeline (`ponyexl3-convert`)
+
+- **End-to-end BF16 → EXL3** — `ponyexl3-convert --in-dir --out-dir --bits` runs quant plan, bundled WikiText-2 calibration, M5b candidate measurement, budget optimization, LDLQ conversion, and HF-standard shard finalize
+- **Resumable stages** — `--resume` (default) continues plan, calibration, measurement, and per-module conversion after interrupts
+- **`ponyexl3-convert-advanced`** — former low-level converter surface (per-module, oracle scales, tile pilots, `--init-quant-config`)
+- **`ponyexl3-convert-e2e`** — deprecated alias to the main CLI
+
+### GPU-residency & throughput
+
+- MLX trellis pack (`pack_trellis_mlx`), MLX-resident LDLQ inner loop, deferred packed buffers
+- Sibling batching (gate/up, q/k/v, linear-attn groups) with uniform sibling K for inference fusion
+- Parallel measurement prep (`--max-workers`), layer reuse across measure→convert, MLX native Hadamard basis path
+
+### Quality gate — Qwen3.6-27B @ 4.15bpw (self-converted)
+
+mlx-eval KLD vs bf16, `4 × 512` windows — same class as [UnstableLlama 4.15bpw](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw); better **ΔPPL** (+0.015 vs +0.169) and **p99** (0.548 vs 0.592), slightly higher mean KLD (0.045 vs 0.040)
+
+### Other
+
+- Bundled offline calibration corpus (`ponyexl3/convert/calibration_data/`)
+- `ponyexl3-optimize-measurements` for measured bit-plan handoff
+- Qwen MTP path fix; incremental multi-shard bundling
+
+### Tests
+
+- `tests/test_convert_measure.py`, expanded CLI/e2e gates — **293** tests pass (13 skipped)
+
 ## [0.2.1] — 2026-06-19
 
 ### Converter (`ponyexl3-convert`)

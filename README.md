@@ -7,9 +7,9 @@
 
 # PonyExl3
 
-v0.2.1 — Now converter can build a quantization plan from BF16 source alone (`--init-quant-config`); bit budget via `--bits` / `--head-bits` / `--layer-bits`. Still beta and need a redesign, our conversion quality is matching the oracles.
+Our new version focuses on the converter, as I promised to land a better one. Now it can convert the HF model weight to EXL3 format with just one command. And it's internally 3.5x faster than the previous version. We successfully converted Qwen3.6-27B at 4.15bpw and the result is competitive with the reference checkpoint.
 
-Known Issue: The converter design could be much faster, that will be coming soon since it's quite a big change.
+v0.3.0 — **One-command converter:** `ponyexl3-convert --in-dir --out-dir --bits` runs the full BF16→EXL3 pipeline (plan, calibration, measured bit allocation, LDLQ, resumable shards). Self-converted **Qwen3.6-27B @ 4.15bpw** matches reference-class quality vs bf16 (better ΔPPL and p99 than the [UnstableLlama](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw) checkpoint at the same bitrate).
 
 ---
 
@@ -82,38 +82,47 @@ fitting far larger models than the 4090's 24 GB.
 
 ### Conversion (HF → EXL3)
 
-Measured on the same M5 Max. The **oracle** is
-[turboderp/MiniCPM5-1B-exl3 · 4.00bpw](https://huggingface.co/turboderp/MiniCPM5-1B-exl3/tree/4.00bpw)
-(exllamav3 reference); **source** is the bf16
-[openbmb/MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) weights. PonyExl3
-output is produced with `ponyexl3-convert-advanced --ldlq-layer --model-modules`
-(`oracle_safe` scales, production metrics).
+**One command** — no oracle checkpoint, no manual stages:
 
-**4.00 bpw quality vs bf16 original** — mlx-eval KLD over `4 × 512` token windows
-(lower KLD / p95 is better):
+```bash
+ponyexl3-convert --in-dir /path/to/Qwen3.6-27B \
+  --out-dir /path/to/Qwen3.6-27B-PonyExl3-4.15bpw --bits 4.15
+```
+
+The pipeline discovers modules from BF16 safetensors, captures calibration (bundled
+WikiText-2 by default), measures candidate K per layer, optimizes under the bit
+budget, and emits a strict-loadable EXL3 bundle. Use `--resume` to continue after
+interrupts. See [Convert a model](#convert-a-model) for flags and the advanced path.
+
+**Qwen3.6-27B @ 4.15bpw — self-converted vs bf16** (mlx-eval KLD, `4 × 512` token
+windows; lower KLD / p95 is better):
 
 | model | KLD | p95 | p99 | ΔPPL | ΔAcc@1 |
 |-------|----:|----:|----:|-----:|-------:|
-| [turboderp oracle](https://huggingface.co/turboderp/MiniCPM5-1B-exl3/tree/4.00bpw) | 0.0428 | 0.145 | 0.316 | +0.243 | +0.0024 |
+| **PonyExl3 4.15bpw** | 0.04514 | 0.08268 | **0.54807** | **+0.01522** | −0.00979 |
+| [UnstableLlama 4.15bpw](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw) | **0.04034** | **0.07886** | 0.59191 | +0.16881 | **−0.00196** |
+
+Same class on mean KLD; PonyExl3 edges **ΔPPL** and **p99** at the cost of a slightly
+higher mean. Inference on both checkpoints runs at ~16.6 tok/s decode on M5 Max (see
+the 27B row above).
+
+**MiniCPM5-1B @ 4.00bpw** (oracle-comparable advanced path vs
+[turboderp](https://huggingface.co/turboderp/MiniCPM5-1B-exl3/tree/4.00bpw)):
+
+| model | KLD | p95 | p99 | ΔPPL | ΔAcc@1 |
+|-------|----:|----:|----:|-----:|-------:|
+| turboderp oracle | 0.0428 | 0.145 | 0.316 | +0.243 | +0.0024 |
 | **PonyExl3 4.00bpw** | **0.0422** | **0.136** | 0.334 | +0.382 | −0.0020 |
 
-PonyExl3-converted matches the official exllamav3 checkpoint on mean KLD and edges it
-on p95; p99 and ΔPPL are in the same ballpark. Inference on both runs at ~152 tok/s
-decode (see the MiniCPM5 row above).
-
-**Converter wall-clock** (`ponyexl3-convert`, Metal search):
+**Converter wall-clock** (M5 Max, Metal search):
 
 | scope | mode | time | notes |
 |-------|------|-----:|-------|
-| `model.layers.0.self_attn.q_proj` | direct | ~0.95 s | fast iteration gate |
-| `model.layers.0.mlp.down_proj` | direct | ~1.8 s | representative layer smoke |
-| `model.layers.0.mlp.down_proj` | LDLQ (exact) | 2.8 s | output rel-RMS `0.0037` vs direct `0.068` |
-| layer 0 (7 modules) | LDLQ | 8.5 s | `--ldlq-feedback-rows 16` |
-| `lm_head` (K6) | LDLQ | ~40 s | production metrics (no oracle dequant) |
-| **MiniCPM5-1B full model** | direct | **428 s (7.1 min)** | 169 EXL3 linears + 50 plain tensors; strict-loadable |
+| **Qwen3.6-27B full model** | one-command LDLQ | overnight | measured K4/K5 mix + K6 `lm_head`; resumable |
+| **MiniCPM5-1B full model** | direct (advanced) | **428 s (7.1 min)** | 169 EXL3 linears + 50 plain tensors |
+| `model.layers.0.mlp.down_proj` | LDLQ (exact) | 2.8 s | representative layer smoke |
 
-Qwen3.6-35B-A3B full-model conversion is experimental (hours overnight); see
-`ponyexl3/convert/DESIGN.md` for scope limits and tuning flags.
+See `ponyexl3/convert/DESIGN.md` for architecture notes and tuning flags.
 
 ---
 
@@ -201,7 +210,7 @@ Engine fidelity via `ponyexl3/reference/compare_trace.py`.
 
 - **Exact EXL3 decode path** — fused Metal GEMV at batch size 1; lowest memory footprint
 - **Full model loader** — Qwen3.5 / Qwen3.6 dense and MoE, Gemma4-26B-A4B MoE, and Llama-layout dense (MiniCPM5) via mlx-lm skeleton + `EXL3Linear` swap
-- **HF → EXL3 converter** — Metal trellis search, Hessian/LDLQ, full-model conversion (`ponyexl3-convert`)
+- **HF → EXL3 converter** — one-command `ponyexl3-convert` (plan → calibrate → measure → optimize → emit); resumable full-model path validated on Qwen3.6-27B @ 4.15bpw
 - **Speculative decoding** — MTP, DFlash, EAGLE-3, and draft-free n-gram lookup (all verify-gated for token-identical greedy output)
 - **Dual implementation + pytest parity** — every MLX primitive has a CPU `ref/` twin
 - **Cross-platform reference** — CUDA-exported `.npz` fixtures for logits and per-layer bisection (`ponyexl3/reference/`)
@@ -256,14 +265,14 @@ No Pony monorepo or `PYTHONPATH` setup is needed. Everything imports as `ponyexl
 
 ### Releases
 
-v0.2.x ships the **Python runtime only** — not model weights. EXL3 checkpoints
+v0.3.x ships the **Python runtime only** — not model weights. EXL3 checkpoints
 live on Hugging Face (or your disk) separately.
 
 | Artifact | Format | How to get it |
 |----------|--------|---------------|
-| Git tag | `v0.2.1` | `git checkout v0.2.1` |
+| Git tag | `v0.3.0` | `git checkout v0.3.0` |
 | GitHub Release | `.tar.gz` / `.zip` source archives | Auto-attached when you publish a [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) from the tag |
-| Python packages | `ponyexl3-0.2.1.tar.gz` (sdist) + `ponyexl3-0.2.1-py3-none-any.whl` | `uv build` locally; optionally upload to PyPI or attach to the GitHub Release |
+| Python packages | `ponyexl3-0.3.0.tar.gz` (sdist) + `ponyexl3-0.3.0-py3-none-any.whl` | `uv build` locally; optionally upload to PyPI or attach to the GitHub Release |
 
 **Install options:**
 
@@ -272,10 +281,10 @@ live on Hugging Face (or your disk) separately.
 pip install -e ".[dev]"
 
 # pinned release from git
-pip install "ponyexl3 @ git+https://github.com/beamivalice/PonyExl3.git@v0.2.1"
+pip install "ponyexl3 @ git+https://github.com/beamivalice/PonyExl3.git@v0.3.0"
 
 # from a built wheel
-pip install ponyexl3-0.2.1-py3-none-any.whl
+pip install ponyexl3-0.3.0-py3-none-any.whl
 ```
 
 A release GitHub Action is **optional** — tag + publish a GitHub Release manually is
@@ -363,11 +372,14 @@ python -m ponyexl3.cli.generate_synthetic_layer
 
 ### Convert a model
 
-**One command.** Point it at a BF16 source, an output dir, and a target bitrate — it
-discovers the model structure, captures calibration, measures a per-layer bit plan,
-and emits a loadable EXL3 bundle:
+**One command.** Point it at a BF16 source, an output dir, and a target bitrate:
 
 ```bash
+# Qwen3.6-27B @ 4.15bpw (primary ship target)
+ponyexl3-convert --in-dir /path/to/Qwen3.6-27B \
+  --out-dir /path/to/Qwen3.6-27B-PonyExl3-4.15bpw --bits 4.15
+
+# MiniCPM5-1B @ 4.00bpw
 ponyexl3-convert --in-dir /path/to/MiniCPM5-1B \
   --out-dir /path/to/MiniCPM5-exl3 --bits 4.0
 ```
@@ -421,7 +433,7 @@ End-to-end tested on Apple Silicon (load, generate, parity tests):
 
 | Model | `model_type` | Notes |
 |-------|--------------|-------|
-| [Qwen3.6-27B dense (4.15bpw)](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw) | `qwen3_5` | Primary ship target (~15 GB RAM) |
+| [Qwen3.6-27B dense (4.15bpw)](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw) | `qwen3_5` | Primary ship target (~15 GB RAM); also self-convertible via `ponyexl3-convert` |
 | [Qwen3.6-27B dense (8.00bpw)](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-8.00bpw) | `qwen3_5` | Near-lossless; decodes at 4.15bpw speed (~27 GB RAM) |
 | [Qwen3.6-35B-A3B MoE](https://huggingface.co/UnstableLlama/Qwen3.6-35B-A3B-exl3-4.00bpw) | `qwen3_5_moe` | `EXL3MoEBlock` / fused expert kernels (~17 GB RAM) |
 | [Qwen3.5-2B](https://huggingface.co/UnstableLlama/Qwen3.5-2B-exl3-4.00bpw) | `qwen3_5` | Dev / fast iteration (dense) |
@@ -455,7 +467,7 @@ any drafter's head/body in w4 — draft-side only, so output bits are unchanged.
 pytest tests/ -q
 ```
 
-**249 tests** run without any model on disk (synthetic layers + CPU/MLX parity + converter gates). Optional integration tests are skipped unless env vars are set:
+**293 tests** run without any model on disk (synthetic layers + CPU/MLX parity + converter gates). Optional integration tests are skipped unless env vars are set:
 
 ```bash
 export PONYEXL3_MODELS_DIR=/path/to/exl3-checkpoints
