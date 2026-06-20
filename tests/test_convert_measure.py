@@ -297,6 +297,34 @@ def test_optimize_measurement_plan_forces_fixed_bits():
     assert all(item["module"] != "lm_head" for item in plan["upgrades"])
 
 
+def test_optimize_measurement_plan_keeps_fusion_siblings_uniform():
+    # q/k/v are a fusion group: only q_proj gains much at K5, so the legacy
+    # per-module greedy upgrades q alone and splits the group. The default
+    # uniform_sibling_k path must keep q/k/v at one K (and spend the freed
+    # budget on the non-sibling o_proj instead) so the fused kernel survives.
+    prefix = "model.layers.0.self_attn."
+    records = []
+    for name, gain in (("q_proj", 0.40), ("k_proj", 0.02), ("v_proj", 0.02)):
+        records.append(_measurement_record(prefix + name, k=4, score=1.00, weight=4096))
+        records.append(_measurement_record(prefix + name, k=5, score=1.00 - gain, weight=4096))
+    records.append(_measurement_record(prefix + "o_proj", k=4, score=1.00, weight=4096))
+    records.append(_measurement_record(prefix + "o_proj", k=5, score=0.90, weight=4096))
+    measurement = {"score_metric": "output_rel_rms", "records": records}
+
+    qkv = [prefix + n for n in ("q_proj", "k_proj", "v_proj")]
+
+    split = measure.optimize_measurement_plan(
+        measurement, target_bpw=4.30, uniform_sibling_k=False
+    )["bit_plan"]
+    assert len({split[m] for m in qkv}) == 2  # legacy greedy splits the group
+
+    uniform = measure.optimize_measurement_plan(
+        measurement, target_bpw=4.30, uniform_sibling_k=True
+    )["bit_plan"]
+    assert len({uniform[m] for m in qkv}) == 1  # siblings stay fusable
+    assert uniform[prefix + "o_proj"] == 5  # budget redirected to the singleton
+
+
 def test_optimize_measurements_cli_json(tmp_path: Path):
     measurement = {
         "score_metric": "output_rel_rms",

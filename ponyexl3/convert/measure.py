@@ -19,6 +19,7 @@ import numpy as np
 from ponyexl3.convert import cancel
 from ponyexl3.convert.calibration import activation_for_module
 from ponyexl3.convert.direct import ScaleMode
+from ponyexl3.convert.driver import _sibling_group_signature
 from ponyexl3.convert.fixtures import SearchBackend
 from ponyexl3.convert.hessian import ldlq_layer_summary, ldlq_quantize_layer
 from ponyexl3.ref.loader import layer_meta_from_config
@@ -146,6 +147,7 @@ def _plan_from_candidates(
     score_metric: str,
     hessian_shrinkage: float | None,
     fixed_bits: Mapping[str, int] | None = None,
+    uniform_sibling_k: bool = True,
 ) -> dict[str, Any]:
     if target_bpw <= 0.0:
         raise ValueError(f"target_bpw must be positive, got {target_bpw}")
@@ -188,51 +190,70 @@ def _plan_from_candidates(
     feasible = spent_weighted_bits <= target_weighted_bits
     upgrades: list[dict[str, Any]] = []
 
+    # Group fusion siblings (q/k/v, gate/up, linear_attn in_proj_qkv/z) so they
+    # upgrade to the same K together — keeping them fusable at inference (as the
+    # official allocation does) instead of letting a per-module greedy split a
+    # group across K4/K5 and lose the fused kernel. Singletons are their own group,
+    # so the un-grouped case (uniform_sibling_k=False) reproduces the per-module greedy.
+    group_members: dict[str, list[str]] = {}
+    group_order: list[str] = []
+    for module in module_order:
+        if module in fixed:
+            continue
+        sig = (_sibling_group_signature(module) or module) if uniform_sibling_k else module
+        if sig not in group_members:
+            group_members[sig] = []
+            group_order.append(sig)
+        group_members[sig].append(module)
+
     while spent_weighted_bits < target_weighted_bits:
-        best_upgrade: tuple[tuple[float, float, int, int, str], _MeasuredCandidate] | None = None
-        for module in module_order:
-            if module in fixed:
-                continue
-            current = selected[module]
-            for candidate in by_module[module].values():
-                if candidate.k <= current.k:
+        best_upgrade: tuple[tuple[float, float, int, int, str], str, int] | None = None
+        for sig in group_order:
+            members = group_members[sig]
+            current_k = selected[members[0]].k  # members share K by construction
+            common_ks: set[int] = set(by_module[members[0]])
+            for member in members[1:]:
+                common_ks &= set(by_module[member])
+            for k in common_ks:
+                if k <= current_k:
                     continue
-                cost = (candidate.k - current.k) * candidate.weight
+                cost = sum((k - selected[m].k) * by_module[m][k].weight for m in members)
                 if cost <= 0 or spent_weighted_bits + cost > target_weighted_bits:
                     continue
-                improvement = (current.score - candidate.score) * candidate.weight
+                improvement = sum(
+                    (selected[m].score - by_module[m][k].score) * by_module[m][k].weight
+                    for m in members
+                )
                 if improvement <= 0.0:
                     continue
                 ratio = improvement / cost
-                key = (
-                    ratio,
-                    improvement,
-                    -cost,
-                    -candidate.k,
-                    module,
-                )
+                key = (ratio, improvement, -cost, -k, sig)
                 if best_upgrade is None or key > best_upgrade[0]:
-                    best_upgrade = (key, candidate)
+                    best_upgrade = (key, sig, k)
         if best_upgrade is None:
             break
-        (_ratio, improvement, cost_neg, _k_neg, module), candidate = best_upgrade
-        previous = selected[module]
-        cost = -cost_neg
-        selected[module] = candidate
-        spent_weighted_bits += cost
-        upgrades.append(
-            {
-                "module": module,
-                "from_k": previous.k,
-                "to_k": candidate.k,
-                "from_score": previous.score,
-                "to_score": candidate.score,
-                "score_improvement": improvement / candidate.weight,
-                "weighted_score_improvement": improvement,
-                "weighted_bit_cost": cost,
-                "hessian_shrinkage": candidate.hessian_shrinkage,
-            }
-        )
+        _key, sig, k = best_upgrade
+        is_group = len(group_members[sig]) > 1
+        for module in group_members[sig]:
+            previous = selected[module]
+            candidate = by_module[module][k]
+            cost = (k - previous.k) * candidate.weight
+            selected[module] = candidate
+            spent_weighted_bits += cost
+            upgrades.append(
+                {
+                    "module": module,
+                    "from_k": previous.k,
+                    "to_k": candidate.k,
+                    "from_score": previous.score,
+                    "to_score": candidate.score,
+                    "score_improvement": previous.score - candidate.score,
+                    "weighted_score_improvement": (previous.score - candidate.score) * candidate.weight,
+                    "weighted_bit_cost": cost,
+                    "hessian_shrinkage": candidate.hessian_shrinkage,
+                    "sibling_group": sig if is_group else None,
+                }
+            )
 
     selected_list = [selected[module] for module in module_order]
     baseline_list = [baseline[module] for module in module_order]
@@ -290,6 +311,7 @@ def optimize_measurement_plan(
     hessian_shrinkage: float | None = None,
     per_module_shrinkage: bool = False,
     fixed_bits: Mapping[str, int] | None = None,
+    uniform_sibling_k: bool = True,
 ) -> dict[str, Any]:
     """Build a budgeted K plan from candidate measurement records."""
 
@@ -302,6 +324,7 @@ def optimize_measurement_plan(
             score_metric=metric,
             hessian_shrinkage=None,
             fixed_bits=fixed_bits,
+            uniform_sibling_k=uniform_sibling_k,
         )
         plan["mode"] = "per_module_shrinkage"
         return plan
@@ -325,6 +348,7 @@ def optimize_measurement_plan(
                 score_metric=metric,
                 hessian_shrinkage=shrinkage,
                 fixed_bits=fixed_bits,
+                uniform_sibling_k=uniform_sibling_k,
             )
         )
     if not global_plans:

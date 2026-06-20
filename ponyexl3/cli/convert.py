@@ -307,6 +307,21 @@ def main() -> int:
         action="store_false",
         help="recompute stages even when artifacts exist",
     )
+    parser.add_argument(
+        "--uniform-sibling-k",
+        dest="uniform_sibling_k",
+        action="store_true",
+        default=True,
+        help="give fusion siblings (q/k/v, gate/up, in_proj_qkv/z) the same K so "
+        "they stay fusable at inference, matching the official allocation (default)",
+    )
+    parser.add_argument(
+        "--no-uniform-sibling-k",
+        dest="uniform_sibling_k",
+        action="store_false",
+        help="allow the bit allocator to split fusion siblings across K (legacy "
+        "per-module greedy; sacrifices the fused kernel)",
+    )
     parser.add_argument("--json", action="store_true", help="print final JSON summary")
     args = parser.parse_args()
 
@@ -484,6 +499,7 @@ def main() -> int:
             target_bpw=args.bits,
             score_metric=args.measure_score,
             fixed_bits={"lm_head": args.head_bits},
+            uniform_sibling_k=args.uniform_sibling_k,
         )
         _write_json_atomic(measurement_plan_path, measurement_plan)
         _stage(
