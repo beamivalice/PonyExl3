@@ -621,15 +621,26 @@ def load_model(
     moe_consumed = _build_moe_experts(model, storage, weights, verbose)
     if moe_consumed:
         mx.clear_cache()
+    skipped_unmapped: list[str] = []
     for key, info in sorted(storage.items()):
         if _is_routed_expert_key(key) or key in moe_consumed:
             continue
         layer = _build_exl3_layer(key, info, weights)
-        _set_module(
-            model,
-            _module_path(key, language_model_wrapper=language_model_wrapper),
-            EXL3Linear(layer),
-        )
+        try:
+            _set_module(
+                model,
+                _module_path(key, language_model_wrapper=language_model_wrapper),
+                EXL3Linear(layer),
+            )
+        except AttributeError:
+            # No slot for this module in the model architecture — e.g. a separate
+            # multi-token-prediction head bundled by an over-eager convert. Skip
+            # it (the base model still loads) and report it rather than crash.
+            skipped_unmapped.append(key)
+            for sfx in _EXL3_SUFFIXES:
+                weights.pop(f"{key}.{sfx}", None)
+            mx.clear_cache()
+            continue
         for sfx in _EXL3_SUFFIXES:
             weights.pop(f"{key}.{sfx}", None)
         # release the just-consumed source buffer every layer so it never
@@ -637,6 +648,12 @@ def load_model(
         mx.clear_cache()
         if verbose:
             print(f"  exl3  {key}  {layer.in_features}x{layer.out_features} k={layer.k}")
+    if skipped_unmapped:
+        print(
+            f"  [load] skipped {len(skipped_unmapped)} EXL3 module(s) with no "
+            f"architecture slot (e.g. {skipped_unmapped[0]})",
+            file=sys.stderr,
+        )
     mx.clear_cache()
 
     # 2) Everything that is not an EXL3 tensor loads as a plain weight.

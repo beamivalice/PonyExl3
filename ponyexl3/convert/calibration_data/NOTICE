@@ -1,0 +1,23 @@
+Default calibration corpus: WikiText-2 (raw)
+============================================
+
+`wikitext2.txt` in this directory is a ~900 KB excerpt of the WikiText-2 (raw)
+dataset. PonyExl3 uses it as the default activation-calibration corpus for the
+one-command `ponyexl3-convert` pipeline, so a conversion works offline without
+the user supplying their own text.
+
+Source : Salesforce/wikitext, configuration `wikitext-2-raw-v1`
+         (https://huggingface.co/datasets/Salesforce/wikitext), derived from
+         Wikipedia.
+Dataset : Merity, Xiong, Bradbury, Socher, "Pointer Sentinel Mixture Models"
+         (2016), arXiv:1609.07843.
+License : Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0)
+         https://creativecommons.org/licenses/by-sa/3.0/
+
+Modification: a contiguous subset of the `train` split was concatenated into a
+single UTF-8 text file; no content was otherwise altered. This excerpt is
+redistributed under CC BY-SA 3.0. The rest of PonyExl3 is licensed separately
+(see the repository LICENSE); this file's license applies only to this corpus.
+
+To calibrate on your own (e.g. domain-specific) text instead, pass
+`--calibration-text <file>`.

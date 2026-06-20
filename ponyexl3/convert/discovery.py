@@ -81,6 +81,14 @@ def _meta_shape(dtype: str, shape: tuple[int, ...]) -> dict[str, Any]:
     }
 
 
+def _is_excluded_key(tensor_key: str) -> bool:
+    """Heads the EXL3 base bundle omits — converted/used separately, not part of
+    the model the runtime loads. Notably Qwen3.6's multi-token-prediction (``mtp``)
+    draft head, which the official oracle also excludes and which the inference
+    architecture has no slot for."""
+    return "mtp" in tensor_key.split(".")
+
+
 def discover_exl3_module_keys(
     source_dir: str | Path,
     *,
@@ -92,6 +100,8 @@ def discover_exl3_module_keys(
     keys: set[str] = set()
     for tensor_key in index.weight_map:
         if not tensor_key.endswith(".weight"):
+            continue
+        if _is_excluded_key(tensor_key):
             continue
         module_key = tensor_key[: -len(".weight")]
         if not include_routed_experts and ".experts." in module_key:
@@ -112,17 +122,22 @@ def discover_plain_tensor_keys(
     source_dir: str | Path,
     exl3_module_keys: list[str],
 ) -> list[str]:
-    """Non-EXL3 tensors to copy verbatim (embeddings, norms, etc.)."""
+    """Non-EXL3 source tensors to copy verbatim.
+
+    Everything except the weight matrices replaced by EXL3 trellises: embeddings,
+    norms, biases, and non-``.weight`` parameters like the GatedDeltaNet SSM
+    ``A_log`` / ``dt_bias`` (Qwen3.6 ``linear_attn``). The earlier ``.weight``-only
+    filter silently dropped those, leaving the bundle unloadable.
+    """
 
     index = SafetensorIndex(source_dir)
-    exl3 = set(exl3_module_keys)
+    exl3_weights = {f"{key}.weight" for key in exl3_module_keys}
     plain: list[str] = []
     for tensor_key in sorted(index.weight_map, key=_natural_key):
-        if not tensor_key.endswith(".weight"):
-            continue
-        storage_key = tensor_key[: -len(".weight")]
-        if storage_key in exl3:
-            continue
+        if tensor_key in exl3_weights:
+            continue  # quantized linear weight -> replaced by trellis/suh/svh
+        if _is_excluded_key(tensor_key):
+            continue  # separate head (e.g. mtp) not part of the base model
         plain.append(tensor_key)
     return plain
 

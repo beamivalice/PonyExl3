@@ -14,6 +14,18 @@ import numpy as np
 CaptureDType = Literal["float16", "float32"]
 
 
+def default_calibration_text() -> Path:
+    """Path to the bundled default calibration corpus (a WikiText-2 excerpt).
+
+    Lets the one-command convert pipeline run offline when the user doesn't
+    supply ``--calibration-text``. See the NOTICE in
+    ``ponyexl3/convert/calibration_data/`` for source and licensing (CC BY-SA).
+    """
+    from importlib.resources import files
+
+    return Path(str(files("ponyexl3.convert") / "calibration_data" / "wikitext2.txt"))
+
+
 @dataclass(frozen=True)
 class CalibrationCaptureSummary:
     """JSON-friendly summary for a calibration capture run."""

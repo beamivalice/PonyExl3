@@ -86,7 +86,7 @@ Measured on the same M5 Max. The **oracle** is
 [turboderp/MiniCPM5-1B-exl3 · 4.00bpw](https://huggingface.co/turboderp/MiniCPM5-1B-exl3/tree/4.00bpw)
 (exllamav3 reference); **source** is the bf16
 [openbmb/MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B) weights. PonyExl3
-output is produced with `ponyexl3-convert --direct-layer --model-modules`
+output is produced with `ponyexl3-convert-advanced --ldlq-layer --model-modules`
 (`oracle_safe` scales, production metrics).
 
 **4.00 bpw quality vs bf16 original** — mlx-eval KLD over `4 × 512` token windows
@@ -342,7 +342,8 @@ Installed by `pip install -e .`:
 |---------|---------|
 | `ponyexl3-generate` | End-to-end text generation |
 | `ponyexl3-generate-bench` | Prefill/decode throughput sweep (1k–32k context, 128 gen) |
-| `ponyexl3-convert` | HF → EXL3 conversion; `--init-quant-config` builds plan from BF16 source |
+| `ponyexl3-convert` | One-command HF → EXL3 conversion: `--in-dir --out-dir --bits` (auto calibration, resumable) |
+| `ponyexl3-convert-advanced` | Low-level converter: per-layer/-module, scale modes, `--init-quant-config`, tile pilots |
 | `ponyexl3-compare-layer` | Per-layer correctness ladder (probe → tile → slice → forward) |
 | `ponyexl3-compare-engines` | End-to-end engine agreement + logit drift report |
 
@@ -362,33 +363,35 @@ python -m ponyexl3.cli.generate_synthetic_layer
 
 ### Convert a model
 
-**Apple Silicon-first (no turboderp oracle):** generate a quantization plan from BF16
-source, then convert with computed scales:
+**One command.** Point it at a BF16 source, an output dir, and a target bitrate — it
+discovers the model structure, captures calibration, measures a per-layer bit plan,
+and emits a loadable EXL3 bundle:
 
 ```bash
-# step 1: write quantization_config.json + HF assets from source alone
 ponyexl3-convert --in-dir /path/to/MiniCPM5-1B \
-  --out-dir /path/to/MiniCPM5-plan --init-quant-config
-
-# step 2: quantize weights (plan dir is --oracle-dir; use computed scales)
-ponyexl3-convert --in-dir /path/to/MiniCPM5-1B \
-  --oracle-dir /path/to/MiniCPM5-plan \
-  --out-dir /path/to/MiniCPM5-exl3 \
-  --direct-layer --model-modules --scale-mode computed
+  --out-dir /path/to/MiniCPM5-exl3 --bits 4.0
 ```
 
-**With a turboderp oracle** (oracle-safe scales, comparable to reference checkpoints):
+Calibration defaults to a small **bundled WikiText-2 excerpt** (CC BY-SA — see the
+NOTICE under `ponyexl3/convert/calibration_data/`), so it works offline with no extra
+downloads. Useful flags:
+
+- `--calibration-text my_corpus.txt` — calibrate on your own (e.g. domain-specific) text
+- `--max-workers N` — overlap each module's CPU prep with another's GPU search (default 2)
+- `--resume` — continue an interrupted conversion (re-uses captured calibration + measured layers)
+
+**Advanced / manual** — `ponyexl3-convert-advanced` exposes the low-level pieces
+(per-layer/-module conversion, scale modes, tile pilots, plan generation):
 
 ```bash
-# one module smoke (direct quant, oracle-safe scales)
-ponyexl3-convert --in-dir /path/to/MiniCPM5-1B \
-  --oracle-dir /path/to/MiniCPM5-1B-exl3-4.00bpw \
-  --direct-layer --only-module model.layers.0.mlp.down_proj
+# build a quantization_config.json + HF assets from BF16 source alone
+ponyexl3-convert-advanced --in-dir /path/to/MiniCPM5-1B \
+  --out-dir /path/to/MiniCPM5-plan --init-quant-config
 
-# full model (direct path, ~7 min for MiniCPM5-1B on M5 Max)
-ponyexl3-convert --in-dir /path/to/MiniCPM5-1B \
+# quantize against a turboderp oracle with oracle-safe scales (reference-comparable)
+ponyexl3-convert-advanced --in-dir /path/to/MiniCPM5-1B \
   --oracle-dir /path/to/MiniCPM5-1B-exl3-4.00bpw \
-  --out-dir /path/to/out --direct-layer --model-modules
+  --out-dir /path/to/out --ldlq-layer --model-modules --scale-mode oracle_safe
 ```
 
 See `ponyexl3/convert/DESIGN.md` for LDLQ, allocation, KLD gates, and Metal search details.

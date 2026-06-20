@@ -103,7 +103,7 @@ def test_cli_auto_source_plan_uses_requested_four_bits(tmp_path: Path):
         [
             sys.executable,
             "-m",
-            "ponyexl3.cli.convert",
+            "ponyexl3.cli.convert_advanced",
             "--in-dir",
             str(source),
             "--work-dir",

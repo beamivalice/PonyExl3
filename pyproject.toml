@@ -61,12 +61,16 @@ ponyexl3-generate-bench = "ponyexl3.cli.generate_bench:main"
 ponyexl3-compare-layer = "ponyexl3.cli.compare_layer:main"
 ponyexl3-compare-engines = "ponyexl3.cli.compare_engines:main"
 ponyexl3-convert = "ponyexl3.cli.convert:main"
+ponyexl3-convert-advanced = "ponyexl3.cli.convert_advanced:main"
 ponyexl3-convert-e2e = "ponyexl3.cli.convert_e2e:main"
 ponyexl3-optimize-measurements = "ponyexl3.cli.optimize_measurements:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ponyexl3*"]
+
+[tool.setuptools.package-data]
+"ponyexl3.convert" = ["calibration_data/*.txt", "calibration_data/NOTICE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

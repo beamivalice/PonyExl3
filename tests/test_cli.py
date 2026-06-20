@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from ponyexl3.cli._generate_common import build_prefill_prompt_ids, resolve_prompt_file
-from ponyexl3.cli.convert import _load_measurement_plan, _parse_layer_bit_overrides
-from ponyexl3.cli.convert_e2e import _default_candidate_bits
+from ponyexl3.cli.convert_advanced import _load_measurement_plan, _parse_layer_bit_overrides
+from ponyexl3.cli.convert import _default_candidate_bits
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,7 +70,7 @@ def test_convert_oracle_metrics_requires_full_layer_metrics():
         [
             sys.executable,
             "-m",
-            "ponyexl3.cli.convert",
+            "ponyexl3.cli.convert_advanced",
             "--in-dir",
             "/tmp",
             "--oracle-dir",
@@ -91,7 +91,7 @@ def test_convert_rejects_invalid_hessian_shrinkage():
         [
             sys.executable,
             "-m",
-            "ponyexl3.cli.convert",
+            "ponyexl3.cli.convert_advanced",
             "--in-dir",
             "/tmp",
             "--oracle-dir",
@@ -113,7 +113,7 @@ def test_convert_measure_candidates_requires_ldlq_layer():
         [
             sys.executable,
             "-m",
-            "ponyexl3.cli.convert",
+            "ponyexl3.cli.convert_advanced",
             "--in-dir",
             "/tmp",
             "--oracle-dir",
@@ -134,7 +134,7 @@ def test_convert_rejects_invalid_candidate_bits():
         [
             sys.executable,
             "-m",
-            "ponyexl3.cli.convert",
+            "ponyexl3.cli.convert_advanced",
             "--in-dir",
             "/tmp",
             "--oracle-dir",
@@ -182,7 +182,7 @@ def test_convert_measurement_plan_conflicts_with_measure_mode():
         [
             sys.executable,
             "-m",
-            "ponyexl3.cli.convert",
+            "ponyexl3.cli.convert_advanced",
             "--in-dir",
             "/tmp",
             "--oracle-dir",
