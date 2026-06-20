@@ -17,6 +17,7 @@ from ponyexl3.convert.capture import (
     capture_calibration_activations,
     default_calibration_text,
 )
+from ponyexl3.convert.direct import finalize_bundle
 from ponyexl3.convert.discovery import write_quantization_plan
 from ponyexl3.convert.driver import (
     convert_module_set,
@@ -279,6 +280,18 @@ def main() -> int:
             "Use 1 for the plain sequential path."
         ),
     )
+    parser.add_argument(
+        "--no-finalize",
+        action="store_true",
+        help="keep the per-layer ponyexl3-layer-*.safetensors shards instead of "
+        "repacking them into HF-standard model-NNNNN-of-MMMMM files",
+    )
+    parser.add_argument(
+        "--shard-size-gb",
+        type=float,
+        default=5.0,
+        help="max shard size (GB) when repacking into HF-standard shards (default 5)",
+    )
     parser.add_argument("--module-limit", type=int, help="limit selected modules for smoke runs")
     parser.add_argument("--include-routed-experts", action="store_true")
     parser.add_argument(
@@ -507,7 +520,20 @@ def main() -> int:
             progress=None if args.json else _convert_progress,
         )
         reuse_stats = reuse.disable()
+        finalized_shards: list[str] = []
+        if not args.no_finalize:
+            finalized_shards = finalize_bundle(
+                args.out_dir, max_shard_bytes=int(args.shard_size_gb * 1024**3)
+            )
+            _stage(state_path, "finalize", {"shards": len(finalized_shards)})
+            if not args.json:
+                print(
+                    f"[e2e] repacked into {len(finalized_shards)} HF-standard shard(s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
         conversion_summary = module_set_summary(result)
+        conversion_summary["shards"] = finalized_shards
         conversion_summary["layer_reuse"] = reuse_stats
         conversion_summary["pre_skipped"] = pre_skipped
         conversion_summary["measurement_plan"] = str(measurement_plan_path)

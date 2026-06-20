@@ -936,6 +936,105 @@ def write_exl3_incremental_bundle(
     return loaded
 
 
+def _safetensors_tensor_sizes(path: Path) -> dict[str, int]:
+    """Per-tensor byte size from a safetensors header (no data load)."""
+    import struct
+
+    with open(path, "rb") as handle:
+        header_len = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(header_len))
+    sizes: dict[str, int] = {}
+    for key, meta in header.items():
+        if key == "__metadata__" or not isinstance(meta, dict):
+            continue
+        start, end = meta["data_offsets"]
+        sizes[key] = int(end) - int(start)
+    return sizes
+
+
+def finalize_bundle(
+    out_dir: str | Path,
+    *,
+    max_shard_bytes: int = 5 * 1024**3,
+    shard_prefix: str = "model",
+) -> list[str]:
+    """Consolidate per-layer shards into HF-standard ``model-NNNNN-of-MMMMM`` files.
+
+    The incremental writer emits one small ``ponyexl3-layer-<hash>`` shard per
+    layer (stable names so resume can overwrite) — convenient mid-run, but it
+    leaves hundreds of tiny, oddly-named files. This repacks them into a few
+    size-bounded shards under the conventional naming + index that HF tooling and
+    users expect. Only the safetensors shards + index change; the tensor-keyed
+    ``quantization_config.json`` is untouched, so loading is unaffected.
+    """
+    import re
+
+    from safetensors import safe_open
+
+    out = Path(out_dir)
+    index_path = out / "model.safetensors.index.json"
+    index = _load_json_object(index_path, {"metadata": {"total_size": 0}, "weight_map": {}})
+    weight_map = {str(k): str(v) for k, v in dict(index.get("weight_map", {})).items()}
+    if not weight_map:
+        return []
+
+    old_shards = sorted(set(weight_map.values()))
+    sizes: dict[str, int] = {}
+    for shard in old_shards:
+        sizes.update(_safetensors_tensor_sizes(out / shard))
+
+    def _nat(key: str) -> list[Any]:
+        return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", key)]
+
+    keys = sorted(weight_map, key=_nat)
+
+    # Bin-pack tensors into size-bounded shards (an oversized single tensor gets
+    # its own shard, matching HF behaviour).
+    plan: list[list[str]] = [[]]
+    current = 0
+    for key in keys:
+        size = sizes.get(key, 0)
+        if plan[-1] and current + size > max_shard_bytes:
+            plan.append([])
+            current = 0
+        plan[-1].append(key)
+        current += size
+    total_shards = len(plan)
+
+    new_weight_map: dict[str, str] = {}
+    new_names: list[str] = []
+    for shard_index, shard_keys in enumerate(plan, start=1):
+        name = f"{shard_prefix}-{shard_index:05d}-of-{total_shards:05d}.safetensors"
+        new_names.append(name)
+        by_old: dict[str, list[str]] = {}
+        for key in shard_keys:
+            by_old.setdefault(weight_map[key], []).append(key)
+        tensors: dict[str, np.ndarray] = {}
+        for old_shard, member_keys in by_old.items():
+            with safe_open(str(out / old_shard), framework="numpy") as handle:
+                for key in member_keys:
+                    tensors[key] = handle.get_tensor(key)
+        _save_safetensors_atomic(tensors, out / name)
+        for key in shard_keys:
+            new_weight_map[key] = name
+        del tensors
+
+    # Swap the index to the new shards atomically *before* removing the old
+    # ones, so an interrupt mid-finalize leaves either the original bundle (index
+    # still points at the intact old shards) or the new one — never a dangling
+    # index referencing deleted files.
+    index["weight_map"] = new_weight_map
+    index["metadata"] = {"total_size": _refresh_total_size(out, new_weight_map)}
+    _write_json_atomic(index_path, index)
+    _clear_loader_index_cache(out)
+
+    new_set = set(new_names)
+    for old_shard in old_shards:
+        if old_shard not in new_set:
+            (out / old_shard).unlink(missing_ok=True)
+    return new_names
+
+
 def write_exl3_layers_bundle(
     layers: Sequence[EXL3Layer],
     out_dir: str | Path,
