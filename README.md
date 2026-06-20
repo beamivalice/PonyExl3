@@ -7,9 +7,9 @@
 
 # PonyExl3
 
-Our new version focuses on the converter, as I promised to land a better one. Now it can convert the HF model weight to EXL3 format with just one command. And it's internally 3.5x faster than the previous version. We successfully converted Qwen3.6-27B at 4.15bpw and the result is competitive with the reference checkpoint.
+Our new version focuses on the converter, as I promised to land a better one. Now it can convert the HF model weight to EXL3 format with just one command. And it's internally 3.5x faster than the previous version. We successfully converted Qwen3.6-27B at 4.15bpw and the result is competitive with the reference model.
 
-v0.3.0 — **One-command converter:** `ponyexl3-convert --in-dir --out-dir --bits` runs the full BF16→EXL3 pipeline (plan, calibration, measured bit allocation, LDLQ, resumable shards). Self-converted **Qwen3.6-27B @ 4.15bpw** matches reference-class quality vs bf16 (better ΔPPL and p99 than the [UnstableLlama](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw) checkpoint at the same bitrate).
+v0.3.0 — End to End Converter: `ponyexl3-convert --in-dir --out-dir --bits` runs the full BF16→EXL3 pipeline (plan, calibration, measured bit allocation, LDLQ, resumable shards). Self-converted Qwen3.6-27B @ 4.15bpw matches reference-class quality vs bf16 (worse mean KLD but better ΔPPL and p99 than the [UnstableLlama](https://huggingface.co/UnstableLlama/Qwen3.6-27B-exl3-4.15bpw) checkpoint at the same bitrate).
 
 ---
 
