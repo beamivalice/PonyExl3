@@ -66,6 +66,19 @@ def test_discover_exl3_module_keys_excludes_embeddings(tmp_path: Path):
     assert keys == ["model.layers.0.self_attn.q_proj"]
 
 
+def test_discover_exl3_module_keys_includes_deepseek_head(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_linear_source(source, "head", in_features=128, out_features=256)
+    _write_linear_source(source, "model.layers.0.self_attn.q_proj")
+
+    keys = discover_exl3_module_keys(source)
+    assert keys == ["head", "model.layers.0.self_attn.q_proj"]
+    cfg = generate_quantization_config(source, bits=4.0, head_bits=4)
+    assert int(cfg["tensor_storage"]["head"]["bits_per_weight"]) == 4
+    assert int(cfg["head_bits"]) == 4
+
+
 def test_write_quantization_plan_is_plan_only(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()

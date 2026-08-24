@@ -91,6 +91,7 @@ def test_default_module_priority_prefers_output_sensitive_modules():
     assert default_module_priority("lm_head") > default_module_priority(
         "model.layers.0.mlp.down_proj"
     )
+    assert default_module_priority("head") == default_module_priority("lm_head")
     assert default_module_priority("model.layers.0.self_attn.o_proj") > (
         default_module_priority("model.layers.0.mlp.up_proj")
     )

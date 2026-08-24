@@ -100,6 +100,21 @@ def test_model_module_keys_puts_lm_head_last(tmp_path: Path):
     ]
 
 
+def test_model_module_keys_puts_deepseek_head_last(tmp_path: Path):
+    oracle_dir = tmp_path / "oracle"
+    oracle_dir.mkdir()
+    layers = [
+        _layer("head"),
+        _layer("layers.0.attn.wq_a"),
+    ]
+    write_exl3_layers_bundle(layers, oracle_dir)
+
+    assert model_module_keys(oracle_dir) == [
+        "layers.0.attn.wq_a",
+        "head",
+    ]
+
+
 def test_module_set_resume_loads_existing_layer(tmp_path: Path):
     out_dir = tmp_path / "out"
     layer = _layer("model.language_model.layers.0.linear_attn.in_proj_qkv")

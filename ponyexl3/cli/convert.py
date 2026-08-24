@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from ponyexl3.convert import reuse
+from ponyexl3.convert.heads import is_output_head
 from ponyexl3.convert.calibration import load_calibration_activations_map
 from ponyexl3.convert.capture import (
     capture_calibration_activations,
@@ -352,7 +353,7 @@ def main() -> int:
             default=_default_candidate_bits(args.bits, args.head_bits),
         )
         shrinkages = _parse_csv_floats(args.candidate_hessian_shrinkages)
-        candidate_bits_by_module = {"lm_head": [args.head_bits]}
+        candidate_bits_by_module = {"lm_head": [args.head_bits], "head": [args.head_bits]}
         request = {
             "in_dir": str(args.in_dir),
             "out_dir": str(args.out_dir),
@@ -419,6 +420,7 @@ def main() -> int:
         )
         if not module_keys:
             raise ValueError("no supported modules selected for end-to-end conversion")
+        candidate_bits_by_module = {key: [args.head_bits] for key in module_keys if is_output_head(key)}
 
         if args.resume and calibration_path.is_file():
             if not args.json:
@@ -498,7 +500,7 @@ def main() -> int:
             measurement,
             target_bpw=args.bits,
             score_metric=args.measure_score,
-            fixed_bits={"lm_head": args.head_bits},
+            fixed_bits={key: args.head_bits for key in module_keys if is_output_head(key)},
             uniform_sibling_k=args.uniform_sibling_k,
         )
         _write_json_atomic(measurement_plan_path, measurement_plan)

@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from ponyexl3.convert.heads import is_output_head
 from ponyexl3.convert.measure import optimize_measurement_plan
 
 
@@ -83,13 +84,26 @@ def main() -> int:
         if args.head_bits is not None and not 1 <= args.head_bits <= 8:
             raise ValueError("--head-bits must be in [1, 8]")
         measurement = _load_measurement(args.measurement)
+        fixed_bits = None
+        if args.head_bits is not None:
+            records = measurement.get("records")
+            modules: list[str] = []
+            if isinstance(records, list):
+                modules = [
+                    str(record.get("module"))
+                    for record in records
+                    if isinstance(record, dict) and record.get("module")
+                ]
+            fixed_bits = {key: args.head_bits for key in modules if is_output_head(key)}
+            if not fixed_bits:
+                fixed_bits = {"lm_head": args.head_bits, "head": args.head_bits}
         plan = optimize_measurement_plan(
             measurement,
             target_bpw=args.bits,
             score_metric=args.score,
             hessian_shrinkage=args.hessian_shrinkage,
             per_module_shrinkage=bool(args.per_module_shrinkage),
-            fixed_bits=None if args.head_bits is None else {"lm_head": args.head_bits},
+            fixed_bits=fixed_bits,
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

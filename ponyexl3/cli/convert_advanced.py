@@ -654,8 +654,29 @@ def main() -> int:
         default=0,
         help="seed for computed-scale sign flips",
     )
+    parser.add_argument(
+        "--quant-bits",
+        type=int,
+        help="override EXL3 K for --only-module layer conversion (default: oracle/plan K)",
+    )
+    parser.add_argument(
+        "--replace-into",
+        type=Path,
+        help=(
+            "clone this existing EXL3 checkpoint into --out-dir (hardlinking "
+            "weight shards) and replace the converted module(s) in-place"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="print JSON only")
     args = parser.parse_args()
+
+    if args.quant_bits is not None and not 1 <= args.quant_bits <= 8:
+        raise SystemExit("--quant-bits must be in [1, 8]")
+    if args.replace_into is not None:
+        if args.out_dir is None:
+            raise SystemExit("--replace-into requires --out-dir")
+        if not (args.direct_layer or args.ldlq_layer):
+            raise SystemExit("--replace-into requires --direct-layer or --ldlq-layer")
 
     if args.init_quant_config:
         if args.out_dir is None:
@@ -1216,6 +1237,7 @@ def main() -> int:
                     calibration_activations=calibration_activations,
                     skip_g_scale=bool(args.skip_g_scale),
                     regularization_seed=args.regularization_seed,
+                    quant_bits=args.quant_bits,
                 )
                 summary = ldlq_layer_summary(result)
             else:
@@ -1228,6 +1250,7 @@ def main() -> int:
                     calibration_activations=calibration_activations,
                     skip_g_scale=bool(args.skip_g_scale),
                     regularization_seed=args.regularization_seed,
+                    quant_bits=args.quant_bits,
                 )
                 summary = direct_layer_summary(result)
             summary["requested"] = {
@@ -1256,7 +1279,24 @@ def main() -> int:
                 "skip_g_scale": bool(args.skip_g_scale),
                 "regularization_seed": args.regularization_seed,
             }
-            if args.out_dir is not None:
+            if args.replace_into is not None:
+                from ponyexl3.convert.replace import replace_layers_into_checkpoint
+
+                replaced = replace_layers_into_checkpoint(
+                    args.replace_into,
+                    args.out_dir,
+                    [result.layer],
+                    bits=args.bits,
+                    head_bits=args.head_bits,
+                )
+                summary["replaced"] = replaced
+                summary["emitted"] = {
+                    "out_dir": str(args.out_dir),
+                    "loaded_shape": [result.layer.in_features, result.layer.out_features],
+                    "trellis_shape": [int(x) for x in result.layer.trellis.shape],
+                    "replace_into": str(args.replace_into),
+                }
+            elif args.out_dir is not None:
                 loaded = write_direct_layer_bundle(result, args.out_dir)
                 summary["emitted"] = {
                     "out_dir": str(args.out_dir),

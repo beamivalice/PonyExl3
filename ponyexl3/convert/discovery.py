@@ -14,6 +14,7 @@ from ponyexl3.convert.allocation import (
 )
 from ponyexl3.convert.driver import bit_plan_from_allocations
 from ponyexl3.convert.fixtures import SafetensorIndex, resolve_source_linear
+from ponyexl3.convert.heads import is_output_head
 from ponyexl3.ref.hadamard import HAD_DIM
 
 _MODEL_ASSET_NAMES = (
@@ -33,7 +34,7 @@ _NATURAL_SPLIT = re.compile(r"(\d+)")
 def _is_exl3_linear_key(module_key: str) -> bool:
     """Heuristic: quantize attention/MLP projections and lm_head, not embeddings."""
 
-    if module_key == "lm_head":
+    if is_output_head(module_key):
         return True
     if ".embed_" in module_key:
         return False
@@ -166,7 +167,7 @@ def default_bit_plan(
     weights = module_weight_map_from_source(source_dir, module_keys)
     priorities = {key: default_module_priority(key) for key in module_keys}
     forced: dict[str, int] = {}
-    forced.update({key: int(head_bits) for key in module_keys if key == "lm_head"})
+    forced.update({key: int(head_bits) for key in module_keys if is_output_head(key)})
     forced.update({key: int(bits) for key, bits in (bit_overrides or {}).items()})
     allocation = allocate_priority_bits(
         module_keys,

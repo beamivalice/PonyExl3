@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import math
 from typing import Sequence
 
+from ponyexl3.convert.heads import is_output_head
+
 
 @dataclass(frozen=True)
 class ModuleAllocation:
@@ -102,7 +104,7 @@ def allocation_summary(allocations: Sequence[ModuleAllocation]) -> dict[str, flo
 def default_module_priority(key: str) -> float:
     """Cheap M5a quality priority used before measured proxy deltas exist."""
 
-    if key == "lm_head" or key.endswith(".lm_head"):
+    if is_output_head(key):
         return 100.0
     if ".self_attn.o_proj" in key or ".attention.o_proj" in key:
         return 80.0

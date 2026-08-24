@@ -65,6 +65,50 @@ def test_convert_layer_bit_override_parser():
         _parse_layer_bit_overrides(["nope:5"], modules)
 
 
+def test_convert_replace_into_requires_out_dir():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ponyexl3.cli.convert_advanced",
+            "--in-dir",
+            "/tmp",
+            "--oracle-dir",
+            "/tmp",
+            "--ldlq-layer",
+            "--replace-into",
+            "/tmp",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "--replace-into requires --out-dir" in proc.stderr
+
+
+def test_convert_quant_bits_must_be_in_range():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ponyexl3.cli.convert_advanced",
+            "--in-dir",
+            "/tmp",
+            "--oracle-dir",
+            "/tmp",
+            "--ldlq-layer",
+            "--quant-bits",
+            "9",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "--quant-bits must be in [1, 8]" in proc.stderr
+
+
 def test_convert_oracle_metrics_requires_full_layer_metrics():
     proc = subprocess.run(
         [

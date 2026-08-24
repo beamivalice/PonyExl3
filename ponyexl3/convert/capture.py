@@ -93,6 +93,8 @@ class _ActivationCollector:
 def _candidate_mlx_paths(module_key: str) -> list[str]:
     if module_key == "lm_head":
         return ["language_model.lm_head", "lm_head"]
+    if module_key == "head":
+        return ["head", "lm_head", "language_model.lm_head"]
     paths = [module_key]
     if module_key.startswith("model.language_model."):
         suffix = module_key.removeprefix("model.language_model.")
@@ -232,6 +234,8 @@ def capture_calibration_activations(
             hidden = text_model(input_ids)
             if "lm_head" in collector.counts:
                 collector.add("lm_head", hidden)
+            if "head" in collector.counts:
+                collector.add("head", hidden)
             collector.flush(hidden)
             seqs_run += 1
             mx.clear_cache()

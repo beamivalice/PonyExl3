@@ -25,13 +25,15 @@ PonyExl3 ports the [ExLlamaV3 EXL3](https://github.com/turboderp-org/exllamav3) 
 ## Performance
 
 Decode throughput in tok/s — greedy, and **verify-gated** so every speculative mode
-emits output token-identical to plain greedy. Measured on an Apple M5 Max (128 GB) and
-a 32 GB M1 Max, same EXL3 checkpoints ([UnstableLlama](https://huggingface.co/UnstableLlama)).
+emits output token-identical to plain greedy. Measured on Apple Silicon (M5 Max 128 GB,
+M3 Max 48 GB community report, M1 Max 32 GB), same EXL3 checkpoints
+([UnstableLlama](https://huggingface.co/UnstableLlama)).
 **Bold** = fastest in that row.
 
 | Model | Hardware | plain | EAGLE-3 | MTP | DFlash | prefill (8k) | resident |
 |-------|----------|------:|--------:|----:|-------:|-------------:|---------:|
 | **Qwen3.6-27B · 4.15bpw** | M5 Max | 16.6 | 24.2 | 28.3 | **37.8** | 662 | 15.1 GB |
+|  | M3 Max ([#2](https://github.com/beamivalice/PonyExl3/issues/2)) | 11.3 | — | 11.3 | **13.8** | — | 15.1 GB |
 |  | M1 Max | 4.0 | — | 8.7 | **15.0** | 126 | 15.1 GB |
 | **Qwen3.6-35B-A3B · 4.00bpw** | M5 Max | 68.5 | **79.8** | — | — | 2775 | 17.2 GB |
 |  | M1 Max | 23.5 | ~flat | — | — | 497 | 17.2 GB |
@@ -48,6 +50,14 @@ pays off *more* on the slower GPU for the dense model — DFlash is **3.75×** o
 Draft-free n-gram lookup is workload-dependent (+16% on code edits, ~neutral on novel
 text), so it's not tabled. Reproduce with `ponyexl3-generate-bench` or
 `tools/bench/perf_chart_bench.py`; accuracy is [below](#accuracy).
+
+**M3 Max community datapoint** ([#2](https://github.com/beamivalice/PonyExl3/issues/2)):
+MacBook Pro M3 Max (48 GB), PonyExl3 v0.3.0, Qwen3.6-27B EXL3 4.15bpw +
+[z-lab DFlash (bf16)](https://huggingface.co/zlab/Qwen3.6-27B-DFlash-bf16). Plain
+**11.3** tok/s; DFlash **13.8** tok/s with **36%** accept rate; MTP **11.3** tok/s
+(~flat vs plain). Same reporter saw ~**17** tok/s on 8.00bpw + DFlash (~70% accept).
+Decode scales strongly by SoC tier — M3 Max sits between M1 Max and M5 Max on this
+27B checkpoint.
 
 **At temperature 0.6** the same drafters stay **distribution-exact** (Leviathan-Chen
 rejection sampling, not greedy — see [Speculative decoding](#speculative-decoding)).

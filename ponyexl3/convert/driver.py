@@ -29,6 +29,7 @@ from ponyexl3.convert.direct import (
     write_exl3_layers_bundle,
 )
 from ponyexl3.convert.fixtures import SearchBackend, resolve_source_linear
+from ponyexl3.convert.heads import is_output_head
 from ponyexl3.convert.hessian import (
     LDLQGroupIncompatible,
     ldlq_layer_summary,
@@ -75,7 +76,7 @@ def _natural_key(key: str) -> tuple[Any, ...]:
 
 
 def _model_module_key(key: str) -> tuple[bool, tuple[Any, ...]]:
-    return key == "lm_head", _natural_key(key)
+    return is_output_head(key), _natural_key(key)
 
 
 def layer_module_keys(
@@ -169,7 +170,7 @@ def priority_bit_allocations(
     priorities = {key: default_module_priority(key) for key in keys}
     forced: dict[str, int] = {}
     if head_bits is not None:
-        forced.update({key: int(head_bits) for key in keys if key == "lm_head"})
+        forced.update({key: int(head_bits) for key in keys if is_output_head(key)})
     forced.update({key: int(bits) for key, bits in (bit_overrides or {}).items()})
     return allocate_priority_bits(
         keys,
